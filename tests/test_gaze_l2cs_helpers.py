@@ -58,6 +58,21 @@ class _FakeGDown:
 
 
 class GazeL2CSHelperTests(unittest.TestCase):
+    def test_normalize_l2cs_state_dict_unwraps_and_strips_module_prefix(self):
+        _install_stubs()
+        main = importlib.import_module("main")
+
+        payload = {
+            "state_dict": {
+                "module.fc_yaw_gaze.weight": np.zeros((90, 512), dtype=np.float32),
+                "module.layer1.1.conv1.weight": np.zeros((1, 1, 1, 1), dtype=np.float32),
+            }
+        }
+        normalized = main._normalize_l2cs_state_dict(payload)
+        self.assertIn("fc_yaw_gaze.weight", normalized)
+        self.assertIn("layer1.1.conv1.weight", normalized)
+        self.assertNotIn("module.fc_yaw_gaze.weight", normalized)
+
     def test_select_gaze360_weight_prefers_arch_token(self):
         _install_stubs()
         main = importlib.import_module("main")

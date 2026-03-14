@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import threading
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,8 +19,19 @@ from insightface.app import FaceAnalysis
 from object_detection import DualYoloDetector, find_latest_custom_model
 from scene_memory import SceneMemoryManager
 
+
+def _load_env_file() -> None:
+    try:
+        from dotenv import load_dotenv
+    except Exception:
+        return
+    load_dotenv(override=False)
+
+
+_load_env_file()
+
 # ── Config ────────────────────────────────────────────────────────────────────
-CAMERA_SOURCE = int(os.getenv("AI_STUDIO_CAM_CAMERA_INDEX", "42"))
+CAMERA_SOURCE = os.getenv("AI_STUDIO_CAM_CAMERA_INDEX", "42").strip()
 DB_PATH = Path("face_db.npz")
 METRICS_LOG_PATH = Path("metrics_log.jsonl")
 REPORT_TXT_PATH = Path("report.txt")
@@ -49,6 +62,17 @@ GAZE_WEIGHTS_SOURCE_DEFAULT = (
 )
 GAZE_EMA_ALPHA = 0.10
 GAZE_RECOVERY_STREAK_MIN = 5
+GAZE_OBJECT_HIT_PADDING_PX = 8.0
+GAZE_OBJECT_MAX_DIST_PX = 120.0
+GAZE_SMOOTHING_WINDOW = 5
+GAZE_SWITCH_CONFIRMATION = 3
+BEHAVIOR_LOST_TIMEOUT_SEC = 1.0
+
+GROQ_MODEL_DEFAULT = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+GROQ_SYSTEM_PROMPT = (
+    "You are an assistant for an AI monitoring system. Prefer concise factual answers "
+    "based on provided logs/memory context, avoid speculation, and include timestamps when relevant."
+)
 
 WHITE = (255, 255, 255)
 GREEN = (0, 210, 80)
@@ -126,7 +150,10 @@ def _parse_iso(s: str | None) -> datetime | None:
     if not s:
         return None
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
     except ValueError:
         return None
 
@@ -225,6 +252,7 @@ def _print_runtime_help() -> None:
     print("  q  quit")
     print("  g  toggle general YOLO")
     print("  o  toggle custom YOLO")
+    print("  c  chatbot query")
     print("  t  manual memory snapshot")
     print("  m  memory statistics")
     print("  r  recent snapshots (5 minutes)")
@@ -319,36 +347,109 @@ def _open_camera() -> cv2.VideoCapture:
             time.sleep(0.03)
         return False
 
-    candidates: list[int] = [CAMERA_SOURCE]
-    if sys.platform.startswith("linux"):
-        for path in Path("/dev").glob("video*"):
+    candidates: list[int | str] = []
+    if CAMERA_SOURCE.startswith("/dev/"):
+        candidates.append(CAMERA_SOURCE)
+    elif CAMERA_SOURCE.isdigit():
+        # On some systems, path-based open works while index-based open does not.
+        candidates.append(f"/dev/video{CAMERA_SOURCE}")
+        candidates.append(int(CAMERA_SOURCE))
+    elif CAMERA_SOURCE:
+        candidates.append(CAMERA_SOURCE)
+
+    if sys.platform.startswith("linux") and os.getenv("AI_STUDIO_CAM_SCAN_ALL_DEVICES", "0") == "1":
+        for path in sorted(Path("/dev").glob("video*"), key=lambda p: p.name, reverse=True):
             suffix = path.name.replace("video", "", 1)
+            candidates.append(str(path))
             if suffix.isdigit():
                 candidates.append(int(suffix))
-    candidates = list(dict.fromkeys(candidates))
+    deduped: list[int | str] = []
+    seen: set[tuple[type, str]] = set()
+    for candidate in candidates:
+        key = (type(candidate), str(candidate))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(candidate)
+    candidates = deduped
 
-    backends = [cv2.CAP_V4L2, cv2.CAP_ANY] if sys.platform.startswith("linux") else [cv2.CAP_ANY]
     tried: list[str] = []
 
-    for index in candidates:
+    for source in candidates:
+        if sys.platform.startswith("linux"):
+            if isinstance(source, str):
+                # Path-based capture is more reliable for v4l2loopback devices.
+                backends = [cv2.CAP_FFMPEG, cv2.CAP_ANY, cv2.CAP_V4L2]
+            else:
+                backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
+        else:
+            backends = [cv2.CAP_ANY]
+
         for backend in backends:
-            cap = cv2.VideoCapture(index, backend)
+            cap = cv2.VideoCapture(source, backend)
             if not cap.isOpened():
                 cap.release()
-                tried.append(f"{index}@{backend}:open_failed")
+                tried.append(f"{source}@{backend}:open_failed")
                 continue
 
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if isinstance(source, str):
+                # Device-path opens can be valid even when warm-up reads are backend-dependent.
+                return cap
             if camera_readable(cap):
                 return cap
 
             cap.release()
-            tried.append(f"{index}@{backend}:no_frames")
+            tried.append(f"{source}@{backend}:no_frames")
 
     tried_msg = ", ".join(tried[:18])
     if len(tried) > 18:
         tried_msg += ", ..."
     raise RuntimeError(f"Failed to open readable camera stream. Tried: {tried_msg}")
+
+
+class _AsyncCameraReader:
+    """Background frame reader to keep UI responsive when camera reads block."""
+
+    def __init__(self, cap: cv2.VideoCapture):
+        self._cap = cap
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._frame: np.ndarray | None = None
+        self._seq = 0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            ok, frame = self._cap.read()
+            if ok and frame is not None and frame.size > 0:
+                with self._lock:
+                    self._frame = frame
+                    self._seq += 1
+            else:
+                time.sleep(0.01)
+
+    def read(self, timeout_sec: float = 1.0) -> tuple[bool, np.ndarray | None]:
+        deadline = time.monotonic() + max(timeout_sec, 0.01)
+        with self._lock:
+            start_seq = self._seq
+
+        while time.monotonic() < deadline and not self._stop.is_set():
+            with self._lock:
+                if self._seq > start_seq and self._frame is not None:
+                    return True, self._frame.copy()
+            time.sleep(0.005)
+
+        # Fallback to last frame so the app can keep rendering instead of freezing.
+        with self._lock:
+            if self._frame is not None:
+                return True, self._frame.copy()
+        return False, None
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=0.2)
 
 
 def _detect(
@@ -542,6 +643,22 @@ def _decode_l2cs_pitch_yaw_rad(
     return pitch_rad, yaw_rad
 
 
+def _normalize_l2cs_state_dict(payload: Any) -> dict[str, Any]:
+    state_dict = payload
+    if isinstance(state_dict, dict) and isinstance(state_dict.get("state_dict"), dict):
+        state_dict = state_dict["state_dict"]
+    if not isinstance(state_dict, dict):
+        raise TypeError("L2CS checkpoint did not contain a state_dict mapping")
+
+    normalized: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        k = str(key)
+        if k.startswith("module."):
+            k = k[len("module.") :]
+        normalized[k] = value
+    return normalized
+
+
 def _infer_l2cs_arch_from_state_dict(state_dict: dict[str, Any]) -> str | None:
     fc_w = state_dict.get("fc_yaw_gaze.weight")
     fc_shape = getattr(fc_w, "shape", None)
@@ -624,11 +741,11 @@ def _load_gaze_runtime(
         return None
 
     try:
-        state_dict = torch.load(str(resolved_path), map_location=device)
-        inferred_arch = _infer_l2cs_arch_from_state_dict(state_dict) or "ResNet50"
+        state_dict = _normalize_l2cs_state_dict(torch.load(str(resolved_path), map_location=device))
+        inferred_arch = _infer_l2cs_arch_from_state_dict(state_dict)
 
         # If local/default weights don't match requested arch, try a forced arch-specific download once.
-        if inferred_arch != gaze_arch and gaze_auto_download and gdown_module is not None:
+        if inferred_arch is not None and inferred_arch != gaze_arch and gaze_auto_download and gdown_module is not None:
             alt_path = _resolve_l2cs_weights_path(
                 weights_path=weights_path,
                 weights_source=gaze_weights_source,
@@ -640,31 +757,20 @@ def _load_gaze_runtime(
             )
             if alt_path is not None and alt_path.exists() and alt_path.resolve() != resolved_path.resolve():
                 resolved_path = alt_path.resolve()
-                state_dict = torch.load(str(resolved_path), map_location=device)
-                inferred_arch = _infer_l2cs_arch_from_state_dict(state_dict) or inferred_arch
+                state_dict = _normalize_l2cs_state_dict(torch.load(str(resolved_path), map_location=device))
+                inferred_arch = _infer_l2cs_arch_from_state_dict(state_dict)
 
-        candidate_arches = [inferred_arch]
-        for arch in ["ResNet18", "ResNet34", "ResNet50", "ResNet101", "ResNet152"]:
-            if arch not in candidate_arches:
-                candidate_arches.append(arch)
+        if inferred_arch is not None and inferred_arch != gaze_arch:
+            print(
+                f"[GAZE] Requested arch {gaze_arch} but checkpoint arch is {inferred_arch}. "
+                "Gaze estimation disabled."
+            )
+            return None
 
-        model = None
-        loaded_arch = None
-        last_error: Exception | None = None
-        for candidate in candidate_arches:
-            try:
-                trial_model = getArch(candidate, 90)
-                trial_model.load_state_dict(state_dict)
-                trial_model.eval()
-                trial_model.to(device)
-                model = trial_model
-                loaded_arch = candidate
-                break
-            except Exception as ex:
-                last_error = ex
-
-        if model is None or loaded_arch is None:
-            raise RuntimeError(f"Unable to match weights with any supported L2CS arch. Last error: {last_error}")
+        model = getArch(gaze_arch, 90)
+        model.load_state_dict(state_dict)
+        model.eval()
+        model.to(device)
 
         softmax = torch.nn.Softmax(dim=1)
         idx_tensor_deg = (torch.arange(90, dtype=torch.float32, device=device) * 4.0) - 180.0
@@ -673,9 +779,7 @@ def _load_gaze_runtime(
         print(f"[GAZE] L2CS model load failed ({msg})")
         return None
 
-    if loaded_arch != gaze_arch:
-        print(f"[GAZE] Requested arch {gaze_arch} mismatched weights; using {loaded_arch}")
-    print(f"Gaze model loaded: L2CS-Net {loaded_arch} ({device.type})")
+    print(f"Gaze model loaded: L2CS-Net {gaze_arch} ({device.type})")
     return {
         "model": model,
         "device": device,
@@ -685,7 +789,7 @@ def _load_gaze_runtime(
         "prep_input_numpy": prep_input_numpy,
         "weights_path": str(resolved_path),
         "weights_source": gaze_weights_source,
-        "arch": loaded_arch,
+        "arch": gaze_arch,
     }
 
 
@@ -852,6 +956,805 @@ def _load_metric_events() -> list[dict[str, Any]]:
     return events
 
 
+def _bbox_to_list(bbox: Any) -> list[float]:
+    arr = np.asarray(bbox, dtype=np.float32).reshape(-1)
+    if arr.size < 4:
+        return [0.0, 0.0, 0.0, 0.0]
+    return [float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])]
+
+
+def _normalize_object_rows_for_json(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "label": str(row.get("label", "object")),
+                "confidence": round(_safe_float(row.get("confidence"), 0.0), 6),
+                "bbox": _bbox_to_list(row.get("bbox", [0, 0, 0, 0])),
+                "source": str(row.get("source", "general")),
+                "class_id": _safe_int(row.get("class_id"), -1),
+            }
+        )
+    return out
+
+
+def _normalize_face_rows_for_json(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "name": str(row.get("name", UNKNOWN_LABEL)),
+                "confidence": round(_safe_float(row.get("confidence"), 0.0), 6),
+                "bbox": _bbox_to_list(row.get("bbox", [0, 0, 0, 0])),
+                "gaze": row.get("gaze") if isinstance(row.get("gaze"), dict) else None,
+                "target_object": row.get("target_object"),
+            }
+        )
+    return out
+
+
+def _point_to_rect_distance(
+    x: float,
+    y: float,
+    bbox: np.ndarray | list[float] | tuple[float, float, float, float],
+    pad: float = 0.0,
+) -> float:
+    x1, y1, x2, y2 = [float(v) for v in np.asarray(bbox, dtype=np.float32).reshape(4)]
+    x1 -= pad
+    y1 -= pad
+    x2 += pad
+    y2 += pad
+    dx = max(x1 - x, 0.0, x - x2)
+    dy = max(y1 - y, 0.0, y - y2)
+    return float(np.hypot(dx, dy))
+
+
+def _point_in_rect(
+    x: float,
+    y: float,
+    bbox: np.ndarray | list[float] | tuple[float, float, float, float],
+    pad: float = 0.0,
+) -> bool:
+    x1, y1, x2, y2 = [float(v) for v in np.asarray(bbox, dtype=np.float32).reshape(4)]
+    return (x1 - pad) <= x <= (x2 + pad) and (y1 - pad) <= y <= (y2 + pad)
+
+
+def _infer_gaze_target(
+    gaze_row: tuple[int, int, float, float] | None,
+    object_rows: list[dict[str, Any]],
+    hit_padding_px: float = GAZE_OBJECT_HIT_PADDING_PX,
+    max_dist_px: float = GAZE_OBJECT_MAX_DIST_PX,
+) -> dict[str, Any] | None:
+    if gaze_row is None or not object_rows:
+        return None
+
+    gx, gy, _pitch, _yaw = gaze_row
+
+    inside: list[dict[str, Any]] = []
+    nearest: dict[str, Any] | None = None
+    nearest_dist = float("inf")
+
+    for row in object_rows:
+        bbox = np.asarray(row.get("bbox", [0, 0, 0, 0]), dtype=np.float32).reshape(4)
+        if _point_in_rect(gx, gy, bbox, pad=hit_padding_px):
+            inside.append(row)
+        dist = _point_to_rect_distance(float(gx), float(gy), bbox, pad=0.0)
+        if dist < nearest_dist:
+            nearest_dist = dist
+            nearest = row
+
+    if inside:
+        picked = max(inside, key=lambda r: _safe_float(r.get("confidence"), 0.0))
+        return {
+            "label": str(picked.get("label", "object")),
+            "source": str(picked.get("source", "general")),
+            "confidence": _safe_float(picked.get("confidence"), 0.0),
+            "distance_px": 0.0,
+            "method": "inside",
+        }
+
+    if nearest is not None and nearest_dist <= max_dist_px:
+        return {
+            "label": str(nearest.get("label", "object")),
+            "source": str(nearest.get("source", "general")),
+            "confidence": _safe_float(nearest.get("confidence"), 0.0),
+            "distance_px": float(nearest_dist),
+            "method": "nearest",
+        }
+    return None
+
+
+@dataclass
+class _BehaviorPersonState:
+    history: deque[str | None]
+    stable_target: str | None = None
+    stable_start_ts: float | None = None
+    pending_target: str | None = None
+    pending_count: int = 0
+    present: bool = False
+    last_seen_ts: float | None = None
+    last_update_ts: float | None = None
+
+
+class _BehaviorTracker:
+    def __init__(
+        self,
+        smoothing_window: int = GAZE_SMOOTHING_WINDOW,
+        switch_confirmation: int = GAZE_SWITCH_CONFIRMATION,
+        lost_timeout_sec: float = BEHAVIOR_LOST_TIMEOUT_SEC,
+    ) -> None:
+        self.smoothing_window = max(int(smoothing_window), 1)
+        self.switch_confirmation = max(int(switch_confirmation), 1)
+        self.lost_timeout_sec = max(float(lost_timeout_sec), 0.1)
+
+        self._states: dict[str, _BehaviorPersonState] = {}
+        self.attention_sec: defaultdict[tuple[str, str], float] = defaultdict(float)
+        self.object_attention_sec: defaultdict[str, float] = defaultdict(float)
+        self.interactions: Counter[tuple[str, str]] = Counter()
+        self.events_count = 0
+
+    def _state_for(self, person: str) -> _BehaviorPersonState:
+        state = self._states.get(person)
+        if state is None:
+            state = _BehaviorPersonState(history=deque(maxlen=self.smoothing_window))
+            self._states[person] = state
+        return state
+
+    def _majority_target(self, history: deque[str | None]) -> tuple[str | None, int]:
+        counter: Counter[str] = Counter(v for v in history if v)
+        if not counter:
+            return None, 0
+        target, count = counter.most_common(1)[0]
+        return target, int(count)
+
+    def _accumulate(self, person: str, state: _BehaviorPersonState, now_ts: float) -> None:
+        if state.stable_target is None or state.last_update_ts is None:
+            return
+        dt = max(float(now_ts) - float(state.last_update_ts), 0.0)
+        if dt <= 0.0:
+            return
+        key = (person, state.stable_target)
+        self.attention_sec[key] += dt
+        self.object_attention_sec[state.stable_target] += dt
+
+    def _build_event(
+        self,
+        event: str,
+        person: str,
+        target_object: str | None,
+        now_ts: float,
+        previous_target: str | None = None,
+        duration_sec: float = 0.0,
+    ) -> dict[str, Any]:
+        payload = {
+            "event": event,
+            "person": person,
+            "target_object": target_object,
+            "previous_target": previous_target,
+            "duration_sec": round(max(duration_sec, 0.0), 3),
+            "event_time_utc": _iso(datetime.fromtimestamp(now_ts, tz=timezone.utc)),
+        }
+        self.events_count += 1
+        return payload
+
+    def _close_target(
+        self,
+        person: str,
+        state: _BehaviorPersonState,
+        now_ts: float,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        if state.stable_target is None:
+            return None
+        duration = (
+            max(float(now_ts) - float(state.stable_start_ts), 0.0)
+            if state.stable_start_ts is not None
+            else 0.0
+        )
+        payload = self._build_event(
+            event=reason,
+            person=person,
+            target_object=state.stable_target,
+            previous_target=None,
+            now_ts=now_ts,
+            duration_sec=duration,
+        )
+        state.stable_target = None
+        state.stable_start_ts = None
+        state.pending_target = None
+        state.pending_count = 0
+        state.history.clear()
+        return payload
+
+    def update(self, observations: dict[str, str | None], now_ts: float) -> list[dict[str, Any]]:
+        now_ts = float(now_ts)
+        emitted: list[dict[str, Any]] = []
+        visible = set(observations.keys())
+
+        for person in visible:
+            state = self._state_for(person)
+            self._accumulate(person, state, now_ts)
+
+            target = observations.get(person)
+            state.history.append(target if target else None)
+            state.present = True
+            state.last_seen_ts = now_ts
+            state.last_update_ts = now_ts
+
+            majority_target, majority_count = self._majority_target(state.history)
+            if majority_target is None:
+                state.pending_target = None
+                state.pending_count = 0
+                continue
+
+            if state.stable_target is None:
+                if majority_count >= self.switch_confirmation:
+                    state.stable_target = majority_target
+                    state.stable_start_ts = now_ts
+                    self.interactions[(person, majority_target)] += 1
+                    emitted.append(
+                        self._build_event(
+                            event="start",
+                            person=person,
+                            target_object=majority_target,
+                            now_ts=now_ts,
+                            duration_sec=0.0,
+                        )
+                    )
+                continue
+
+            if majority_target == state.stable_target:
+                state.pending_target = None
+                state.pending_count = 0
+                continue
+
+            if state.pending_target == majority_target:
+                state.pending_count += 1
+            else:
+                state.pending_target = majority_target
+                state.pending_count = 1
+
+            if state.pending_count >= self.switch_confirmation:
+                previous = state.stable_target
+                previous_duration = (
+                    max(now_ts - float(state.stable_start_ts), 0.0)
+                    if state.stable_start_ts is not None
+                    else 0.0
+                )
+                emitted.append(
+                    self._build_event(
+                        event="switch",
+                        person=person,
+                        target_object=majority_target,
+                        previous_target=previous,
+                        now_ts=now_ts,
+                        duration_sec=previous_duration,
+                    )
+                )
+                state.stable_target = majority_target
+                state.stable_start_ts = now_ts
+                state.pending_target = None
+                state.pending_count = 0
+                self.interactions[(person, majority_target)] += 1
+
+        for person, state in self._states.items():
+            if person in visible:
+                continue
+            if state.present:
+                self._accumulate(person, state, now_ts)
+                state.present = False
+                state.last_update_ts = None
+            if (
+                state.stable_target is not None
+                and state.last_seen_ts is not None
+                and (now_ts - float(state.last_seen_ts)) > self.lost_timeout_sec
+            ):
+                closed = self._close_target(person, state, now_ts, reason="end")
+                if closed:
+                    emitted.append(closed)
+
+        return emitted
+
+    def finalize(self, now_ts: float) -> list[dict[str, Any]]:
+        emitted: list[dict[str, Any]] = []
+        now_ts = float(now_ts)
+        for person, state in self._states.items():
+            self._accumulate(person, state, now_ts)
+            state.present = False
+            state.last_update_ts = None
+            closed = self._close_target(person, state, now_ts, reason="end")
+            if closed:
+                emitted.append(closed)
+        return emitted
+
+    def current_targets(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for person, state in self._states.items():
+            if state.stable_target:
+                out[person] = state.stable_target
+        return out
+
+    def summary(self) -> dict[str, Any]:
+        person_map: dict[str, dict[str, float]] = defaultdict(dict)
+        for (person, obj), seconds in self.attention_sec.items():
+            person_map[person][obj] = round(float(seconds), 3)
+        top_objects = sorted(
+            self.object_attention_sec.items(),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )
+        return {
+            "attention_map": dict(person_map),
+            "top_objects": [[obj, round(float(sec), 3)] for obj, sec in top_objects[:10]],
+            "interactions_total": int(sum(self.interactions.values())),
+            "events_count": int(self.events_count),
+            "attention_total_sec": round(float(sum(self.attention_sec.values())), 3),
+            "interaction_counts": {
+                f"{person}|{obj}": int(count)
+                for (person, obj), count in self.interactions.items()
+            },
+        }
+
+
+def _parse_minutes_from_text(text: str, default: int = 5) -> int:
+    m = re.search(r"(\d+)\s*(?:minute|min|mins)", text.lower())
+    if not m:
+        return max(int(default), 1)
+    return max(_safe_int(m.group(1), default), 1)
+
+
+def _phrase_for_attention(person: str, obj: str, seconds: float) -> str:
+    seconds = max(float(seconds), 0.0)
+    if seconds < 30.0:
+        return f"{person} briefly checked a {obj}."
+    if seconds < 120.0:
+        return f"{person} looked at a {obj} for about {int(round(seconds))} seconds."
+    minutes = max(int(round(seconds / 60.0)), 1)
+    return f"{person} looked at a {obj} for {minutes} minutes."
+
+
+def _build_situation_summary(minutes: int = 5, now_utc: datetime | None = None) -> dict[str, Any]:
+    lookback = max(int(minutes), 1)
+    now_dt = now_utc or _now_utc()
+    cutoff = now_dt - timedelta(minutes=lookback)
+
+    events = _load_metric_events()
+    attention_sec: defaultdict[tuple[str, str], float] = defaultdict(float)
+    interaction_counts: Counter[tuple[str, str]] = Counter()
+
+    for event in events:
+        dt = _parse_iso(event.get("timestamp_utc"))
+        if dt is None or dt < cutoff:
+            continue
+
+        et = str(event.get("event_type", ""))
+        if et == "behavior_event":
+            person = str(event.get("person") or "Unknown person")
+            obj = str(event.get("target_object") or "").strip()
+            duration = _safe_float(event.get("duration_sec"), 0.0)
+            if obj and duration > 0:
+                attention_sec[(person, obj)] += duration
+            if obj and str(event.get("event")) in {"start", "switch"}:
+                interaction_counts[(person, obj)] += 1
+            continue
+
+        if et == "recognize_session":
+            agg = event.get("aggregate") if isinstance(event.get("aggregate"), dict) else {}
+            attn_map = agg.get("behavior_attention_map")
+            if isinstance(attn_map, dict):
+                for person, obj_map in attn_map.items():
+                    if not isinstance(obj_map, dict):
+                        continue
+                    for obj, sec in obj_map.items():
+                        obj_name = str(obj).strip()
+                        if not obj_name:
+                            continue
+                        attention_sec[(str(person), obj_name)] += _safe_float(sec, 0.0)
+
+    memory = SceneMemoryManager(base_dir=MEMORY_DIR, enable_vectors=False)
+    recent_rows: list[dict[str, Any]] = []
+    for row in memory.metadata:
+        dt = _parse_iso(row.get("datetime") or row.get("timestamp_utc"))
+        if dt is None or dt < cutoff:
+            continue
+        recent_rows.append(row)
+
+    snapshots_total = len(recent_rows)
+    snapshots_manual = sum(1 for row in recent_rows if bool(row.get("manual")))
+    snapshots_auto = max(snapshots_total - snapshots_manual, 0)
+
+    top_pairs = sorted(attention_sec.items(), key=lambda kv: kv[1], reverse=True)
+    most_viewed_object = None
+    if top_pairs:
+        object_totals: defaultdict[str, float] = defaultdict(float)
+        for (_, obj), sec in top_pairs:
+            object_totals[obj] += sec
+        if object_totals:
+            most_viewed_object = max(object_totals.items(), key=lambda kv: kv[1])[0]
+    else:
+        object_freq: Counter[str] = Counter()
+        for row in recent_rows:
+            for obj in row.get("objects", []):
+                object_freq[str(obj)] += 1
+        if object_freq:
+            most_viewed_object = object_freq.most_common(1)[0][0]
+
+    return {
+        "minutes": lookback,
+        "generated_utc": _iso(now_dt),
+        "window_start_utc": _iso(cutoff),
+        "window_end_utc": _iso(now_dt),
+        "top_attention_pairs": [
+            {"person": person, "object": obj, "seconds": round(float(sec), 3)}
+            for (person, obj), sec in top_pairs[:10]
+        ],
+        "interaction_counts": {
+            f"{person}|{obj}": int(count)
+            for (person, obj), count in interaction_counts.items()
+        },
+        "snapshots_total": snapshots_total,
+        "snapshots_manual": snapshots_manual,
+        "snapshots_auto": snapshots_auto,
+        "most_viewed_object": most_viewed_object,
+    }
+
+
+def _render_situation_summary(summary: dict[str, Any], max_lines: int = 4) -> str:
+    minutes = _safe_int(summary.get("minutes"), 5)
+    pairs = summary.get("top_attention_pairs", [])
+    snapshots_total = _safe_int(summary.get("snapshots_total"), 0)
+    most_viewed_object = summary.get("most_viewed_object")
+
+    bullets: list[str] = []
+    if isinstance(pairs, list):
+        for row in pairs[:3]:
+            person = str(row.get("person", "Unknown person"))
+            obj = str(row.get("object", "object"))
+            sec = _safe_float(row.get("seconds"), 0.0)
+            bullets.append(_phrase_for_attention(person, obj, sec))
+
+    if snapshots_total > 0:
+        verb = "were" if snapshots_total != 1 else "was"
+        bullets.append(
+            f"{snapshots_total} snapshot{'s' if snapshots_total != 1 else ''} {verb} captured."
+        )
+    if most_viewed_object:
+        bullets.append(f"The most viewed object was a {most_viewed_object}.")
+
+    if not bullets:
+        return f"No notable activity was recorded in the last {minutes} minutes."
+
+    lines = [f"In the last {minutes} minutes:"]
+    for line in bullets[: max(int(max_lines), 1)]:
+        lines.append(f"- {line}")
+    return "\n".join(lines)
+
+
+def _build_llm_context(question: str, lookback_minutes: int = 30) -> dict[str, Any]:
+    events = _load_metric_events()
+    cutoff = _now_utc() - timedelta(minutes=max(int(lookback_minutes), 1))
+    recent_behavior: list[dict[str, Any]] = []
+    latest_recognize: dict[str, Any] | None = None
+    for event in reversed(events):
+        if latest_recognize is None and event.get("event_type") == "recognize_session":
+            agg = event.get("aggregate") if isinstance(event.get("aggregate"), dict) else {}
+            latest_recognize = {
+                "session_id": event.get("session_id"),
+                "start_utc": event.get("start_utc"),
+                "end_utc": event.get("end_utc"),
+                "duration_sec": event.get("duration_sec"),
+                "aggregate": {
+                    "known_detections": agg.get("known_detections"),
+                    "unknown_detections": agg.get("unknown_detections"),
+                    "active_subjects": agg.get("active_subjects"),
+                    "active_objects": agg.get("active_objects"),
+                    "behavior_top_objects": agg.get("behavior_top_objects"),
+                    "behavior_interactions_total": agg.get("behavior_interactions_total"),
+                },
+            }
+        dt = _parse_iso(event.get("timestamp_utc"))
+        if dt is None or dt < cutoff:
+            continue
+        if event.get("event_type") == "behavior_event":
+            recent_behavior.append(
+                {
+                    "ts": event.get("timestamp_utc"),
+                    "event": event.get("event"),
+                    "person": event.get("person"),
+                    "target_object": event.get("target_object"),
+                    "duration_sec": event.get("duration_sec"),
+                }
+            )
+    recent_behavior.reverse()
+
+    memory = SceneMemoryManager(base_dir=MEMORY_DIR, enable_vectors=False)
+    memory_hits = memory.search_similar_scene(question, top_k=5)
+    compact_hits = [
+        {
+            "timestamp_local": row.get("timestamp_local"),
+            "objects": row.get("objects"),
+            "snapshot": row.get("snapshot"),
+        }
+        for row in memory_hits
+    ]
+
+    return {
+        "question": question,
+        "latest_session": latest_recognize,
+        "recent_behavior": recent_behavior[-30:],
+        "memory_hits": compact_hits,
+    }
+
+
+def _query_groq(question: str, context: dict[str, Any]) -> str | None:
+    api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq_api_key")
+    if not api_key:
+        return None
+    try:
+        from groq import Groq
+    except Exception:
+        return None
+
+    try:
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model=GROQ_MODEL_DEFAULT,
+            temperature=0.2,
+            max_tokens=350,
+            messages=[
+                {"role": "system", "content": GROQ_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "Use this context to answer the question.\n"
+                        f"Context JSON:\n{json.dumps(context, ensure_ascii=True)}\n\n"
+                        f"Question: {question}"
+                    ),
+                },
+            ],
+        )
+    except Exception:
+        return None
+    if not response.choices:
+        return None
+    msg = response.choices[0].message
+    content = getattr(msg, "content", None)
+    if not content:
+        return None
+    return str(content).strip()
+
+
+def _extract_last_seen_target(question: str) -> str | None:
+    q = question.strip()
+    patterns = [
+        r"last\s+see\s+(.+)\??$",
+        r"last\s+seen\s+(.+)\??$",
+        r"when\s+did\s+you\s+last\s+see\s+(.+)\??$",
+    ]
+    ql = q.lower()
+    for pattern in patterns:
+        m = re.search(pattern, ql)
+        if not m:
+            continue
+        target = m.group(1).strip()
+        target = re.sub(r"^(a|an|the)\s+", "", target)
+        return target.strip(" ?.")
+    return None
+
+
+def _answer_current_presence() -> str:
+    events = _load_metric_events()
+    for event in reversed(events):
+        if event.get("event_type") != "recognize_session":
+            continue
+        agg = event.get("aggregate") if isinstance(event.get("aggregate"), dict) else {}
+        active = agg.get("active_subjects")
+        if isinstance(active, list) and active:
+            names = [str(row.get("name", UNKNOWN_LABEL)) for row in active[:8] if isinstance(row, dict)]
+            if names:
+                return "Currently visible: " + ", ".join(names)
+        return "No known people are currently visible in the latest session state."
+    return "No recognition session data is available yet."
+
+
+def _answer_attention_query(question: str, known_people: list[str]) -> str:
+    target_person = None
+    ql = question.lower()
+    for name in known_people:
+        if name.lower() in ql:
+            target_person = name
+            break
+
+    events = _load_metric_events()
+    for event in reversed(events):
+        if event.get("event_type") != "behavior_event":
+            continue
+        if str(event.get("event")) not in {"start", "switch", "end"}:
+            continue
+        person = str(event.get("person", "Unknown"))
+        if target_person and person.lower() != target_person.lower():
+            continue
+        obj = event.get("target_object")
+        if not obj:
+            continue
+        ts = event.get("timestamp_utc")
+        if str(event.get("event")) == "end":
+            return f"{person} stopped attending {obj} around {_local_hms(ts)}."
+        return f"{person} was looking at {obj} around {_local_hms(ts)}."
+
+    if target_person:
+        return f"No recent attention events were found for {target_person}."
+    return "No recent gaze attention events were found."
+
+
+def _handle_chat_query(
+    question: str,
+    runtime_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    question = question.strip()
+    started = time.perf_counter()
+    answer = ""
+    intent = "open_ended"
+    action = "none"
+    hit = True
+    used_llm = False
+    summary_minutes = None
+    summary_payload: dict[str, Any] | None = None
+    snapshot_payload: dict[str, Any] | None = None
+
+    q = question.lower()
+    memory = runtime_context.get("memory") if isinstance(runtime_context, dict) else None
+    if memory is None:
+        memory = SceneMemoryManager(base_dir=MEMORY_DIR, enable_vectors=False)
+    db = FaceDB.load()
+    known_people = {n.lower() for n in db.names}
+
+    if ("what happened" in q and "minute" in q) or "recent activity" in q or "situation summary" in q:
+        intent = "session_summary"
+        summary_minutes = _parse_minutes_from_text(q, default=5)
+        summary_payload = _build_situation_summary(summary_minutes)
+        answer = _render_situation_summary(summary_payload)
+        _append_metric(
+            "summary_query",
+            {
+                "source": "chat",
+                "minutes": summary_minutes,
+                "result_lines": answer.count("\n") + 1,
+                "hit": bool(summary_payload.get("top_attention_pairs") or summary_payload.get("snapshots_total")),
+            },
+        )
+    elif "memory status" in q or "memory stats" in q:
+        intent = "memory_stats"
+        answer = json.dumps(memory.get_memory_stats(), ensure_ascii=True, indent=2)
+    elif "recent snapshot" in q:
+        intent = "memory_recent"
+        minutes = _parse_minutes_from_text(q, default=5)
+        rows = memory.get_recent_snapshots(minutes=minutes)
+        if rows:
+            snippets = [
+                f"{row.get('timestamp_local')} | {row.get('objects')} | {row.get('snapshot')}"
+                for row in rows[-5:]
+            ]
+            answer = f"Recent snapshots in the last {minutes} minutes:\n" + "\n".join(snippets)
+        else:
+            hit = False
+            answer = f"No recent snapshots were found in the last {minutes} minutes."
+    elif "take snapshot" in q or "capture snapshot" in q:
+        intent = "snapshot"
+        if isinstance(runtime_context, dict) and runtime_context.get("frame") is not None:
+            snap = memory.save_snapshot(
+                runtime_context["frame"],
+                runtime_context.get("object_rows", []),
+                current_time=time.time(),
+                manual=True,
+                faces=runtime_context.get("face_rows"),
+                object_detections=runtime_context.get("object_rows"),
+                people=runtime_context.get("people"),
+                attention=runtime_context.get("attention_rows"),
+            )
+            snapshot_payload = snap
+            answer = f"Snapshot captured: {snap.get('snapshot')}"
+            action = "snapshot"
+        else:
+            hit = False
+            answer = "Snapshot capture is only available while live recognition is running."
+    elif "who is present" in q or "who was present" in q:
+        intent = "presence"
+        if isinstance(runtime_context, dict) and runtime_context.get("people"):
+            names = [str(x) for x in runtime_context.get("people", []) if str(x).strip()]
+            if names:
+                answer = "Currently visible: " + ", ".join(sorted(set(names)))
+            else:
+                answer = _answer_current_presence()
+        else:
+            answer = _answer_current_presence()
+    elif "looking at" in q or "look at" in q:
+        intent = "attention_lookup"
+        answer = _answer_attention_query(question, db.names)
+    elif "most viewed object" in q:
+        intent = "session_summary"
+        summary_minutes = _parse_minutes_from_text(q, default=5)
+        summary_payload = _build_situation_summary(summary_minutes)
+        mvo = summary_payload.get("most_viewed_object")
+        if mvo:
+            answer = f"In the last {summary_minutes} minutes, the most viewed object was a {mvo}."
+        else:
+            hit = False
+            answer = f"No viewed-object data is available in the last {summary_minutes} minutes."
+        _append_metric(
+            "summary_query",
+            {
+                "source": "chat",
+                "minutes": summary_minutes,
+                "result_lines": 1,
+                "hit": bool(mvo),
+            },
+        )
+    elif "last see" in q or "last seen" in q:
+        target = _extract_last_seen_target(question)
+        if target:
+            if target.lower() in known_people:
+                intent = "person_last_seen"
+                row = memory.find_person_last_seen(target)
+                if row:
+                    answer = (
+                        f"Last seen '{target}' at {row.get('timestamp_local')} | "
+                        f"people={row.get('people', [])} | snapshot={row.get('snapshot')}"
+                    )
+                else:
+                    hit = False
+                    answer = f"I could not find recent sightings for '{target}'."
+            else:
+                intent = "object_last_seen"
+                row = memory.find_object_last_seen(target)
+                if row:
+                    answer = (
+                        f"Last seen '{target}' at {row.get('timestamp_local')} | "
+                        f"objects={row.get('objects')} | snapshot={row.get('snapshot')}"
+                    )
+                else:
+                    hit = False
+                    answer = f"I could not find object '{target}' in memory."
+        else:
+            hit = False
+            answer = "Please specify who or what you want to look up."
+    else:
+        context = _build_llm_context(question)
+        llm_answer = _query_groq(question, context)
+        if llm_answer:
+            used_llm = True
+            answer = llm_answer
+        else:
+            hit = False
+            answer = (
+                "I could not resolve that from deterministic tools and no Groq response was available. "
+                "Try asking for summary, recent snapshots, memory stats, or last-seen queries."
+            )
+
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    _append_metric(
+        "chat_query",
+        {
+            "question": question,
+            "intent": intent,
+            "action": action,
+            "hit": bool(hit),
+            "used_llm": bool(used_llm),
+            "duration_ms": round(duration_ms, 2),
+        },
+    )
+
+    return {
+        "answer": answer,
+        "intent": intent,
+        "action": action,
+        "hit": bool(hit),
+        "used_llm": bool(used_llm),
+        "summary": summary_payload,
+        "snapshot": snapshot_payload,
+    }
+
+
 # ── UI helpers ────────────────────────────────────────────────────────────────
 def _bracket_box(frame: np.ndarray, bbox: np.ndarray, color: tuple[int, int, int], thickness: int = 2) -> None:
     x1, y1, x2, y2 = (int(v) for v in bbox)
@@ -917,6 +1820,7 @@ def cmd_enroll(name: str, model: str) -> None:
     started = time.time()
 
     app, db, cap = _build_app(model), FaceDB.load(), _open_camera()
+    reader = _AsyncCameraReader(cap)
     cv2.namedWindow(win := f"Enroll — {name}", cv2.WINDOW_NORMAL)
 
     samples: list[np.ndarray] = []
@@ -928,7 +1832,7 @@ def cmd_enroll(name: str, model: str) -> None:
 
     try:
         while len(samples) < ENROLL_SAMPLES:
-            ok, frame = cap.read()
+            ok, frame = reader.read(timeout_sec=1.0)
             if not ok:
                 frames_dropped += 1
                 continue
@@ -962,6 +1866,7 @@ def cmd_enroll(name: str, model: str) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        reader.close()
         cap.release()
         cv2.destroyAllWindows()
 
@@ -1030,6 +1935,7 @@ def cmd_recognize(
     memory = SceneMemoryManager(snapshot_interval_sec=snapshot_interval, base_dir=MEMORY_DIR)
 
     app, cap = _build_app(model), _open_camera()
+    reader = _AsyncCameraReader(cap)
     gaze_enabled = not disable_gaze
     gaze_auto_download = not disable_gaze_auto_download
     gaze_inference_calls = 0
@@ -1105,6 +2011,9 @@ def cmd_recognize(
     memory_query_counts: Counter[str] = Counter()
     memory_query_hits: Counter[str] = Counter()
     memory_query_misses: Counter[str] = Counter()
+    chat_queries_total = 0
+    chat_queries_hit = 0
+    chat_queries_llm = 0
 
     unknown_alert_count = 0
     last_unknown_alert_ts = -1e9
@@ -1115,6 +2024,7 @@ def cmd_recognize(
 
     people: dict[str, dict[str, Any]] = {}
     visible_prev: set[str] = set()
+    behavior_tracker = _BehaviorTracker()
 
     events: list[dict[str, Any]] = []
     events_total_count = 0
@@ -1142,9 +2052,10 @@ def cmd_recognize(
 
     try:
         while True:
-            ok, frame = cap.read()
+            ok, frame = reader.read(timeout_sec=1.0)
             if not ok:
                 frames_dropped += 1
+                cv2.waitKey(1)
                 continue
 
             frames_total += 1
@@ -1285,29 +2196,91 @@ def cmd_recognize(
                 gaze_inference_min_ms = min(gaze_inference_min_ms, gaze_latency_ms)
                 gaze_inference_max_ms = max(gaze_inference_max_ms, gaze_latency_ms)
 
+            gaze_observations: dict[str, str | None] = {}
+            attention_rows: list[dict[str, Any]] = []
+            face_snapshot_rows: list[dict[str, Any]] = []
             for i, (bbox, _landmarks, label, score) in enumerate(render_rows):
                 color = GREEN if label != UNKNOWN_LABEL else AMBER
                 _bracket_box(frame, bbox, color)
                 _label_tag(frame, f"{label}  {score:.2f}", int(bbox[0]), int(bbox[1]) - 6, color)
 
-                if not ran_gaze_this_frame:
-                    continue
-
                 gaze_info = gaze_rows[i] if i < len(gaze_rows) else None
-                if gaze_info is None:
-                    continue
+                target_info: dict[str, Any] | None = None
+                gaze_payload: dict[str, Any] | None = None
+                if ran_gaze_this_frame and gaze_info is not None:
+                    gx, gy, pitch, yaw = gaze_info
+                    cx = int((bbox[0] + bbox[2]) * 0.5)
+                    cy = int((bbox[1] + bbox[3]) * 0.5)
+                    cv2.line(frame, (cx, cy), (gx, gy), TEAL, 2, cv2.LINE_AA)
+                    cv2.circle(frame, (gx, gy), 7, TEAL, -1)
+                    _label_tag(
+                        frame,
+                        f"pitch:{pitch:+.2f} yaw:{yaw:+.2f}",
+                        gx + 8,
+                        max(20, gy - 8),
+                        TEAL,
+                    )
+                    target_info = _infer_gaze_target(gaze_info, object_rows)
+                    if target_info is not None:
+                        _label_tag(
+                            frame,
+                            f"target:{target_info['label']}",
+                            gx + 8,
+                            min(frame.shape[0] - 10, gy + 22),
+                            CYAN,
+                        )
+                    gaze_payload = {
+                        "endpoint": [int(gx), int(gy)],
+                        "pitch": round(float(pitch), 6),
+                        "yaw": round(float(yaw), 6),
+                    }
 
-                gx, gy, pitch, yaw = gaze_info
-                cx = int((bbox[0] + bbox[2]) * 0.5)
-                cy = int((bbox[1] + bbox[3]) * 0.5)
-                cv2.line(frame, (cx, cy), (gx, gy), TEAL, 2, cv2.LINE_AA)
-                cv2.circle(frame, (gx, gy), 7, TEAL, -1)
-                _label_tag(
-                    frame,
-                    f"pitch:{pitch:+.2f} yaw:{yaw:+.2f}",
-                    gx + 8,
-                    max(20, gy - 8),
-                    TEAL,
+                if label != UNKNOWN_LABEL:
+                    gaze_observations[label] = (
+                        str(target_info.get("label")) if isinstance(target_info, dict) else None
+                    )
+                    if isinstance(target_info, dict):
+                        attention_rows.append(
+                            {
+                                "name": label,
+                                "target_object": str(target_info.get("label")),
+                                "method": target_info.get("method"),
+                                "distance_px": round(_safe_float(target_info.get("distance_px"), 0.0), 3),
+                            }
+                        )
+
+                face_snapshot_rows.append(
+                    {
+                        "name": label,
+                        "confidence": round(float(score), 6),
+                        "bbox": _bbox_to_list(bbox),
+                        "gaze": gaze_payload,
+                        "target_object": str(target_info.get("label")) if isinstance(target_info, dict) else None,
+                    }
+                )
+
+            behavior_events = behavior_tracker.update(gaze_observations, now_ts)
+            for behavior_event in behavior_events:
+                _append_metric("behavior_event", {"session_id": session_id, **behavior_event})
+                evt = str(behavior_event.get("event"))
+                person = str(behavior_event.get("person", "Unknown"))
+                target = behavior_event.get("target_object")
+                prev = behavior_event.get("previous_target")
+                if evt == "switch":
+                    message = f"{person} shifted attention from {prev} to {target}"
+                elif evt == "start":
+                    message = f"{person} started attending {target}"
+                else:
+                    message = f"{person} stopped attending {target}"
+                add_event(
+                    "behavior_event",
+                    message,
+                    extra={
+                        "behavior_event": evt,
+                        "person": person,
+                        "target_object": target,
+                        "duration_sec": behavior_event.get("duration_sec"),
+                    },
                 )
 
             object_labels_in_frame: set[str] = set()
@@ -1343,7 +2316,16 @@ def cmd_recognize(
             latest_object_labels = sorted(object_labels_in_frame)
 
             if memory.should_take_snapshot(now_ts):
-                snap = memory.save_snapshot(frame, object_rows, current_time=now_ts, manual=False)
+                snap = memory.save_snapshot(
+                    frame,
+                    object_rows,
+                    current_time=now_ts,
+                    manual=False,
+                    faces=face_snapshot_rows,
+                    object_detections=object_rows,
+                    people=sorted(visible_now),
+                    attention=attention_rows,
+                )
                 memory_auto_snapshots += 1
                 add_event(
                     "memory_snapshot_auto",
@@ -1378,7 +2360,7 @@ def cmd_recognize(
                         f"Snapshots(auto/manual): {memory_auto_snapshots}/{memory_manual_snapshots}",
                         (160, 160, 160),
                     ),
-                    ("Q quit | G/O toggle YOLO | T/M/R/F/H", (140, 140, 140)),
+                    ("Q quit | G/O toggle YOLO | C/T/M/R/F/H", (140, 140, 140)),
                 ],
             )
             cv2.imshow(win, frame)
@@ -1394,8 +2376,55 @@ def cmd_recognize(
                 enabled = detector.toggle_custom()
                 print(f"Custom YOLO: {'ON' if enabled else 'OFF'}")
                 add_event("toggle_custom_yolo", f"Custom YOLO {'enabled' if enabled else 'disabled'}")
+            elif key == ord("c"):
+                query = input("Chat query: ").strip()
+                if query:
+                    chat_queries_total += 1
+                    runtime_context = {
+                        "memory": memory,
+                        "frame": frame.copy(),
+                        "object_rows": _normalize_object_rows_for_json(object_rows),
+                        "face_rows": _normalize_face_rows_for_json(face_snapshot_rows),
+                        "people": sorted(visible_now),
+                        "attention_rows": list(attention_rows),
+                    }
+                    result = _handle_chat_query(query, runtime_context=runtime_context)
+                    if result.get("hit"):
+                        chat_queries_hit += 1
+                    if result.get("used_llm"):
+                        chat_queries_llm += 1
+                    print(result.get("answer", ""))
+                    add_event(
+                        "chat_query",
+                        f"Chat intent={result.get('intent')} q='{query[:80]}'",
+                        extra={
+                            "intent": result.get("intent"),
+                            "hit": result.get("hit"),
+                            "used_llm": result.get("used_llm"),
+                        },
+                    )
+                    if result.get("action") == "snapshot" and isinstance(result.get("snapshot"), dict):
+                        memory_manual_snapshots += 1
+                        snap = result["snapshot"]
+                        add_event(
+                            "memory_snapshot_manual",
+                            "Manual snapshot saved (chat action)",
+                            extra={
+                                "image_path": snap.get("snapshot_path"),
+                                "image_name": Path(str(snap.get("snapshot", ""))).name,
+                            },
+                        )
             elif key == ord("t"):
-                snap = memory.save_snapshot(frame, object_rows, current_time=now_ts, manual=True)
+                snap = memory.save_snapshot(
+                    frame,
+                    object_rows,
+                    current_time=now_ts,
+                    manual=True,
+                    faces=face_snapshot_rows,
+                    object_detections=object_rows,
+                    people=sorted(visible_now),
+                    attention=attention_rows,
+                )
                 memory_manual_snapshots += 1
                 print(f"Manual snapshot saved: {snap.get('snapshot')}")
                 add_event(
@@ -1444,6 +2473,7 @@ def cmd_recognize(
     except KeyboardInterrupt:
         pass
     finally:
+        reader.close()
         cap.release()
         memory.save_all_memory()
         cv2.destroyAllWindows()
@@ -1451,6 +2481,23 @@ def cmd_recognize(
     end_dt = _now_utc()
     end_ts = time.time()
     duration_sec = max(end_ts - session_start, 0.0)
+
+    for behavior_event in behavior_tracker.finalize(end_ts):
+        _append_metric("behavior_event", {"session_id": session_id, **behavior_event})
+        evt = str(behavior_event.get("event"))
+        if evt == "end":
+            person = str(behavior_event.get("person", "Unknown"))
+            target = behavior_event.get("target_object")
+            add_event(
+                "behavior_event",
+                f"{person} stopped attending {target}",
+                extra={
+                    "behavior_event": evt,
+                    "person": person,
+                    "target_object": target,
+                    "duration_sec": behavior_event.get("duration_sec"),
+                },
+            )
 
     # Close out presence timing for those still visible at end.
     for name in visible_prev:
@@ -1503,6 +2550,17 @@ def cmd_recognize(
             "last_seen_utc": info.get("last_seen_utc"),
             "presence_sec": round(_safe_float(info.get("presence_sec")), 3),
         }
+
+    behavior_summary = behavior_tracker.summary()
+    behavior_interactions_total = _safe_int(behavior_summary.get("interactions_total"), 0)
+    behavior_attention_total_sec = _safe_float(behavior_summary.get("attention_total_sec"), 0.0)
+    transitions_per_min = (
+        behavior_interactions_total / (duration_sec / 60.0) if duration_sec > 0 else 0.0
+    )
+    unique_attended_objects = len(behavior_summary.get("top_objects", []))
+    focus_ratio = (
+        behavior_attention_total_sec / duration_sec if duration_sec > 0 else 0.0
+    )
 
     memory_stats = memory.get_memory_stats()
     aggregate = {
@@ -1577,12 +2635,25 @@ def cmd_recognize(
         "memory_query_counts": dict(memory_query_counts),
         "memory_query_hits": dict(memory_query_hits),
         "memory_query_misses": dict(memory_query_misses),
+        "chat_queries_total": chat_queries_total,
+        "chat_queries_hit": chat_queries_hit,
+        "chat_queries_llm": chat_queries_llm,
+        "behavior_interactions_total": behavior_interactions_total,
+        "behavior_attention_total_sec": round(behavior_attention_total_sec, 3),
+        "behavior_top_objects": behavior_summary.get("top_objects", []),
+        "behavior_attention_map": behavior_summary.get("attention_map", {}),
+        "behavior_events_count": _safe_int(behavior_summary.get("events_count"), 0),
+        "behavior_activity_patterns": {
+            "transitions_per_min": round(transitions_per_min, 3),
+            "unique_attended_objects": unique_attended_objects,
+            "focus_ratio": round(focus_ratio, 4),
+        },
     }
 
     _append_metric(
         "recognize_session",
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "session_id": session_id,
             "model": model,
             "camera_source": CAMERA_SOURCE,
@@ -1696,7 +2767,7 @@ def cmd_train_objects(
 
 
 def cmd_memory_stats() -> None:
-    memory = SceneMemoryManager(base_dir=MEMORY_DIR)
+    memory = SceneMemoryManager(base_dir=MEMORY_DIR, enable_vectors=False)
     stats = memory.get_memory_stats()
     _append_metric(
         "memory_query",
@@ -1710,7 +2781,7 @@ def cmd_memory_stats() -> None:
 
 
 def cmd_memory_recent(minutes: int) -> None:
-    memory = SceneMemoryManager(base_dir=MEMORY_DIR)
+    memory = SceneMemoryManager(base_dir=MEMORY_DIR, enable_vectors=False)
     rows = memory.get_recent_snapshots(minutes=minutes)
     _append_metric(
         "memory_query",
@@ -1735,7 +2806,7 @@ def cmd_memory_recent(minutes: int) -> None:
 
 
 def cmd_memory_find(object_name: str) -> None:
-    memory = SceneMemoryManager(base_dir=MEMORY_DIR)
+    memory = SceneMemoryManager(base_dir=MEMORY_DIR, enable_vectors=False)
     row = memory.find_object_last_seen(object_name)
     _append_metric(
         "memory_query",
@@ -1754,6 +2825,29 @@ def cmd_memory_find(object_name: str) -> None:
     print(
         f"Last seen '{object_name}' at {row.get('timestamp_local')} | "
         f"objects={row.get('objects')} | snapshot={row.get('snapshot')}"
+    )
+
+
+def cmd_memory_find_person(person_name: str) -> None:
+    memory = SceneMemoryManager(base_dir=MEMORY_DIR, enable_vectors=False)
+    row = memory.find_person_last_seen(person_name)
+    _append_metric(
+        "memory_query",
+        {
+            "query_type": "find_person",
+            "person": person_name,
+            "hit": bool(row),
+            "result_count": 1 if row else 0,
+        },
+    )
+
+    if not row:
+        print(f"Person not found: {person_name}")
+        return
+
+    print(
+        f"Last seen '{person_name}' at {row.get('timestamp_local')} | "
+        f"people={row.get('people', [])} | snapshot={row.get('snapshot')}"
     )
 
 
@@ -1785,6 +2879,45 @@ def cmd_memory_search(text: str) -> None:
             f"  {row.get('timestamp_local')} | {row.get('objects')} | "
             f"{row.get('snapshot')}{extra}"
         )
+
+
+def cmd_session_summary(minutes: int, as_json: bool = False) -> None:
+    summary = _build_situation_summary(minutes=minutes)
+    rendered = _render_situation_summary(summary)
+    _append_metric(
+        "summary_query",
+        {
+            "source": "command",
+            "minutes": int(minutes),
+            "result_lines": rendered.count("\n") + 1,
+            "hit": bool(summary.get("top_attention_pairs") or summary.get("snapshots_total")),
+        },
+    )
+    if as_json:
+        print(json.dumps(summary, ensure_ascii=True, indent=2))
+        return
+    print(rendered)
+
+
+def cmd_chat(question: str | None = None) -> None:
+    if question:
+        result = _handle_chat_query(question)
+        print(result.get("answer", ""))
+        return
+
+    print("Interactive chat mode. Type 'quit' to exit.")
+    while True:
+        try:
+            q = input("You> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not q:
+            continue
+        if q.lower() in {"quit", "exit", "q"}:
+            break
+        result = _handle_chat_query(q)
+        print(result.get("answer", ""))
 
 
 # ── Reporting helpers ─────────────────────────────────────────────────────────
@@ -2002,6 +3135,15 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
         "memory_query_counts": raw_aggregate.get("memory_query_counts", event.get("memory_query_counts", {})),
         "memory_query_hits": raw_aggregate.get("memory_query_hits", event.get("memory_query_hits", {})),
         "memory_query_misses": raw_aggregate.get("memory_query_misses", event.get("memory_query_misses", {})),
+        "chat_queries_total": _safe_int(raw_aggregate.get("chat_queries_total"), 0),
+        "chat_queries_hit": _safe_int(raw_aggregate.get("chat_queries_hit"), 0),
+        "chat_queries_llm": _safe_int(raw_aggregate.get("chat_queries_llm"), 0),
+        "behavior_interactions_total": _safe_int(raw_aggregate.get("behavior_interactions_total"), 0),
+        "behavior_attention_total_sec": _safe_float(raw_aggregate.get("behavior_attention_total_sec"), 0.0),
+        "behavior_top_objects": raw_aggregate.get("behavior_top_objects", []),
+        "behavior_attention_map": raw_aggregate.get("behavior_attention_map", {}),
+        "behavior_events_count": _safe_int(raw_aggregate.get("behavior_events_count"), 0),
+        "behavior_activity_patterns": raw_aggregate.get("behavior_activity_patterns", {}),
     }
 
     people = event.get("people") if isinstance(event.get("people"), dict) else {}
@@ -2077,6 +3219,10 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
 
     recognize_events.sort(key=lambda r: r.get("end_utc") or r.get("raw_timestamp_utc") or "")
     latest = recognize_events[-1] if recognize_events else None
+    chat_query_events = [e for e in events if e.get("event_type") == "chat_query"]
+    summary_query_events = [e for e in events if e.get("event_type") == "summary_query"]
+    chat_query_event_hits = sum(1 for e in chat_query_events if bool(e.get("hit")))
+    chat_query_event_llm = sum(1 for e in chat_query_events if bool(e.get("used_llm")))
 
     hist_frames = 0
     hist_frames_with_faces = 0
@@ -2099,6 +3245,13 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
     hist_memory_auto = 0
     hist_memory_manual = 0
     hist_memory_queries_total = 0
+    hist_chat_queries_total = 0
+    hist_chat_queries_hit = 0
+    hist_chat_queries_llm = 0
+    hist_behavior_interactions = 0
+    hist_behavior_attention_sec = 0.0
+    hist_behavior_events = 0
+    behavior_object_counter: Counter[str] = Counter()
 
     label_counter: Counter[str] = Counter()
     object_label_counter: Counter[str] = Counter()
@@ -2142,12 +3295,27 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
         hist_object_conf_weight += object_weight
         hist_memory_auto += _safe_int(a.get("memory_snapshots_auto"), 0)
         hist_memory_manual += _safe_int(a.get("memory_snapshots_manual"), 0)
+        hist_chat_queries_total += _safe_int(a.get("chat_queries_total"), 0)
+        hist_chat_queries_hit += _safe_int(a.get("chat_queries_hit"), 0)
+        hist_chat_queries_llm += _safe_int(a.get("chat_queries_llm"), 0)
+        hist_behavior_interactions += _safe_int(a.get("behavior_interactions_total"), 0)
+        hist_behavior_attention_sec += _safe_float(a.get("behavior_attention_total_sec"), 0.0)
+        hist_behavior_events += _safe_int(a.get("behavior_events_count"), 0)
         query_counts = a.get("memory_query_counts", {})
         if isinstance(query_counts, dict):
             hist_memory_queries_total += sum(_safe_int(v) for v in query_counts.values())
         class_counts = a.get("object_class_counts_total", {})
         if isinstance(class_counts, dict):
             object_label_counter.update({str(k): _safe_int(v) for k, v in class_counts.items()})
+        behavior_top = a.get("behavior_top_objects", [])
+        if isinstance(behavior_top, list):
+            for row in behavior_top:
+                if not isinstance(row, (list, tuple)) or len(row) < 2:
+                    continue
+                weight = _safe_float(row[1], 0.0)
+                if weight <= 0.0:
+                    continue
+                behavior_object_counter[str(row[0])] += max(1, int(round(weight)))
 
         hist_event_count += _safe_int(r.get("events_total_count"), len(r.get("events", [])))
         label_counter.update(r.get("label_counts", {}))
@@ -2242,6 +3410,8 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
             "events_total": len(events),
             "enroll_events": len(enroll_events),
             "recognize_sessions": len(recognize_events),
+            "chat_queries": len(chat_query_events),
+            "summary_queries": len(summary_query_events),
         },
         "latest_session": latest,
         "historical": {
@@ -2273,6 +3443,14 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
             "memory_manual_snapshots": hist_memory_manual,
             "memory_total_snapshots": hist_memory_auto + hist_memory_manual,
             "memory_queries_total": hist_memory_queries_total,
+            "chat_queries_total": len(chat_query_events) or hist_chat_queries_total,
+            "chat_queries_hit": chat_query_event_hits or hist_chat_queries_hit,
+            "chat_queries_llm": chat_query_event_llm or hist_chat_queries_llm,
+            "summary_queries_total": len(summary_query_events),
+            "behavior_interactions_total": hist_behavior_interactions,
+            "behavior_attention_total_sec": hist_behavior_attention_sec,
+            "behavior_events_count": hist_behavior_events,
+            "behavior_top_objects": behavior_object_counter.most_common(10),
             "unique_individuals_seen": len(member_activity),
         },
         "member_activity": member_activity,
@@ -2352,6 +3530,12 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
         if isinstance(latest_agg.get("detection_timeline"), list)
         else []
     )
+    behavior_top = (
+        latest_agg.get("behavior_top_objects", [])
+        if isinstance(latest_agg.get("behavior_top_objects"), list)
+        else []
+    )
+    behavior_interactions = _safe_int(latest_agg.get("behavior_interactions_total"), 0)
 
     lines = [
         "╔════════════════════════════════════════════════════╗",
@@ -2378,6 +3562,7 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
         f"Current People Visible  : {current_visible}",
         f"Memory Snapshots A/M    : {memory_snapshots_auto}/{memory_snapshots_manual}",
         f"Memory Queries (session): {memory_queries_total}",
+        f"Behavior Interactions   : {behavior_interactions}",
         "",
         "--------------------------------------------------------",
         "SESSION STATISTICS",
@@ -2413,6 +3598,10 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
         lines.append(", ".join(str(x) for x in active_objects[:16]))
     else:
         lines.append("No active objects")
+
+    if behavior_top:
+        top_name = str(behavior_top[0][0]) if len(behavior_top[0]) >= 1 else "object"
+        lines.append(f"Top attended object: {top_name}")
 
     lines.extend(
         [
@@ -2517,6 +3706,13 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
             f"Memory Snapshots A/M    : {_safe_int(hist.get('memory_auto_snapshots'), 0)}/"
             f"{_safe_int(hist.get('memory_manual_snapshots'), 0)}",
             f"Memory Queries Total    : {_safe_int(hist.get('memory_queries_total'), 0)}",
+            f"Chat Queries Total      : {_safe_int(hist.get('chat_queries_total'), 0)}",
+            f"Chat Queries Hit/LLM    : {_safe_int(hist.get('chat_queries_hit'), 0)}/"
+            f"{_safe_int(hist.get('chat_queries_llm'), 0)}",
+            f"Summary Queries Total   : {_safe_int(hist.get('summary_queries_total'), 0)}",
+            f"Behavior Interactions   : {_safe_int(hist.get('behavior_interactions_total'), 0)}",
+            f"Behavior Attention (s)  : {_safe_float(hist.get('behavior_attention_total_sec'), 0.0):.1f}",
+            f"Behavior Events         : {_safe_int(hist.get('behavior_events_count'), 0)}",
             f"Alert Density           : {_safe_float(hist.get('alert_density_per_min'), 0.0):.2f} alerts/min",
             f"Average Confidence      : {_safe_float(hist.get('avg_confidence'), 0.0):.4f}",
             "",
@@ -2620,8 +3816,15 @@ def main() -> None:
     p_mr.add_argument("--minutes", type=int, default=5, help="Lookback window in minutes")
     p_mf = sub.add_parser("memory-find", help="Find when an object was last seen")
     p_mf.add_argument("--object", required=True, help="Object label or text")
+    p_mfp = sub.add_parser("memory-find-person", help="Find when a person was last seen")
+    p_mfp.add_argument("--name", required=True, help="Person name")
     p_ms = sub.add_parser("memory-search", help="Search similar scenes")
     p_ms.add_argument("--text", required=True, help="Natural language scene query")
+    p_ss = sub.add_parser("session-summary", help="Generate narrative summary of recent activity")
+    p_ss.add_argument("--minutes", type=int, default=5, help="Lookback window in minutes (default: 5)")
+    p_ss.add_argument("--json", action="store_true", help="Output raw summary JSON")
+    p_chat = sub.add_parser("chat", help="Interactive chat over memory and logs")
+    p_chat.add_argument("--question", default=None, help="Single-turn question (optional)")
 
     sub.add_parser("list", help="List enrolled identities")
     sub.add_parser("report", help="Generate metrics/report files")
@@ -2655,7 +3858,10 @@ def main() -> None:
         "memory-stats": cmd_memory_stats,
         "memory-recent": lambda: cmd_memory_recent(args.minutes),
         "memory-find": lambda: cmd_memory_find(args.object),
+        "memory-find-person": lambda: cmd_memory_find_person(args.name),
         "memory-search": lambda: cmd_memory_search(args.text),
+        "session-summary": lambda: cmd_session_summary(args.minutes, args.json),
+        "chat": lambda: cmd_chat(args.question),
         "list": cmd_list,
         "report": cmd_report,
     }.get(args.cmd, parser.print_help)()

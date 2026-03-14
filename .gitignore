@@ -2,11 +2,10 @@
 .pixi/*
 !.pixi/config.toml
 
-# local references
+# local references and editor state
 .references/
-
-# editor
 .vscode/
+.cache/
 
 # python caches
 __pycache__/
@@ -21,7 +20,16 @@ report.txt
 unknown_incidents/
 custom_model_path.txt
 
-# local model/checkpoint artifacts (large)
+# local model and training artifacts
 models/
 runs/
+*.zip
 *.part
+
+# env/secrets
+.env
+.env.*
+!.env.example
+
+# os noise
+.DS_Store

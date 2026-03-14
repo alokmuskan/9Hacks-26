@@ -6,9 +6,9 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
-run = "python main.py recognize"
-enroll = "python main.py enroll"
-recognize = "python main.py recognize"
+run = "AI_STUDIO_CAM_CAMERA_INDEX=/dev/video42 python main.py recognize"
+enroll = "AI_STUDIO_CAM_CAMERA_INDEX=/dev/video42 python main.py enroll"
+recognize = "AI_STUDIO_CAM_CAMERA_INDEX=/dev/video42 python main.py recognize"
 list = "python main.py list"
 report = "python main.py report"
 
@@ -23,8 +23,12 @@ pillow = ">=11,<12"
 numpy = ">=1.26,<3"
 faiss-cpu = ">=1.9,<2"
 open-clip-torch = ">=3.0,<4"
+huggingface_hub = ">=1.7.1,<2"
+pytest = ">=9.0.2,<10"
 
 [pypi-dependencies]
 gdown = "*"
 l2cs = { git = "https://github.com/Ahmednull/L2CS-Net.git", rev = "a4d8f7fa5436a2b2b9f088471623b552a85811bd" }
 face_detection = { git = "https://github.com/elliottzheng/face-detection.git" }
+groq = "*"
+python-dotenv = "*"

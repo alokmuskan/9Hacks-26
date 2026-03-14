@@ -123,6 +123,56 @@ class SceneMemoryManager:
 
         return sorted(set(labels))
 
+    def _normalize_bbox(self, value: Any) -> list[float]:
+        arr = np.asarray(value, dtype=np.float32).reshape(-1)
+        if arr.size < 4:
+            return [0.0, 0.0, 0.0, 0.0]
+        return [float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])]
+
+    def _normalize_object_rows(self, rows: list[Any]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                class_id = int(row.get("class_id", -1))
+            except Exception:
+                class_id = -1
+            try:
+                confidence = float(row.get("confidence", 0.0))
+            except Exception:
+                confidence = 0.0
+            out.append(
+                {
+                    "label": str(row.get("label", "object")),
+                    "confidence": confidence,
+                    "bbox": self._normalize_bbox(row.get("bbox", [0, 0, 0, 0])),
+                    "source": str(row.get("source", "general")),
+                    "class_id": class_id,
+                }
+            )
+        return out
+
+    def _normalize_face_rows(self, rows: list[Any]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                confidence = float(row.get("confidence", 0.0))
+            except Exception:
+                confidence = 0.0
+            out.append(
+                {
+                    "name": str(row.get("name", "Unknown")),
+                    "confidence": confidence,
+                    "bbox": self._normalize_bbox(row.get("bbox", [0, 0, 0, 0])),
+                    "gaze": row.get("gaze") if isinstance(row.get("gaze"), dict) else None,
+                    "target_object": row.get("target_object"),
+                }
+            )
+        return out
+
     def _embed_image(self, image: Image.Image) -> np.ndarray | None:
         if not self.vectors_enabled:
             return None
@@ -145,6 +195,10 @@ class SceneMemoryManager:
         detections: list[Any],
         current_time: float | None = None,
         manual: bool = False,
+        faces: list[dict[str, Any]] | None = None,
+        object_detections: list[dict[str, Any]] | None = None,
+        people: list[str] | None = None,
+        attention: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         ts_utc = datetime.now(timezone.utc)
         snapshot_path = self._next_snapshot_path(ts_utc)
@@ -153,6 +207,8 @@ class SceneMemoryManager:
         image.save(snapshot_path, format="JPEG", quality=95)
 
         labels = self._extract_labels(detections)
+        object_rows = self._normalize_object_rows(object_detections or [])
+        face_rows = self._normalize_face_rows(faces or [])
 
         if self.vectors_enabled and self._faiss_index is not None:
             emb = self._embed_image(image)
@@ -170,6 +226,42 @@ class SceneMemoryManager:
             "manual": bool(manual),
             "object_count": len(labels),
         }
+        if object_rows:
+            entry["object_detections"] = object_rows
+        if face_rows:
+            entry["faces"] = face_rows
+
+        if people:
+            entry["people"] = sorted({str(p) for p in people if str(p).strip()})
+        elif face_rows:
+            entry["people"] = sorted(
+                {
+                    str(row.get("name"))
+                    for row in face_rows
+                    if str(row.get("name", "")).strip()
+                    and str(row.get("name")) != "Unknown"
+                }
+            )
+
+        if isinstance(attention, list) and attention:
+            safe_attention: list[dict[str, Any]] = []
+            for row in attention:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    distance_px = float(row.get("distance_px", 0.0))
+                except Exception:
+                    distance_px = 0.0
+                safe_attention.append(
+                    {
+                        "name": str(row.get("name", "Unknown")),
+                        "target_object": row.get("target_object"),
+                        "method": row.get("method"),
+                        "distance_px": distance_px,
+                    }
+                )
+            if safe_attention:
+                entry["attention"] = safe_attention
 
         self.metadata.append(entry)
         self._save_metadata()
@@ -226,6 +318,23 @@ class SceneMemoryManager:
             labels = [str(o).lower() for o in entry.get("objects", [])]
             if any(target in label for label in labels):
                 return entry
+        return None
+
+    def find_person_last_seen(self, person_name: str) -> dict[str, Any] | None:
+        target = person_name.strip().lower()
+        if not target:
+            return None
+
+        for entry in reversed(self.metadata):
+            people = [str(p).lower() for p in entry.get("people", [])]
+            if any(target in person for person in people):
+                return entry
+
+            faces = entry.get("faces", [])
+            if isinstance(faces, list):
+                names = [str(row.get("name", "")).lower() for row in faces if isinstance(row, dict)]
+                if any(target in name for name in names):
+                    return entry
         return None
 
     def _parse_dt(self, value: Any) -> datetime | None:

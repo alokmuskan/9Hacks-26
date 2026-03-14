@@ -61,6 +61,15 @@ class MetricsSchemaTests(unittest.TestCase):
                 "memory_query_counts": {"find": 2, "recent": 1},
                 "memory_query_hits": {"find": 1},
                 "memory_query_misses": {"find": 1},
+                "chat_queries_total": 3,
+                "chat_queries_hit": 2,
+                "chat_queries_llm": 1,
+                "behavior_interactions_total": 7,
+                "behavior_attention_total_sec": 123.4,
+                "behavior_top_objects": [["laptop", 90.2]],
+                "behavior_attention_map": {"Hemanth": {"laptop": 90.2}},
+                "behavior_events_count": 11,
+                "behavior_activity_patterns": {"transitions_per_min": 1.2},
                 "gaze_enabled": True,
                 "gaze_model_loaded": True,
                 "gaze_base_interval_frames": 3,
@@ -85,6 +94,15 @@ class MetricsSchemaTests(unittest.TestCase):
         self.assertEqual(agg["memory_snapshots_auto"], 4)
         self.assertEqual(agg["memory_snapshots_manual"], 1)
         self.assertEqual(agg["memory_query_counts"], {"find": 2, "recent": 1})
+        self.assertEqual(agg["chat_queries_total"], 3)
+        self.assertEqual(agg["chat_queries_hit"], 2)
+        self.assertEqual(agg["chat_queries_llm"], 1)
+        self.assertEqual(agg["behavior_interactions_total"], 7)
+        self.assertAlmostEqual(agg["behavior_attention_total_sec"], 123.4, places=6)
+        self.assertEqual(agg["behavior_top_objects"], [["laptop", 90.2]])
+        self.assertEqual(agg["behavior_attention_map"], {"Hemanth": {"laptop": 90.2}})
+        self.assertEqual(agg["behavior_events_count"], 11)
+        self.assertEqual(agg["behavior_activity_patterns"], {"transitions_per_min": 1.2})
         self.assertTrue(agg["gaze_enabled"])
         self.assertTrue(agg["gaze_model_loaded"])
         self.assertEqual(agg["gaze_base_interval_frames"], 3)
@@ -125,6 +143,15 @@ class MetricsSchemaTests(unittest.TestCase):
         self.assertEqual(agg["gaze_inference_avg_ms"], 0.0)
         self.assertEqual(agg["gaze_inference_min_ms"], 0.0)
         self.assertEqual(agg["gaze_inference_max_ms"], 0.0)
+        self.assertEqual(agg["chat_queries_total"], 0)
+        self.assertEqual(agg["chat_queries_hit"], 0)
+        self.assertEqual(agg["chat_queries_llm"], 0)
+        self.assertEqual(agg["behavior_interactions_total"], 0)
+        self.assertEqual(agg["behavior_attention_total_sec"], 0.0)
+        self.assertEqual(agg["behavior_top_objects"], [])
+        self.assertEqual(agg["behavior_attention_map"], {})
+        self.assertEqual(agg["behavior_events_count"], 0)
+        self.assertEqual(agg["behavior_activity_patterns"], {})
 
 
 if __name__ == "__main__":

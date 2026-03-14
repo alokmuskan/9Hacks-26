@@ -1,103 +1,117 @@
-# 9Hacks-26
+# Intelligent Monitoring System
 
-Real-time vision pipeline for:
-- face enrollment and recognition
-- dual YOLO object detection (general + custom)
-- gaze prediction (L2CS-Net)
-- scene memory snapshots and search
-- session metrics and report generation
+A real-time AI monitoring pipeline that combines:
 
-## Stack
+- Face recognition (InsightFace)
+- Object detection (YOLO: general + custom)
+- Gaze prediction (L2CS-Net)
+- Behavior tracking (who looked at what, and for how long)
+- Memory snapshots with searchable metadata
+- Chat and situation summary queries over recent activity
 
-- Python 3.11
-- InsightFace
-- OpenCV
-- Ultralytics YOLO
-- PyTorch / TorchVision
-- L2CS-Net (via pip git dependency)
-- FAISS + OpenCLIP for memory search
-- Pixi for environment and task management
+## Milestone
+
+This milestone adds working chatbot and summary capabilities on top of face/object/gaze + memory data.
 
 ## Setup
+
+Install dependencies with Pixi:
 
 ```bash
 pixi install
 ```
 
-## Core Commands
+## Quick Start
+
+Enroll a person:
 
 ```bash
-# enroll an identity
-pixi run python main.py enroll --name "Hemanth"
+pixi run python main.py enroll --name Hemanth
+```
 
-# live face + object + gaze recognition
+Start live monitoring:
+
+```bash
 pixi run python main.py recognize
-
-# generate report artifacts
-pixi run python main.py report
-
-# list enrolled identities
-pixi run python main.py list
 ```
 
-If no subcommand is provided, `recognize` is used by default.
-
-## Recognize Options
+Generate summary for the last 5 minutes:
 
 ```bash
-python main.py recognize \
-  --general-model <path-or-default> \
-  --custom-model <path> \
-  --snapshot-interval 15 \
-  --gaze-arch ResNet18 \
-  --gaze-weights models/L2CSNet_gaze360.pkl
+pixi run python main.py session-summary --minutes 5
 ```
 
-Useful flags:
-- `--disable-general`
-- `--disable-custom`
-- `--disable-gaze`
-- `--gaze-weights-source <url>`
-- `--disable-gaze-auto-download`
-
-## Object Model Training
+Ask a one-shot chatbot question:
 
 ```bash
-python main.py train-objects \
-  --data <dataset.yaml> \
-  --base-model yolov8n.pt \
-  --epochs 30 \
-  --imgsz 640 \
-  --batch 16 \
-  --set-default
+pixi run python main.py chat --question "What happened in the last 5 minutes?"
 ```
 
-## Memory Commands
+## Commands
 
 ```bash
+python main.py enroll --name <person>
+python main.py recognize [--disable-general] [--disable-custom] [--disable-gaze]
+python main.py train-objects --data <dataset.yaml> [--set-default]
 python main.py memory-stats
-python main.py memory-recent --minutes 5
-python main.py memory-find --object "person"
-python main.py memory-search --text "person near doorway"
+python main.py memory-recent --minutes <n>
+python main.py memory-find --object <label>
+python main.py memory-find-person --name <person>
+python main.py memory-search --text "<query>"
+python main.py session-summary --minutes <n> [--json]
+python main.py chat [--question "..."]
+python main.py list
+python main.py report
 ```
 
-## Runtime Hotkeys
+## Chatbot Behavior
+
+Deterministic intents supported directly from logs/memory:
+
+- session summary queries
+- last-seen object queries
+- last-seen person queries
+- memory stats and recent snapshots
+- attention-style questions (for example: who looked at laptop)
+
+For open-ended prompts, the system can use Groq when configured.
+
+## Runtime Controls (during recognize)
 
 - `q`: quit
 - `g`: toggle general YOLO
 - `o`: toggle custom YOLO
-- `t`: take manual memory snapshot
-- `m`: print memory statistics
-- `r`: show recent snapshots
-- `f`: find when object was last seen
-- `h`: print help
+- `c`: open chatbot prompt
+- `t`: manual snapshot
+- `m`: memory stats
+- `r`: recent snapshots
+- `f`: find last-seen object
+- `h`: help
 
-## Local Artifacts
+## Environment Variables
 
-Generated runtime artifacts are intentionally gitignored:
-- `face_db.npz`
-- `memory/`
-- `unknown_incidents/`
-- `metrics_log.jsonl`
-- `report.txt`
-- `models/`
+Use `.env` or shell exports:
+
+- `AI_STUDIO_CAM_CAMERA_INDEX`
+- `AI_STUDIO_GENERAL_YOLO_MODEL`
+- `GROQ_API_KEY` (preferred)
+- `groq_api_key` (compat fallback)
+- `GROQ_MODEL` (default: `llama-3.3-70b-versatile`)
+
+## Stored Data
+
+- `metrics_log.jsonl`: append-only events/sessions
+- `memory/metadata.json`: memory metadata
+- `memory/snapshots/*`: captured frames
+- `memory/embeddings.faiss`: vector index (if enabled)
+
+## Test
+
+```bash
+pixi run python -m unittest discover -s tests -q
+```
+
+## Docs
+
+- `docs/ARCHITECTURE.md`
+- `docs/CHAT_AND_SUMMARY.md`
