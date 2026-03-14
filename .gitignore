@@ -2,6 +2,9 @@
 .pixi/*
 !.pixi/config.toml
 
+# local references
+.references/
+
 # editor
 .vscode/
 
@@ -10,10 +13,15 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
-# local runtime artifacts
-unknown_incidents/
+# runtime artifacts
+face_db.npz
 memory/
 metrics_log.jsonl
 report.txt
-face_db.npz
+unknown_incidents/
 custom_model_path.txt
+
+# local model/checkpoint artifacts (large)
+models/
+runs/
+*.part

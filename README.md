@@ -1,29 +1,22 @@
 # 9Hacks-26
 
-Real-time vision console for:
-- face enrollment and recognition (InsightFace)
-- object detection with dual YOLO streams (general + custom)
-- scene memory snapshots and retrieval
-- unknown-incident capture and session reporting
+Real-time vision pipeline for:
+- face enrollment and recognition
+- dual YOLO object detection (general + custom)
+- gaze prediction (L2CS-Net)
+- scene memory snapshots and search
+- session metrics and report generation
 
-## Features
+## Stack
 
-- Live face recognition with persistent local face database (`face_db.npz`)
-- Dual YOLO inference:
-  - general model (default `yolov8n.pt` or configured path)
-  - optional custom fine-tuned model
-- Scene memory manager with:
-  - periodic/manual snapshots
-  - metadata storage
-  - vector search via CLIP + FAISS (when available)
-- Unknown face incident image capture
-- Metrics logging (`metrics_log.jsonl`) and ASCII report generation (`report.txt`)
-
-## Requirements
-
-- Linux (project currently configured for `linux-64` in `pixi.toml`)
-- Webcam/camera device
-- [Pixi](https://pixi.sh/) recommended for environment + dependency management
+- Python 3.11
+- InsightFace
+- OpenCV
+- Ultralytics YOLO
+- PyTorch / TorchVision
+- L2CS-Net (via pip git dependency)
+- FAISS + OpenCLIP for memory search
+- Pixi for environment and task management
 
 ## Setup
 
@@ -31,63 +24,80 @@ Real-time vision console for:
 pixi install
 ```
 
-## Quick Start
-
-Enroll a person:
+## Core Commands
 
 ```bash
-pixi run python main.py enroll --name "YourName"
-```
+# enroll an identity
+pixi run python main.py enroll --name "Hemanth"
 
-Start live recognition + object detection:
-
-```bash
+# live face + object + gaze recognition
 pixi run python main.py recognize
-```
 
-Generate report:
-
-```bash
+# generate report artifacts
 pixi run python main.py report
+
+# list enrolled identities
+pixi run python main.py list
 ```
 
-## CLI Commands
+If no subcommand is provided, `recognize` is used by default.
+
+## Recognize Options
 
 ```bash
-python main.py enroll --name <name>
-python main.py recognize [--general-model <path>] [--custom-model <path>] [--disable-general] [--disable-custom] [--snapshot-interval 15]
-python main.py train-objects --data <dataset.yaml> [--base-model yolov8n.pt] [--epochs 30] [--imgsz 640] [--batch 16] [--project runs/detect] [--name custom-objects] [--set-default]
+python main.py recognize \
+  --general-model <path-or-default> \
+  --custom-model <path> \
+  --snapshot-interval 15 \
+  --gaze-arch ResNet18 \
+  --gaze-weights models/L2CSNet_gaze360.pkl
+```
+
+Useful flags:
+- `--disable-general`
+- `--disable-custom`
+- `--disable-gaze`
+- `--gaze-weights-source <url>`
+- `--disable-gaze-auto-download`
+
+## Object Model Training
+
+```bash
+python main.py train-objects \
+  --data <dataset.yaml> \
+  --base-model yolov8n.pt \
+  --epochs 30 \
+  --imgsz 640 \
+  --batch 16 \
+  --set-default
+```
+
+## Memory Commands
+
+```bash
 python main.py memory-stats
 python main.py memory-recent --minutes 5
-python main.py memory-find --object "<label>"
-python main.py memory-search --text "<query>"
-python main.py list
-python main.py report
+python main.py memory-find --object "person"
+python main.py memory-search --text "person near doorway"
 ```
 
-If no command is passed, `recognize` is used by default.
-
-## Runtime Controls (recognize mode)
+## Runtime Hotkeys
 
 - `q`: quit
 - `g`: toggle general YOLO
 - `o`: toggle custom YOLO
-- `t`: manual memory snapshot
-- `m`: print memory stats
-- `r`: list recent snapshots (last 5 minutes)
-- `f`: find when an object was last seen
-- `h`: print runtime help
+- `t`: take manual memory snapshot
+- `m`: print memory statistics
+- `r`: show recent snapshots
+- `f`: find when object was last seen
+- `h`: print help
 
-## Environment Variables
+## Local Artifacts
 
-- `AI_STUDIO_CAM_CAMERA_INDEX` (default: `42`)
-- `AI_STUDIO_GENERAL_YOLO_MODEL` (default: `.references/AI-Studio-Cam-(On-Hold)/models/yolov8n.pt`)
-
-## Generated Artifacts
-
-- `face_db.npz`: enrolled face embeddings/centroids
-- `unknown_incidents/`: unknown face snapshots
-- `memory/`: scene snapshots + metadata + FAISS index
-- `metrics_log.jsonl`: event/session metrics
-- `report.txt`: generated ASCII summary report
-- `custom_model_path.txt`: pointer to selected custom YOLO model (when set)
+Generated runtime artifacts are intentionally gitignored:
+- `face_db.npz`
+- `memory/`
+- `unknown_incidents/`
+- `metrics_log.jsonl`
+- `report.txt`
+- `models/`

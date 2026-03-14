@@ -39,6 +39,16 @@ UNKNOWN_LABEL = "Unknown"
 
 EVENTS_TIMELINE_CAP = 500
 UNKNOWN_ALERT_COOLDOWN_SEC = 3.0
+GAZE_INTERVAL_DEFAULT = 1
+GAZE_MAX_INTERVAL_DEFAULT = 4
+GAZE_TARGET_FPS_DROP_DEFAULT = 0.25
+GAZE_ARCH_DEFAULT = "ResNet18"
+GAZE_WEIGHTS_DEFAULT = "models/L2CSNet_gaze360.pkl"
+GAZE_WEIGHTS_SOURCE_DEFAULT = (
+    "https://drive.google.com/drive/folders/17p6ORr-JQJcw-eYtG2WGNiuS_qVKwdWd?usp=sharing"
+)
+GAZE_EMA_ALPHA = 0.10
+GAZE_RECOVERY_STREAK_MIN = 5
 
 WHITE = (255, 255, 255)
 GREEN = (0, 210, 80)
@@ -341,7 +351,9 @@ def _open_camera() -> cv2.VideoCapture:
     raise RuntimeError(f"Failed to open readable camera stream. Tried: {tried_msg}")
 
 
-def _detect(app: FaceAnalysis, frame: np.ndarray) -> list[tuple[np.ndarray, np.ndarray, float]]:
+def _detect(
+    app: FaceAnalysis, frame: np.ndarray
+) -> list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None]]:
     h, w = frame.shape[:2]
     scale = INFER_MAX_SIDE / max(h, w)
     inp = (
@@ -359,12 +371,445 @@ def _detect(app: FaceAnalysis, frame: np.ndarray) -> list[tuple[np.ndarray, np.n
             np.asarray(f.bbox, np.float32) * inv,
             _l2(np.asarray(f.normed_embedding, np.float32)),
             float(getattr(f, "det_score", 1.0)),
+            (
+                np.asarray(getattr(f, "kps"), np.float32) * inv
+                if getattr(f, "kps", None) is not None
+                else (
+                    np.asarray(getattr(f, "landmark"), np.float32) * inv
+                    if getattr(f, "landmark", None) is not None
+                    else None
+                )
+            ),
         )
         for f in app.get(inp)
     ]
 
 
-def _best_face(faces: list[tuple[np.ndarray, np.ndarray, float]]) -> tuple[np.ndarray, np.ndarray, float] | None:
+def _arch_name_tokens(arch: str) -> list[str]:
+    s = arch.lower().replace("-", "").replace("_", "")
+    if s.endswith("18"):
+        return ["resnet18", "res18", "r18"]
+    if s.endswith("34"):
+        return ["resnet34", "res34", "r34"]
+    if s.endswith("50"):
+        return ["resnet50", "res50", "r50"]
+    if s.endswith("101"):
+        return ["resnet101", "res101", "r101"]
+    if s.endswith("152"):
+        return ["resnet152", "res152", "r152"]
+    return [s]
+
+
+def _select_gaze360_weight_path(
+    candidates: list[str | Path], preferred_arch: str | None = None
+) -> Path | None:
+    filtered: list[Path] = []
+    for candidate in candidates:
+        path = Path(candidate)
+        name = path.name.lower()
+        if path.suffix.lower() == ".pkl" and "gaze360" in name:
+            filtered.append(path)
+    if not filtered:
+        return None
+
+    if preferred_arch:
+        arch_filtered: list[Path] = []
+        tokens = _arch_name_tokens(preferred_arch)
+        for path in filtered:
+            name = path.name.lower().replace("-", "").replace("_", "")
+            if any(tok in name for tok in tokens):
+                arch_filtered.append(path)
+        if arch_filtered:
+            return sorted(arch_filtered, key=lambda p: p.name.lower())[0]
+
+    return sorted(filtered, key=lambda p: p.name.lower())[0]
+
+
+def _resolve_l2cs_weights_path(
+    weights_path: Path,
+    weights_source: str,
+    auto_download: bool,
+    gdown_module: Any | None,
+    cached_resolved_path: Path | None = None,
+    preferred_arch: str | None = None,
+    force_download: bool = False,
+) -> Path | None:
+    if not force_download and cached_resolved_path is not None and cached_resolved_path.exists():
+        return cached_resolved_path
+    if not force_download and weights_path.exists():
+        return weights_path
+
+    # Fast local fallback: discover nested gaze360 checkpoints under the same base directory.
+    if not force_download:
+        local_candidates = list(weights_path.parent.rglob("*.pkl")) if weights_path.parent.exists() else []
+        local_selected = _select_gaze360_weight_path(
+            [str(p) for p in local_candidates], preferred_arch=preferred_arch
+        )
+        if local_selected is not None and local_selected.exists():
+            return local_selected.resolve()
+
+    if not auto_download or gdown_module is None:
+        return None
+
+    weights_path.parent.mkdir(parents=True, exist_ok=True)
+    downloaded_files: list[str] = []
+    try:
+        rows = gdown_module.download_folder(
+            url=weights_source,
+            output=str(weights_path.parent),
+            quiet=True,
+            use_cookies=False,
+        )
+        if isinstance(rows, list):
+            downloaded_files = [str(x) for x in rows if x]
+    except Exception:
+        return None
+
+    candidate_paths: list[Path] = []
+    for row in downloaded_files:
+        path = Path(row)
+        if path.is_dir():
+            candidate_paths.extend(path.rglob("*.pkl"))
+        else:
+            candidate_paths.append(path)
+
+    if not candidate_paths:
+        candidate_paths = list(weights_path.parent.rglob("*.pkl"))
+    selected = _select_gaze360_weight_path([str(p) for p in candidate_paths], preferred_arch=preferred_arch)
+    return selected if selected is None else selected.resolve()
+
+
+def _expand_bbox_by_ratio(
+    bbox: np.ndarray,
+    frame_w: int,
+    frame_h: int,
+    ratio: float = 0.10,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    bw = max(x2 - x1, 1.0)
+    bh = max(y2 - y1, 1.0)
+    pad_x = bw * ratio
+    pad_y = bh * ratio
+    ex1 = max(0, int(round(x1 - pad_x)))
+    ey1 = max(0, int(round(y1 - pad_y)))
+    ex2 = min(max(frame_w - 1, 0), int(round(x2 + pad_x)))
+    ey2 = min(max(frame_h - 1, 0), int(round(y2 + pad_y)))
+    return ex1, ey1, ex2, ey2
+
+
+def _align_face_from_landmarks(face_crop: np.ndarray, landmarks: np.ndarray | None) -> np.ndarray:
+    if face_crop is None or face_crop.size == 0:
+        return face_crop
+
+    h, w = face_crop.shape[:2]
+    if w < 32:
+        return face_crop
+
+    if landmarks is None:
+        return face_crop
+    lm = np.asarray(landmarks, dtype=np.float32)
+    if lm.ndim != 2 or lm.shape[0] < 2 or lm.shape[1] < 2:
+        return face_crop
+
+    left_eye = lm[0]
+    right_eye = lm[1]
+    dx = float(right_eye[0] - left_eye[0])
+    dy = float(right_eye[1] - left_eye[1])
+    eye_distance = float(np.hypot(dx, dy))
+    if eye_distance < 20.0:
+        return face_crop
+
+    angle = float(np.degrees(np.arctan2(dy, dx)))
+    center = (w * 0.5, h * 0.5)
+    try:
+        mat = cv2.getRotationMatrix2D(center, angle, 1.0)
+        border_mode = int(getattr(cv2, "BORDER_REPLICATE", 1))
+        return cv2.warpAffine(face_crop, mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=border_mode)
+    except Exception:
+        return face_crop
+
+
+def _decode_l2cs_pitch_yaw_rad(
+    pitch_logits: Any,
+    yaw_logits: Any,
+    softmax: Any,
+    idx_tensor_deg: Any,
+    torch_module: Any,
+) -> tuple[Any, Any]:
+    # Convert to radians exactly once after expected-value decoding in degrees.
+    pitch_rad = torch_module.sum(softmax(pitch_logits) * idx_tensor_deg, dim=1) * (np.pi / 180.0)
+    yaw_rad = torch_module.sum(softmax(yaw_logits) * idx_tensor_deg, dim=1) * (np.pi / 180.0)
+    return pitch_rad, yaw_rad
+
+
+def _infer_l2cs_arch_from_state_dict(state_dict: dict[str, Any]) -> str | None:
+    fc_w = state_dict.get("fc_yaw_gaze.weight")
+    fc_shape = getattr(fc_w, "shape", None)
+    if not fc_shape or len(fc_shape) < 2:
+        return None
+
+    width = int(fc_shape[1])
+    keyset = {str(k) for k in state_dict.keys()}
+    if width == 512:
+        # Distinguish 18 vs 34 by existence of deeper stage block indexes.
+        if any(k.startswith("layer1.2.") or k.startswith("layer2.3.") or k.startswith("layer3.5.") for k in keyset):
+            return "ResNet34"
+        return "ResNet18"
+
+    if width == 2048:
+        # Distinguish 50/101/152 using deepest layer3 block index.
+        if any(k.startswith("layer3.35.") for k in keyset):
+            return "ResNet152"
+        if any(k.startswith("layer3.23.") for k in keyset):
+            return "ResNet101"
+        return "ResNet50"
+
+    return None
+
+
+def _gaze_endpoint_from_pitch_yaw(
+    cx: float,
+    cy: float,
+    length: float,
+    pitch: float,
+    yaw: float,
+    frame_w: int,
+    frame_h: int,
+) -> tuple[int, int]:
+    # Match L2CS draw math: dx uses pitch, dy uses yaw.
+    dx = -length * float(np.sin(pitch) * np.cos(yaw))
+    dy = -length * float(np.sin(yaw))
+    gx = int(round(cx + dx))
+    gy = int(round(cy + dy))
+    gx = int(np.clip(gx, 0, max(frame_w - 1, 0)))
+    gy = int(np.clip(gy, 0, max(frame_h - 1, 0)))
+    return gx, gy
+
+
+def _load_gaze_runtime(
+    gaze_arch: str,
+    gaze_weights: str,
+    gaze_weights_source: str,
+    gaze_auto_download: bool,
+) -> dict[str, Any] | None:
+    try:
+        import torch
+        from l2cs.utils import getArch, prep_input_numpy
+    except Exception as ex:
+        print(f"[GAZE] L2CS dependencies unavailable ({ex})")
+        return None
+
+    gdown_module: Any | None = None
+    if gaze_auto_download:
+        try:
+            import gdown  # type: ignore
+
+            gdown_module = gdown
+        except Exception:
+            gdown_module = None
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    weights_path = Path(gaze_weights)
+    resolved_path = _resolve_l2cs_weights_path(
+        weights_path=weights_path,
+        weights_source=gaze_weights_source,
+        auto_download=gaze_auto_download,
+        gdown_module=gdown_module,
+        cached_resolved_path=None,
+        preferred_arch=gaze_arch,
+        force_download=False,
+    )
+    if resolved_path is None or not resolved_path.exists():
+        print("[GAZE] L2CS weights unavailable — gaze estimation disabled")
+        return None
+
+    try:
+        state_dict = torch.load(str(resolved_path), map_location=device)
+        inferred_arch = _infer_l2cs_arch_from_state_dict(state_dict) or "ResNet50"
+
+        # If local/default weights don't match requested arch, try a forced arch-specific download once.
+        if inferred_arch != gaze_arch and gaze_auto_download and gdown_module is not None:
+            alt_path = _resolve_l2cs_weights_path(
+                weights_path=weights_path,
+                weights_source=gaze_weights_source,
+                auto_download=True,
+                gdown_module=gdown_module,
+                cached_resolved_path=None,
+                preferred_arch=gaze_arch,
+                force_download=True,
+            )
+            if alt_path is not None and alt_path.exists() and alt_path.resolve() != resolved_path.resolve():
+                resolved_path = alt_path.resolve()
+                state_dict = torch.load(str(resolved_path), map_location=device)
+                inferred_arch = _infer_l2cs_arch_from_state_dict(state_dict) or inferred_arch
+
+        candidate_arches = [inferred_arch]
+        for arch in ["ResNet18", "ResNet34", "ResNet50", "ResNet101", "ResNet152"]:
+            if arch not in candidate_arches:
+                candidate_arches.append(arch)
+
+        model = None
+        loaded_arch = None
+        last_error: Exception | None = None
+        for candidate in candidate_arches:
+            try:
+                trial_model = getArch(candidate, 90)
+                trial_model.load_state_dict(state_dict)
+                trial_model.eval()
+                trial_model.to(device)
+                model = trial_model
+                loaded_arch = candidate
+                break
+            except Exception as ex:
+                last_error = ex
+
+        if model is None or loaded_arch is None:
+            raise RuntimeError(f"Unable to match weights with any supported L2CS arch. Last error: {last_error}")
+
+        softmax = torch.nn.Softmax(dim=1)
+        idx_tensor_deg = (torch.arange(90, dtype=torch.float32, device=device) * 4.0) - 180.0
+    except Exception as ex:
+        msg = str(ex).splitlines()[0] if str(ex) else type(ex).__name__
+        print(f"[GAZE] L2CS model load failed ({msg})")
+        return None
+
+    if loaded_arch != gaze_arch:
+        print(f"[GAZE] Requested arch {gaze_arch} mismatched weights; using {loaded_arch}")
+    print(f"Gaze model loaded: L2CS-Net {loaded_arch} ({device.type})")
+    return {
+        "model": model,
+        "device": device,
+        "torch": torch,
+        "softmax": softmax,
+        "idx_tensor_deg": idx_tensor_deg,
+        "prep_input_numpy": prep_input_numpy,
+        "weights_path": str(resolved_path),
+        "weights_source": gaze_weights_source,
+        "arch": loaded_arch,
+    }
+
+
+def _estimate_gaze_points(
+    frame: np.ndarray,
+    bboxes: list[np.ndarray],
+    landmarks_list: list[np.ndarray | None],
+    gaze_runtime: dict[str, Any] | None,
+) -> list[tuple[int, int, float, float] | None]:
+    if gaze_runtime is None or not bboxes:
+        return [None for _ in bboxes]
+
+    model = gaze_runtime.get("model")
+    device = gaze_runtime.get("device")
+    torch = gaze_runtime.get("torch")
+    softmax = gaze_runtime.get("softmax")
+    idx_tensor_deg = gaze_runtime.get("idx_tensor_deg")
+    prep_input_numpy = gaze_runtime.get("prep_input_numpy")
+    if (
+        model is None
+        or device is None
+        or torch is None
+        or softmax is None
+        or idx_tensor_deg is None
+        or prep_input_numpy is None
+    ):
+        return [None for _ in bboxes]
+
+    frame_h, frame_w = frame.shape[:2]
+    if frame_h <= 0 or frame_w <= 0:
+        return [None for _ in bboxes]
+
+    valid_idx: list[int] = []
+    crops_rgb: list[np.ndarray] = []
+    for i, bbox in enumerate(bboxes):
+        landmarks = landmarks_list[i] if i < len(landmarks_list) else None
+        ex1, ey1, ex2, ey2 = _expand_bbox_by_ratio(bbox, frame_w, frame_h, ratio=0.10)
+        if ex2 <= ex1 or ey2 <= ey1:
+            continue
+        crop = frame[ey1:ey2, ex1:ex2]
+        if crop.size == 0:
+            continue
+        crop_landmarks: np.ndarray | None = None
+        if landmarks is not None:
+            lm = np.asarray(landmarks, dtype=np.float32)
+            if lm.ndim == 2 and lm.shape[0] >= 2 and lm.shape[1] >= 2:
+                crop_landmarks = lm.copy()
+                crop_landmarks[:, 0] -= float(ex1)
+                crop_landmarks[:, 1] -= float(ey1)
+
+        aligned = _align_face_from_landmarks(crop, crop_landmarks)
+        aligned = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
+        aligned = cv2.resize(aligned, (224, 224), interpolation=cv2.INTER_LINEAR)
+        crops_rgb.append(aligned)
+        valid_idx.append(i)
+
+    results: list[tuple[int, int, float, float] | None] = [None for _ in bboxes]
+    if not crops_rgb:
+        return results
+
+    inp = prep_input_numpy(np.stack(crops_rgb), device)
+    with torch.no_grad():
+        pitch_logits, yaw_logits = model(inp)
+        pitch_rad, yaw_rad = _decode_l2cs_pitch_yaw_rad(
+            pitch_logits=pitch_logits,
+            yaw_logits=yaw_logits,
+            softmax=softmax,
+            idx_tensor_deg=idx_tensor_deg,
+            torch_module=torch,
+        )
+        pitch_np = pitch_rad.detach().cpu().numpy()
+        yaw_np = yaw_rad.detach().cpu().numpy()
+
+    for j, i in enumerate(valid_idx):
+        bbox = bboxes[i]
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        bbox_width = max(x2 - x1, 1.0)
+        length = bbox_width * 0.7
+
+        pitch = float(pitch_np[j])
+        yaw = float(yaw_np[j])
+        gx, gy = _gaze_endpoint_from_pitch_yaw(
+            cx=cx,
+            cy=cy,
+            length=length,
+            pitch=pitch,
+            yaw=yaw,
+            frame_w=frame_w,
+            frame_h=frame_h,
+        )
+        results[i] = (gx, gy, pitch, yaw)
+
+    return results
+
+
+def _adapt_gaze_interval(
+    current_interval: int,
+    base_interval: int,
+    max_interval: int,
+    overhead_ratio: float,
+    target_drop: float,
+    recovery_streak: int,
+) -> tuple[int, int]:
+    current_interval = max(current_interval, 1)
+    base_interval = max(base_interval, 1)
+    max_interval = max(max_interval, base_interval)
+
+    if overhead_ratio > target_drop:
+        return min(current_interval + 1, max_interval), 0
+
+    if overhead_ratio < (target_drop * 0.5):
+        next_streak = recovery_streak + 1
+        if next_streak >= GAZE_RECOVERY_STREAK_MIN and current_interval > base_interval:
+            return max(current_interval - 1, base_interval), 0
+        return current_interval, next_streak
+
+    return current_interval, 0
+
+
+def _best_face(
+    faces: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None]]
+) -> tuple[np.ndarray, np.ndarray, float, np.ndarray | None] | None:
     return max(
         faces,
         key=lambda f: (f[0][2] - f[0][0]) * (f[0][3] - f[0][1]),
@@ -497,7 +942,7 @@ def cmd_enroll(name: str, model: str) -> None:
             elif picked is None:
                 status, sc = "No face detected", AMBER
             else:
-                bbox, emb, _ = picked
+                bbox, emb, _, _ = picked
                 _bracket_box(frame, bbox, TEAL)
                 now = time.time()
                 elapsed = now - last_capture_ts
@@ -559,6 +1004,11 @@ def cmd_recognize(
     disable_general: bool,
     disable_custom: bool,
     snapshot_interval: float,
+    disable_gaze: bool,
+    gaze_arch: str,
+    gaze_weights: str,
+    gaze_weights_source: str,
+    disable_gaze_auto_download: bool,
 ) -> None:
     db = FaceDB.load()
     if not db.names:
@@ -580,6 +1030,25 @@ def cmd_recognize(
     memory = SceneMemoryManager(snapshot_interval_sec=snapshot_interval, base_dir=MEMORY_DIR)
 
     app, cap = _build_app(model), _open_camera()
+    gaze_enabled = not disable_gaze
+    gaze_auto_download = not disable_gaze_auto_download
+    gaze_inference_calls = 0
+    gaze_inference_sum_ms = 0.0
+    gaze_inference_min_ms = float("inf")
+    gaze_inference_max_ms = 0.0
+    gaze_runtime = (
+        _load_gaze_runtime(
+            gaze_arch=gaze_arch,
+            gaze_weights=gaze_weights,
+            gaze_weights_source=gaze_weights_source,
+            gaze_auto_download=gaze_auto_download,
+        )
+        if gaze_enabled
+        else None
+    )
+    gaze_model_loaded = gaze_runtime is not None
+    gaze_active = gaze_enabled and gaze_model_loaded
+
     cv2.namedWindow(win := "Recognize", cv2.WINDOW_NORMAL)
 
     print("Running unified stream: InsightFace + YOLO + memory.")
@@ -588,6 +1057,16 @@ def cmd_recognize(
         print(f"Custom YOLO model: {custom_model_path}")
     else:
         print("Custom YOLO model: not configured")
+    if gaze_enabled:
+        if gaze_model_loaded:
+            loaded_path = str(gaze_runtime.get("weights_path", gaze_weights)) if gaze_runtime else gaze_weights
+            loaded_arch = str(gaze_runtime.get("arch", gaze_arch)) if gaze_runtime else gaze_arch
+            print(
+                f"Gaze active: model=L2CS-Net {loaded_arch} weights={loaded_path} "
+                "mode=full-rate"
+            )
+        else:
+            print("Gaze requested but unavailable. Continuing with gaze OFF.")
 
     t_prev = time.time()
     fps_ema = 0.0
@@ -713,12 +1192,12 @@ def cmd_recognize(
             visible_now: set[str] = set()
             unknown_in_frame = False
             unknown_bboxes: list[np.ndarray] = []
-            render_rows: list[tuple[np.ndarray, str, float]] = []
+            render_rows: list[tuple[np.ndarray, np.ndarray | None, str, float]] = []
             active_conf: dict[str, float] = {}
 
-            for bbox, emb, _ in face_rows:
+            for bbox, emb, _, landmarks in face_rows:
                 label, score = _match(emb, db)
-                render_rows.append((bbox, label, score))
+                render_rows.append((bbox, landmarks, label, score))
                 confidence_sum += score
 
                 if label == UNKNOWN_LABEL:
@@ -786,10 +1265,50 @@ def cmd_recognize(
                 for n, c in sorted(active_conf.items(), key=lambda kv: kv[1], reverse=True)
             ]
 
-            for bbox, label, score in render_rows:
+            gaze_rows: list[tuple[int, int, float, float] | None] = [None for _ in render_rows]
+            ran_gaze_this_frame = False
+            if (
+                gaze_active
+                and render_rows
+            ):
+                ran_gaze_this_frame = True
+                gaze_t0 = time.perf_counter()
+                gaze_rows = _estimate_gaze_points(
+                    frame,
+                    [row[0] for row in render_rows],
+                    [row[1] for row in render_rows],
+                    gaze_runtime,
+                )
+                gaze_latency_ms = (time.perf_counter() - gaze_t0) * 1000.0
+                gaze_inference_calls += 1
+                gaze_inference_sum_ms += gaze_latency_ms
+                gaze_inference_min_ms = min(gaze_inference_min_ms, gaze_latency_ms)
+                gaze_inference_max_ms = max(gaze_inference_max_ms, gaze_latency_ms)
+
+            for i, (bbox, _landmarks, label, score) in enumerate(render_rows):
                 color = GREEN if label != UNKNOWN_LABEL else AMBER
                 _bracket_box(frame, bbox, color)
                 _label_tag(frame, f"{label}  {score:.2f}", int(bbox[0]), int(bbox[1]) - 6, color)
+
+                if not ran_gaze_this_frame:
+                    continue
+
+                gaze_info = gaze_rows[i] if i < len(gaze_rows) else None
+                if gaze_info is None:
+                    continue
+
+                gx, gy, pitch, yaw = gaze_info
+                cx = int((bbox[0] + bbox[2]) * 0.5)
+                cy = int((bbox[1] + bbox[3]) * 0.5)
+                cv2.line(frame, (cx, cy), (gx, gy), TEAL, 2, cv2.LINE_AA)
+                cv2.circle(frame, (gx, gy), 7, TEAL, -1)
+                _label_tag(
+                    frame,
+                    f"pitch:{pitch:+.2f} yaw:{yaw:+.2f}",
+                    gx + 8,
+                    max(20, gy - 8),
+                    TEAL,
+                )
 
             object_labels_in_frame: set[str] = set()
             for row in object_rows:
@@ -836,6 +1355,7 @@ def cmd_recognize(
                 )
 
             state = detector.get_state()
+            gaze_status = "ON" if gaze_active else ("OFF" if not gaze_enabled else "UNAVAILABLE")
             _hud(
                 frame,
                 [
@@ -848,6 +1368,11 @@ def cmd_recognize(
                         f"G:{'ON' if state['general']['enabled'] else 'OFF'} "
                         f"C:{'ON' if state['custom']['enabled'] else 'OFF'}",
                         (180, 180, 180),
+                    ),
+                    (
+                        f"Gaze:{gaze_status} L:{'Y' if gaze_model_loaded else 'N'} "
+                        f"Calls:{gaze_inference_calls}",
+                        (170, 170, 170),
                     ),
                     (
                         f"Snapshots(auto/manual): {memory_auto_snapshots}/{memory_manual_snapshots}",
@@ -963,6 +1488,9 @@ def cmd_recognize(
         if object_custom_detections > 0
         else 0.0
     )
+    gaze_inference_avg_ms = (
+        gaze_inference_sum_ms / gaze_inference_calls if gaze_inference_calls > 0 else 0.0
+    )
 
     people_clean: dict[str, dict[str, Any]] = {}
     for name, info in people.items():
@@ -1018,6 +1546,18 @@ def cmd_recognize(
         "object_avg_confidence": round(object_avg_conf, 4),
         "object_avg_confidence_general": round(object_avg_conf_general, 4),
         "object_avg_confidence_custom": round(object_avg_conf_custom, 4),
+        "gaze_enabled": gaze_enabled,
+        "gaze_model_loaded": gaze_model_loaded,
+        "gaze_base_interval_frames": 1,
+        "gaze_interval_frames_final": 1,
+        "gaze_target_fps_drop": 0.0,
+        "gaze_inference_calls": gaze_inference_calls,
+        "gaze_inference_avg_ms": round(gaze_inference_avg_ms, 2),
+        "gaze_inference_min_ms": round(
+            0.0 if gaze_inference_min_ms == float("inf") else gaze_inference_min_ms,
+            2,
+        ),
+        "gaze_inference_max_ms": round(gaze_inference_max_ms, 2),
         "object_class_counts_total": dict(object_class_counts_total),
         "object_class_counts_general": dict(object_class_counts_general),
         "object_class_counts_custom": dict(object_class_counts_custom),
@@ -1393,6 +1933,38 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
             raw_aggregate.get(
                 "object_avg_confidence_custom", event.get("object_avg_confidence_custom", 0.0)
             ),
+            0.0,
+        ),
+        "gaze_enabled": bool(raw_aggregate.get("gaze_enabled", event.get("gaze_enabled", False))),
+        "gaze_model_loaded": bool(
+            raw_aggregate.get("gaze_model_loaded", event.get("gaze_model_loaded", False))
+        ),
+        "gaze_base_interval_frames": _safe_int(
+            raw_aggregate.get("gaze_base_interval_frames", event.get("gaze_base_interval_frames", 0)),
+            0,
+        ),
+        "gaze_interval_frames_final": _safe_int(
+            raw_aggregate.get("gaze_interval_frames_final", event.get("gaze_interval_frames_final", 0)),
+            0,
+        ),
+        "gaze_target_fps_drop": _safe_float(
+            raw_aggregate.get("gaze_target_fps_drop", event.get("gaze_target_fps_drop", 0.0)),
+            0.0,
+        ),
+        "gaze_inference_calls": _safe_int(
+            raw_aggregate.get("gaze_inference_calls", event.get("gaze_inference_calls", 0)),
+            0,
+        ),
+        "gaze_inference_avg_ms": _safe_float(
+            raw_aggregate.get("gaze_inference_avg_ms", event.get("gaze_inference_avg_ms", 0.0)),
+            0.0,
+        ),
+        "gaze_inference_min_ms": _safe_float(
+            raw_aggregate.get("gaze_inference_min_ms", event.get("gaze_inference_min_ms", 0.0)),
+            0.0,
+        ),
+        "gaze_inference_max_ms": _safe_float(
+            raw_aggregate.get("gaze_inference_max_ms", event.get("gaze_inference_max_ms", 0.0)),
             0.0,
         ),
         "object_class_counts_total": raw_aggregate.get(
@@ -2000,11 +2572,33 @@ def main() -> None:
     )
     p_r.add_argument("--disable-general", action="store_true", help="Disable general YOLO stream")
     p_r.add_argument("--disable-custom", action="store_true", help="Disable custom YOLO stream")
+    p_r.add_argument("--disable-gaze", action="store_true", help="Disable gaze prediction stream")
     p_r.add_argument(
         "--snapshot-interval",
         type=float,
         default=15.0,
         help="Automatic snapshot interval in seconds (default: 15)",
+    )
+    p_r.add_argument(
+        "--gaze-arch",
+        default=GAZE_ARCH_DEFAULT,
+        choices=["ResNet18", "ResNet34", "ResNet50", "ResNet101", "ResNet152"],
+        help=f"L2CS-Net backbone architecture (default: {GAZE_ARCH_DEFAULT})",
+    )
+    p_r.add_argument(
+        "--gaze-weights",
+        default=GAZE_WEIGHTS_DEFAULT,
+        help=f"Path to L2CS-Net gaze weights (default: {GAZE_WEIGHTS_DEFAULT})",
+    )
+    p_r.add_argument(
+        "--gaze-weights-source",
+        default=GAZE_WEIGHTS_SOURCE_DEFAULT,
+        help="Source URL used for auto-downloading gaze weights when local file is missing",
+    )
+    p_r.add_argument(
+        "--disable-gaze-auto-download",
+        action="store_true",
+        help="Disable automatic gaze weight download fallback",
     )
 
     p_t = sub.add_parser("train-objects", help="Fine-tune YOLO on a custom dataset YAML")
@@ -2042,6 +2636,11 @@ def main() -> None:
             args.disable_general,
             args.disable_custom,
             args.snapshot_interval,
+            args.disable_gaze,
+            args.gaze_arch,
+            args.gaze_weights,
+            args.gaze_weights_source,
+            args.disable_gaze_auto_download,
         ),
         "train-objects": lambda: cmd_train_objects(
             args.data,
