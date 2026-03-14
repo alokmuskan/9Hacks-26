@@ -31,7 +31,8 @@ def _load_env_file() -> None:
 _load_env_file()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CAMERA_SOURCE = os.getenv("AI_STUDIO_CAM_CAMERA_INDEX", "42").strip()
+_DEFAULT_CAMERA_SOURCE = "/dev/video42" if sys.platform.startswith("linux") else "0"
+CAMERA_SOURCE = os.getenv("AI_STUDIO_CAM_CAMERA_INDEX", _DEFAULT_CAMERA_SOURCE).strip()
 DB_PATH = Path("face_db.npz")
 METRICS_LOG_PATH = Path("metrics_log.jsonl")
 REPORT_TXT_PATH = Path("report.txt")
@@ -55,7 +56,7 @@ UNKNOWN_ALERT_COOLDOWN_SEC = 3.0
 GAZE_INTERVAL_DEFAULT = 1
 GAZE_MAX_INTERVAL_DEFAULT = 4
 GAZE_TARGET_FPS_DROP_DEFAULT = 0.25
-GAZE_ARCH_DEFAULT = "ResNet18"
+GAZE_ARCH_DEFAULT = "ResNet50"
 GAZE_WEIGHTS_DEFAULT = "models/L2CSNet_gaze360.pkl"
 GAZE_WEIGHTS_SOURCE_DEFAULT = (
     "https://drive.google.com/drive/folders/17p6ORr-JQJcw-eYtG2WGNiuS_qVKwdWd?usp=sharing"
@@ -337,6 +338,18 @@ def _build_app(model: str) -> FaceAnalysis:
 
 
 def _open_camera() -> cv2.VideoCapture:
+    def suppress_opencv_warnings() -> None:
+        try:
+            if hasattr(cv2, "setLogLevel"):
+                cv2.setLogLevel(0)
+                return
+            if hasattr(cv2, "utils") and hasattr(cv2.utils, "logging"):
+                cvlog = cv2.utils.logging
+                if hasattr(cvlog, "setLogLevel"):
+                    cvlog.setLogLevel(getattr(cvlog, "LOG_LEVEL_ERROR", 0))
+        except Exception:
+            pass
+
     def camera_readable(cap: cv2.VideoCapture, warmup_reads: int = 10) -> bool:
         if not cap or not cap.isOpened():
             return False
@@ -347,15 +360,24 @@ def _open_camera() -> cv2.VideoCapture:
             time.sleep(0.03)
         return False
 
+    source_value = os.getenv("AI_STUDIO_CAM_CAMERA_INDEX", CAMERA_SOURCE).strip()
+
+    suppress_opencv_warnings()
+
     candidates: list[int | str] = []
-    if CAMERA_SOURCE.startswith("/dev/"):
-        candidates.append(CAMERA_SOURCE)
-    elif CAMERA_SOURCE.isdigit():
+    if source_value.startswith("/dev/"):
+        candidates.append(source_value)
+        # Optional fallback for OpenCV builds that only work with numeric indices.
+        if os.getenv("AI_STUDIO_CAM_INCLUDE_INDEX_FALLBACK", "0") == "1":
+            suffix = source_value.replace("/dev/video", "", 1)
+            if source_value.startswith("/dev/video") and suffix.isdigit():
+                candidates.append(int(suffix))
+    elif source_value.isdigit():
         # On some systems, path-based open works while index-based open does not.
-        candidates.append(f"/dev/video{CAMERA_SOURCE}")
-        candidates.append(int(CAMERA_SOURCE))
-    elif CAMERA_SOURCE:
-        candidates.append(CAMERA_SOURCE)
+        candidates.append(f"/dev/video{source_value}")
+        candidates.append(int(source_value))
+    elif source_value:
+        candidates.append(source_value)
 
     if sys.platform.startswith("linux") and os.getenv("AI_STUDIO_CAM_SCAN_ALL_DEVICES", "0") == "1":
         for path in sorted(Path("/dev").glob("video*"), key=lambda p: p.name, reverse=True):
@@ -376,11 +398,15 @@ def _open_camera() -> cv2.VideoCapture:
 
     for source in candidates:
         if sys.platform.startswith("linux"):
-            if isinstance(source, str):
-                # Path-based capture is more reliable for v4l2loopback devices.
+            if isinstance(source, str) and source.startswith("/dev/video"):
+                # Many Linux builds read v4l2loopback more reliably via FFmpeg path.
                 backends = [cv2.CAP_FFMPEG, cv2.CAP_ANY, cv2.CAP_V4L2]
+            elif isinstance(source, int):
+                backends = [cv2.CAP_V4L2]
+            elif isinstance(source, str):
+                backends = [cv2.CAP_ANY]
             else:
-                backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
+                backends = [cv2.CAP_ANY]
         else:
             backends = [cv2.CAP_ANY]
 
@@ -392,9 +418,7 @@ def _open_camera() -> cv2.VideoCapture:
                 continue
 
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            if isinstance(source, str):
-                # Device-path opens can be valid even when warm-up reads are backend-dependent.
-                return cap
+            # Require readable frames for non-device-path sources to fail-fast on broken streams.
             if camera_readable(cap):
                 return cap
 
@@ -3778,7 +3802,7 @@ def main() -> None:
     p_r.add_argument(
         "--gaze-arch",
         default=GAZE_ARCH_DEFAULT,
-        choices=["ResNet18", "ResNet34", "ResNet50", "ResNet101", "ResNet152"],
+        choices=["ResNet50"],
         help=f"L2CS-Net backbone architecture (default: {GAZE_ARCH_DEFAULT})",
     )
     p_r.add_argument(

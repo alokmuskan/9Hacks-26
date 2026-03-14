@@ -1,0 +1,159 @@
+.live-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 16px;
+}
+
+.live-stream-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.live-stream-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.badge {
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.badge.ok {
+  background: rgba(0, 255, 102, 0.14);
+  color: var(--accent-green);
+}
+
+.badge.danger {
+  background: rgba(255, 51, 102, 0.18);
+  color: var(--accent-red);
+}
+
+.live-viewport {
+  position: relative;
+  width: 100%;
+  min-height: 420px;
+  border-radius: 12px;
+  border: 1px solid var(--glass-border);
+  overflow: hidden;
+  background: #000;
+}
+
+.scanline {
+  pointer-events: none;
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 3px;
+  background: rgba(0, 210, 254, 0.45);
+  animation: scanline 4.5s linear infinite;
+}
+
+.live-warmup-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  background: rgba(2, 10, 24, 0.56);
+}
+
+.live-warmup-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 210, 254, 0.24);
+  background: rgba(8, 17, 38, 0.82);
+  color: var(--text-primary);
+  padding: 10px 14px;
+  font-size: 0.9rem;
+}
+
+.live-warmup-spinner {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.15);
+  border-top-color: var(--accent-blue);
+  animation: live-warmup-spin 0.9s linear infinite;
+}
+
+@keyframes live-warmup-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes scanline {
+  0% {
+    transform: translateY(0);
+  }
+  100% {
+    transform: translateY(420px);
+  }
+}
+
+.controls-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.startup-failure-box {
+  margin-top: 10px;
+  border: 1px solid rgba(255, 51, 102, 0.35);
+  background: rgba(255, 51, 102, 0.12);
+  color: #ffdbe7;
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.toggle-list {
+  margin-top: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.toggle-btn {
+  justify-content: flex-start;
+}
+
+.counts-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.count-box {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 10px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.count-box span {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.count-box strong {
+  font-size: 1.2rem;
+}
+
+@media (max-width: 1200px) {
+  .live-grid {
+    grid-template-columns: 1fr;
+  }
+}

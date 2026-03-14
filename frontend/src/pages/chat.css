@@ -1,0 +1,72 @@
+.chat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 70vh;
+}
+
+.chat-scroll {
+  flex: 1;
+  overflow: auto;
+  display: grid;
+  gap: 10px;
+  padding-right: 4px;
+}
+
+.chat-msg {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.04);
+  max-width: min(80%, 900px);
+}
+
+.chat-msg.user {
+  justify-self: end;
+  background: rgba(0, 210, 254, 0.16);
+  border-color: rgba(0, 210, 254, 0.25);
+}
+
+.chat-msg.assistant {
+  justify-self: start;
+}
+
+.chat-form {
+  display: flex;
+  gap: 8px;
+}
+
+.chat-form input {
+  flex: 1;
+  border-radius: 10px;
+  border: 1px solid var(--glass-border);
+  background: rgba(0, 0, 0, 0.2);
+  color: var(--text-primary);
+  padding: 10px 12px;
+}
+
+.chat-citations {
+  margin-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.chat-citation-item {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  padding: 6px 8px;
+  display: grid;
+  gap: 2px;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+.chat-citation-item strong {
+  color: var(--accent-cyan);
+}
+
+.chat-action-row {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+}

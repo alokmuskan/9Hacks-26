@@ -1,0 +1,30 @@
+.register-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.register-form {
+  display: grid;
+  gap: 12px;
+}
+
+.register-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.register-stream {
+  margin-top: 10px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--glass-border);
+  min-height: 320px;
+  background: #000;
+}
+
+@media (max-width: 1200px) {
+  .register-grid {
+    grid-template-columns: 1fr;
+  }
+}

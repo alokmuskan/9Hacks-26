@@ -1,0 +1,34 @@
+.report-grid {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr;
+  gap: 16px;
+}
+
+.summary-controls {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.text-box {
+  white-space: pre-wrap;
+  margin-top: 10px;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 10px;
+  min-height: 100px;
+}
+
+.report-log-table {
+  max-height: 360px;
+  overflow: auto;
+  margin-top: 10px;
+}
+
+@media (max-width: 1200px) {
+  .report-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,117 +1,90 @@
-# Intelligent Monitoring System
+# Intelligent Monitoring Platform
 
-A real-time AI monitoring pipeline that combines:
-
-- Face recognition (InsightFace)
-- Object detection (YOLO: general + custom)
-- Gaze prediction (L2CS-Net)
-- Behavior tracking (who looked at what, and for how long)
-- Memory snapshots with searchable metadata
-- Chat and situation summary queries over recent activity
+Full-stack monitoring system with working backend API + frontend dashboard.
 
 ## Milestone
 
-This milestone adds working chatbot and summary capabilities on top of face/object/gaze + memory data.
+`Milestone: Frontend and Backend Working`
 
-## Setup
+## What Works
 
-Install dependencies with Pixi:
+- Real-time monitor pipeline (face recognition + object detection + gaze)
+- Behavior tracking (who looked at what)
+- Memory snapshots and searchable history
+- Chat + summary queries over logs/memory
+- FastAPI backend with REST + WebSocket streams
+- React/Vite frontend dashboard connected to backend
+
+## Project Structure
+
+- `main.py` - CLI pipeline and local commands
+- `server.py` - FastAPI backend
+- `frontend/` - React client app
+- `docs/ARCHITECTURE.md` - pipeline/runtime internals
+- `docs/CHAT_AND_SUMMARY.md` - chat and summary behavior
+
+## Backend Run
 
 ```bash
 pixi install
+AI_STUDIO_CAM_CAMERA_INDEX=/dev/video42 pixi run python server.py
 ```
 
-## Quick Start
+Backend default: `http://localhost:8000`
 
-Enroll a person:
+## Frontend Run
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Frontend default: `http://localhost:5173`
+
+`VITE_API_BASE` controls backend URL (default `http://localhost:8000`).
+
+## CLI Run (Optional)
 
 ```bash
 pixi run python main.py enroll --name Hemanth
-```
-
-Start live monitoring:
-
-```bash
 pixi run python main.py recognize
-```
-
-Generate summary for the last 5 minutes:
-
-```bash
 pixi run python main.py session-summary --minutes 5
-```
-
-Ask a one-shot chatbot question:
-
-```bash
 pixi run python main.py chat --question "What happened in the last 5 minutes?"
 ```
 
-## Commands
+## Key API Endpoints
 
-```bash
-python main.py enroll --name <person>
-python main.py recognize [--disable-general] [--disable-custom] [--disable-gaze]
-python main.py train-objects --data <dataset.yaml> [--set-default]
-python main.py memory-stats
-python main.py memory-recent --minutes <n>
-python main.py memory-find --object <label>
-python main.py memory-find-person --name <person>
-python main.py memory-search --text "<query>"
-python main.py session-summary --minutes <n> [--json]
-python main.py chat [--question "..."]
-python main.py list
-python main.py report
-```
+- `POST /api/v1/monitor/start`
+- `POST /api/v1/monitor/stop`
+- `GET /api/v1/monitor/status`
+- `GET /api/v1/stream/video`
+- `WS /api/v1/stream/events/ws`
+- `POST /api/v1/chat/query`
+- `GET /api/v1/summaries/session?minutes=5`
 
-## Chatbot Behavior
+## Environment
 
-Deterministic intents supported directly from logs/memory:
-
-- session summary queries
-- last-seen object queries
-- last-seen person queries
-- memory stats and recent snapshots
-- attention-style questions (for example: who looked at laptop)
-
-For open-ended prompts, the system can use Groq when configured.
-
-## Runtime Controls (during recognize)
-
-- `q`: quit
-- `g`: toggle general YOLO
-- `o`: toggle custom YOLO
-- `c`: open chatbot prompt
-- `t`: manual snapshot
-- `m`: memory stats
-- `r`: recent snapshots
-- `f`: find last-seen object
-- `h`: help
-
-## Environment Variables
-
-Use `.env` or shell exports:
+Use `.env` for secrets/config:
 
 - `AI_STUDIO_CAM_CAMERA_INDEX`
 - `AI_STUDIO_GENERAL_YOLO_MODEL`
-- `GROQ_API_KEY` (preferred)
-- `groq_api_key` (compat fallback)
-- `GROQ_MODEL` (default: `llama-3.3-70b-versatile`)
+- `GROQ_API_KEY` (or `groq_api_key`)
+- `GROQ_MODEL`
+- `PORT`
 
-## Stored Data
+## Tests
 
-- `metrics_log.jsonl`: append-only events/sessions
-- `memory/metadata.json`: memory metadata
-- `memory/snapshots/*`: captured frames
-- `memory/embeddings.faiss`: vector index (if enabled)
-
-## Test
+Backend:
 
 ```bash
 pixi run python -m unittest discover -s tests -q
 ```
 
-## Docs
+Frontend:
 
-- `docs/ARCHITECTURE.md`
-- `docs/CHAT_AND_SUMMARY.md`
+```bash
+cd frontend
+npm test
+npm run build
+```

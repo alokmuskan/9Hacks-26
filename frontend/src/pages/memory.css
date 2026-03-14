@@ -1,0 +1,44 @@
+.memory-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.snapshot-grid {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.snapshot-card {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.lookup-row {
+  display: flex;
+  gap: 10px;
+  align-items: end;
+  margin-top: 10px;
+}
+
+.json-box {
+  margin-top: 12px;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 10px;
+  max-height: 260px;
+  overflow: auto;
+  font-size: 0.78rem;
+}
+
+@media (max-width: 1200px) {
+  .memory-grid {
+    grid-template-columns: 1fr;
+  }
+}
