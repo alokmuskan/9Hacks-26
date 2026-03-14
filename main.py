@@ -14,6 +14,8 @@ from typing import Any
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
+from object_detection import DualYoloDetector, find_latest_custom_model
+from scene_memory import SceneMemoryManager
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CAMERA_SOURCE = int(os.getenv("AI_STUDIO_CAM_CAMERA_INDEX", "42"))
@@ -21,8 +23,15 @@ DB_PATH = Path("face_db.npz")
 METRICS_LOG_PATH = Path("metrics_log.jsonl")
 REPORT_TXT_PATH = Path("report.txt")
 UNKNOWN_INCIDENTS_DIR = Path("unknown_incidents")
+MEMORY_DIR = Path("memory")
+CUSTOM_MODEL_POINTER_PATH = Path("custom_model_path.txt")
+DEFAULT_GENERAL_MODEL = os.getenv(
+    "AI_STUDIO_GENERAL_YOLO_MODEL",
+    ".references/AI-Studio-Cam-(On-Hold)/models/yolov8n.pt",
+)
 
 ENROLL_SAMPLES = 25
+ENROLL_CAPTURE_INTERVAL_SEC = 0.25
 MATCH_THRESHOLD = 0.40
 DET_SIZE = 320
 INFER_MAX_SIDE = 640
@@ -35,6 +44,8 @@ WHITE = (255, 255, 255)
 GREEN = (0, 210, 80)
 AMBER = (0, 140, 255)
 TEAL = (200, 220, 0)
+CYAN = (255, 255, 0)
+MAGENTA = (255, 0, 255)
 BLACK = (0, 0, 0)
 
 
@@ -173,6 +184,88 @@ def _save_unknown_snapshot(
     return str(candidate)
 
 
+def _resolve_general_model_path(path: str | None) -> str:
+    if path:
+        return path
+
+    configured = Path(DEFAULT_GENERAL_MODEL)
+    if configured.exists():
+        return str(configured)
+    return "yolov8n.pt"
+
+
+def _load_default_custom_model_path() -> str | None:
+    if CUSTOM_MODEL_POINTER_PATH.exists():
+        raw = CUSTOM_MODEL_POINTER_PATH.read_text(encoding="utf-8").strip()
+        if raw and Path(raw).exists():
+            return raw
+
+    latest = find_latest_custom_model()
+    if latest and Path(latest).exists():
+        return latest
+    return None
+
+
+def _save_default_custom_model_path(path: str) -> None:
+    CUSTOM_MODEL_POINTER_PATH.write_text(str(Path(path)), encoding="utf-8")
+
+
+def _print_runtime_help() -> None:
+    print("\nRuntime controls:")
+    print("  q  quit")
+    print("  g  toggle general YOLO")
+    print("  o  toggle custom YOLO")
+    print("  t  manual memory snapshot")
+    print("  m  memory statistics")
+    print("  r  recent snapshots (5 minutes)")
+    print("  f  find when object was last seen")
+    print("  h  print this help")
+
+
+def _make_face_analysis(model: str, providers: list[str]) -> FaceAnalysis:
+    try:
+        return FaceAnalysis(
+            name=model,
+            providers=providers,
+            allowed_modules=["detection", "recognition"],
+        )
+    except TypeError:
+        return FaceAnalysis(name=model, providers=providers)
+
+
+def _repair_insightface_model_layout(model: str) -> bool:
+    """
+    Repair model packs extracted as ~/.insightface/models/<model>/<model>/*.onnx.
+    InsightFace expects ONNX files directly in ~/.insightface/models/<model>.
+    """
+    model_dir = Path("~/.insightface/models").expanduser() / model
+    nested_dir = model_dir / model
+
+    if not nested_dir.exists() or not nested_dir.is_dir():
+        return False
+    if any(model_dir.glob("*.onnx")):
+        return False
+    if not any(nested_dir.glob("*.onnx")):
+        return False
+
+    moved_any = False
+    for item in nested_dir.iterdir():
+        target = model_dir / item.name
+        if target.exists():
+            continue
+        item.replace(target)
+        moved_any = True
+
+    try:
+        nested_dir.rmdir()
+    except OSError:
+        pass
+
+    if moved_any:
+        print(f"Repaired InsightFace model layout for '{model}' in {model_dir}")
+    return moved_any
+
+
 def _build_app(model: str) -> FaceAnalysis:
     try:
         import onnxruntime as ort
@@ -186,14 +279,19 @@ def _build_app(model: str) -> FaceAnalysis:
     ] or ["CPUExecutionProvider"]
     ctx_id = 0 if "CUDAExecutionProvider" in providers else -1
 
+    _repair_insightface_model_layout(model)
     try:
-        app = FaceAnalysis(
-            name=model,
-            providers=providers,
-            allowed_modules=["detection", "recognition"],
-        )
-    except TypeError:
-        app = FaceAnalysis(name=model, providers=providers)
+        app = _make_face_analysis(model, providers)
+    except AssertionError as exc:
+        repaired = _repair_insightface_model_layout(model)
+        if repaired:
+            app = _make_face_analysis(model, providers)
+        else:
+            model_dir = Path("~/.insightface/models").expanduser() / model
+            raise RuntimeError(
+                f"InsightFace model '{model}' is missing detection ONNX files in {model_dir}. "
+                "Delete that model directory and rerun to re-download cleanly."
+            ) from exc
 
     app.prepare(ctx_id=ctx_id, det_size=(DET_SIZE, DET_SIZE))
     print(f"Model: {model}  |  Providers: {providers}")
@@ -201,18 +299,46 @@ def _build_app(model: str) -> FaceAnalysis:
 
 
 def _open_camera() -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(CAMERA_SOURCE)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera {CAMERA_SOURCE}.")
+    def camera_readable(cap: cv2.VideoCapture, warmup_reads: int = 10) -> bool:
+        if not cap or not cap.isOpened():
+            return False
+        for _ in range(warmup_reads):
+            ok, frame = cap.read()
+            if ok and frame is not None and frame.size > 0:
+                return True
+            time.sleep(0.03)
+        return False
 
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        if cap.read()[0]:
-            return cap
-        time.sleep(0.05)
-    cap.release()
-    raise RuntimeError(f"Camera {CAMERA_SOURCE}: no frames within 3 s.")
+    candidates: list[int] = [CAMERA_SOURCE]
+    if sys.platform.startswith("linux"):
+        for path in Path("/dev").glob("video*"):
+            suffix = path.name.replace("video", "", 1)
+            if suffix.isdigit():
+                candidates.append(int(suffix))
+    candidates = list(dict.fromkeys(candidates))
+
+    backends = [cv2.CAP_V4L2, cv2.CAP_ANY] if sys.platform.startswith("linux") else [cv2.CAP_ANY]
+    tried: list[str] = []
+
+    for index in candidates:
+        for backend in backends:
+            cap = cv2.VideoCapture(index, backend)
+            if not cap.isOpened():
+                cap.release()
+                tried.append(f"{index}@{backend}:open_failed")
+                continue
+
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if camera_readable(cap):
+                return cap
+
+            cap.release()
+            tried.append(f"{index}@{backend}:no_frames")
+
+    tried_msg = ", ".join(tried[:18])
+    if len(tried) > 18:
+        tried_msg += ", ..."
+    raise RuntimeError(f"Failed to open readable camera stream. Tried: {tried_msg}")
 
 
 def _detect(app: FaceAnalysis, frame: np.ndarray) -> list[tuple[np.ndarray, np.ndarray, float]]:
@@ -351,6 +477,7 @@ def cmd_enroll(name: str, model: str) -> None:
     samples: list[np.ndarray] = []
     frames_total = 0
     frames_dropped = 0
+    last_capture_ts = -1e9
 
     print(f"Enrolling '{name}'. Keep one face visible. Press q to finish early.")
 
@@ -372,8 +499,15 @@ def cmd_enroll(name: str, model: str) -> None:
             else:
                 bbox, emb, _ = picked
                 _bracket_box(frame, bbox, TEAL)
-                samples.append(emb)
-                status, sc = f"Captured {len(samples)} / {ENROLL_SAMPLES}", GREEN
+                now = time.time()
+                elapsed = now - last_capture_ts
+                if elapsed >= ENROLL_CAPTURE_INTERVAL_SEC:
+                    samples.append(emb)
+                    last_capture_ts = now
+                    status, sc = f"Captured {len(samples)} / {ENROLL_SAMPLES}", GREEN
+                else:
+                    wait_left = max(ENROLL_CAPTURE_INTERVAL_SEC - elapsed, 0.0)
+                    status, sc = f"Hold still... {wait_left:.2f}s", TEAL
 
             _progress_bar(frame, len(samples), ENROLL_SAMPLES)
             _hud(frame, [(f"Enrolling: {name}", WHITE), (status, sc), ("Q  quit early", (160, 160, 160))])
@@ -418,7 +552,14 @@ def cmd_enroll(name: str, model: str) -> None:
     print(f"Saved '{name}'  +{len(samples)} samples  (total={total_for_name})")
 
 
-def cmd_recognize(model: str) -> None:
+def cmd_recognize(
+    model: str,
+    general_model: str | None,
+    custom_model: str | None,
+    disable_general: bool,
+    disable_custom: bool,
+    snapshot_interval: float,
+) -> None:
     db = FaceDB.load()
     if not db.names:
         raise RuntimeError("No enrolled identities. Run:  enroll --name <n>")
@@ -427,8 +568,26 @@ def cmd_recognize(model: str) -> None:
     start_dt = _now_utc()
     session_start = time.time()
 
+    general_model_path = _resolve_general_model_path(general_model)
+    custom_model_path = custom_model or _load_default_custom_model_path()
+
+    detector = DualYoloDetector(
+        general_model_path=general_model_path,
+        custom_model_path=custom_model_path,
+        enable_general=not disable_general,
+        enable_custom=(not disable_custom) and bool(custom_model_path),
+    )
+    memory = SceneMemoryManager(snapshot_interval_sec=snapshot_interval, base_dir=MEMORY_DIR)
+
     app, cap = _build_app(model), _open_camera()
     cv2.namedWindow(win := "Recognize", cv2.WINDOW_NORMAL)
+
+    print("Running unified stream: InsightFace + YOLO + memory.")
+    _print_runtime_help()
+    if custom_model_path:
+        print(f"Custom YOLO model: {custom_model_path}")
+    else:
+        print("Custom YOLO model: not configured")
 
     t_prev = time.time()
     fps_ema = 0.0
@@ -451,17 +610,36 @@ def cmd_recognize(model: str) -> None:
     detection_latency_max_ms = 0.0
     detection_timeline: dict[str, int] = defaultdict(int)
 
+    object_detections_total = 0
+    object_general_detections = 0
+    object_custom_detections = 0
+    object_conf_sum = 0.0
+    object_general_conf_sum = 0.0
+    object_custom_conf_sum = 0.0
+    object_detection_timeline: dict[str, int] = defaultdict(int)
+    object_class_counts_total: Counter[str] = Counter()
+    object_class_counts_general: Counter[str] = Counter()
+    object_class_counts_custom: Counter[str] = Counter()
+
+    memory_auto_snapshots = 0
+    memory_manual_snapshots = 0
+    memory_query_counts: Counter[str] = Counter()
+    memory_query_hits: Counter[str] = Counter()
+    memory_query_misses: Counter[str] = Counter()
+
     unknown_alert_count = 0
     last_unknown_alert_ts = -1e9
 
     label_counter: Counter[str] = Counter()
     latest_active_subjects: list[dict[str, Any]] = []
+    latest_object_labels: list[str] = []
 
     people: dict[str, dict[str, Any]] = {}
     visible_prev: set[str] = set()
 
     events: list[dict[str, Any]] = []
     events_total_count = 0
+    detector_error_seen = False
 
     def add_event(
         event_type: str,
@@ -508,10 +686,21 @@ def cmd_recognize(model: str) -> None:
             detection_latency_min_ms = min(detection_latency_min_ms, latency_ms)
             detection_latency_max_ms = max(detection_latency_max_ms, latency_ms)
 
+            try:
+                object_rows = detector.detect(frame)
+            except Exception as exc:
+                object_rows = []
+                if not detector_error_seen:
+                    detector_error_seen = True
+                    add_event("object_detect_error", str(exc), severity="alert")
+                    print(f"Object detection error: {exc}")
+
             face_count = len(face_rows)
+            object_count = len(object_rows)
             peak_simultaneous_faces = max(peak_simultaneous_faces, face_count)
             timeline_key = _now_utc().astimezone().strftime("%H:%M:%S")
             detection_timeline[timeline_key] += face_count
+            object_detection_timeline[timeline_key] += object_count
 
             if face_count > 0:
                 frames_with_faces += 1
@@ -519,6 +708,7 @@ def cmd_recognize(model: str) -> None:
                 frames_empty += 1
 
             detections_total += face_count
+            object_detections_total += object_count
 
             visible_now: set[str] = set()
             unknown_in_frame = False
@@ -601,23 +791,136 @@ def cmd_recognize(model: str) -> None:
                 _bracket_box(frame, bbox, color)
                 _label_tag(frame, f"{label}  {score:.2f}", int(bbox[0]), int(bbox[1]) - 6, color)
 
+            object_labels_in_frame: set[str] = set()
+            for row in object_rows:
+                label = str(row.get("label", "object"))
+                conf = _safe_float(row.get("confidence"), 0.0)
+                bbox = np.asarray(row.get("bbox", [0, 0, 0, 0]), dtype=np.float32)
+                source = str(row.get("source", "general"))
+                object_labels_in_frame.add(label)
+                object_conf_sum += conf
+                object_class_counts_total[label] += 1
+
+                if source == "custom":
+                    object_custom_detections += 1
+                    object_custom_conf_sum += conf
+                    object_class_counts_custom[label] += 1
+                    color = MAGENTA
+                else:
+                    object_general_detections += 1
+                    object_general_conf_sum += conf
+                    object_class_counts_general[label] += 1
+                    color = CYAN
+
+                _bracket_box(frame, bbox, color, thickness=2)
+                _label_tag(
+                    frame,
+                    f"{source}:{label} {conf:.2f}",
+                    int(bbox[0]),
+                    max(int(bbox[1]) - 6, 20),
+                    color,
+                )
+
+            latest_object_labels = sorted(object_labels_in_frame)
+
+            if memory.should_take_snapshot(now_ts):
+                snap = memory.save_snapshot(frame, object_rows, current_time=now_ts, manual=False)
+                memory_auto_snapshots += 1
+                add_event(
+                    "memory_snapshot_auto",
+                    "Auto snapshot saved",
+                    extra={
+                        "image_path": snap.get("snapshot_path"),
+                        "image_name": Path(str(snap.get("snapshot", ""))).name,
+                    },
+                )
+
+            state = detector.get_state()
             _hud(
                 frame,
                 [
                     (
-                        f"Faces: {face_count}  FPS: {fps_ema:.1f}  Known: {known_detections}  Unknown: {unknown_detections}",
+                        f"Faces:{face_count} Objects:{object_count} FPS:{fps_ema:.1f}",
                         WHITE,
                     ),
-                    (f"Model: {model}   Q quit", (160, 160, 160)),
+                    (
+                        f"Known:{known_detections} Unknown:{unknown_detections} "
+                        f"G:{'ON' if state['general']['enabled'] else 'OFF'} "
+                        f"C:{'ON' if state['custom']['enabled'] else 'OFF'}",
+                        (180, 180, 180),
+                    ),
+                    (
+                        f"Snapshots(auto/manual): {memory_auto_snapshots}/{memory_manual_snapshots}",
+                        (160, 160, 160),
+                    ),
+                    ("Q quit | G/O toggle YOLO | T/M/R/F/H", (140, 140, 140)),
                 ],
             )
             cv2.imshow(win, frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
+            if key == ord("g"):
+                enabled = detector.toggle_general()
+                print(f"General YOLO: {'ON' if enabled else 'OFF'}")
+                add_event("toggle_general_yolo", f"General YOLO {'enabled' if enabled else 'disabled'}")
+            elif key == ord("o"):
+                enabled = detector.toggle_custom()
+                print(f"Custom YOLO: {'ON' if enabled else 'OFF'}")
+                add_event("toggle_custom_yolo", f"Custom YOLO {'enabled' if enabled else 'disabled'}")
+            elif key == ord("t"):
+                snap = memory.save_snapshot(frame, object_rows, current_time=now_ts, manual=True)
+                memory_manual_snapshots += 1
+                print(f"Manual snapshot saved: {snap.get('snapshot')}")
+                add_event(
+                    "memory_snapshot_manual",
+                    "Manual snapshot saved",
+                    extra={
+                        "image_path": snap.get("snapshot_path"),
+                        "image_name": Path(str(snap.get("snapshot", ""))).name,
+                    },
+                )
+            elif key == ord("m"):
+                stats = memory.get_memory_stats()
+                memory_query_counts["stats"] += 1
+                memory_query_hits["stats"] += 1
+                print(f"Memory stats: {json.dumps(stats, ensure_ascii=True)}")
+                add_event("memory_stats", "Memory statistics requested")
+            elif key == ord("r"):
+                rows = memory.get_recent_snapshots(minutes=5)
+                memory_query_counts["recent"] += 1
+                if rows:
+                    memory_query_hits["recent"] += 1
+                    print(f"Recent snapshots (last 5 min): {len(rows)}")
+                    for row in rows[-8:]:
+                        print(f"  {row.get('timestamp_local')} | {row.get('objects')} | {row.get('snapshot')}")
+                else:
+                    memory_query_misses["recent"] += 1
+                    print("No recent snapshots in the last 5 minutes.")
+                add_event("memory_recent", "Recent snapshots requested")
+            elif key == ord("f"):
+                memory_query_counts["find"] += 1
+                query = input("Object to find: ").strip()
+                if query:
+                    row = memory.find_object_last_seen(query)
+                    if row:
+                        memory_query_hits["find"] += 1
+                        print(
+                            f"Last seen '{query}' at {row.get('timestamp_local')} "
+                            f"objects={row.get('objects')} snapshot={row.get('snapshot')}"
+                        )
+                    else:
+                        memory_query_misses["find"] += 1
+                        print(f"'{query}' not found in memory.")
+                    add_event("memory_find", f"Find object query: {query}")
+            elif key == ord("h"):
+                _print_runtime_help()
     except KeyboardInterrupt:
         pass
     finally:
         cap.release()
+        memory.save_all_memory()
         cv2.destroyAllWindows()
 
     end_dt = _now_utc()
@@ -647,6 +950,20 @@ def cmd_recognize(model: str) -> None:
         unknown_alert_count / (duration_sec / 60.0) if duration_sec > 0 else 0.0
     )
 
+    object_avg_conf = (
+        object_conf_sum / object_detections_total if object_detections_total > 0 else 0.0
+    )
+    object_avg_conf_general = (
+        object_general_conf_sum / object_general_detections
+        if object_general_detections > 0
+        else 0.0
+    )
+    object_avg_conf_custom = (
+        object_custom_conf_sum / object_custom_detections
+        if object_custom_detections > 0
+        else 0.0
+    )
+
     people_clean: dict[str, dict[str, Any]] = {}
     for name, info in people.items():
         detections = _safe_int(info.get("detections"))
@@ -659,6 +976,7 @@ def cmd_recognize(model: str) -> None:
             "presence_sec": round(_safe_float(info.get("presence_sec")), 3),
         }
 
+    memory_stats = memory.get_memory_stats()
     aggregate = {
         "session_id": session_id,
         "frames_total": frames_total,
@@ -689,16 +1007,42 @@ def cmd_recognize(model: str) -> None:
         "unique_individuals_seen": len(people_clean),
         "current_people_visible": current_people_visible,
         "active_subjects": latest_active_subjects,
+        "active_objects": latest_object_labels,
         "detection_timeline": [
             {"time_local": t, "detections": int(c)}
             for t, c in list(detection_timeline.items())[-20:]
         ],
+        "object_detections_total": object_detections_total,
+        "object_general_detections": object_general_detections,
+        "object_custom_detections": object_custom_detections,
+        "object_avg_confidence": round(object_avg_conf, 4),
+        "object_avg_confidence_general": round(object_avg_conf_general, 4),
+        "object_avg_confidence_custom": round(object_avg_conf_custom, 4),
+        "object_class_counts_total": dict(object_class_counts_total),
+        "object_class_counts_general": dict(object_class_counts_general),
+        "object_class_counts_custom": dict(object_class_counts_custom),
+        "object_detection_timeline": [
+            {"time_local": t, "detections": int(c)}
+            for t, c in list(object_detection_timeline.items())[-20:]
+        ],
+        "yolo_state_final": detector.get_state(),
+        "yolo_model_paths": {
+            "general": general_model_path,
+            "custom": custom_model_path,
+        },
+        "memory_snapshots_auto": memory_auto_snapshots,
+        "memory_snapshots_manual": memory_manual_snapshots,
+        "memory_snapshots_total_session": memory_auto_snapshots + memory_manual_snapshots,
+        "memory_snapshot_total_store": _safe_int(memory_stats.get("total_snapshots"), 0),
+        "memory_query_counts": dict(memory_query_counts),
+        "memory_query_hits": dict(memory_query_hits),
+        "memory_query_misses": dict(memory_query_misses),
     }
 
     _append_metric(
         "recognize_session",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "session_id": session_id,
             "model": model,
             "camera_source": CAMERA_SOURCE,
@@ -715,7 +1059,8 @@ def cmd_recognize(model: str) -> None:
 
     print(
         f"Session summary | frames={frames_total} avg_fps={avg_fps:.2f} "
-        f"detections={detections_total} known={known_detections} unknown={unknown_detections}"
+        f"faces={detections_total} objects={object_detections_total} "
+        f"known={known_detections} unknown={unknown_detections}"
     )
 
 
@@ -727,6 +1072,179 @@ def cmd_list() -> None:
     print(f"Database: {DB_PATH}")
     for name, count in zip(db.names, db.counts):
         print(f"  {name}: {int(count)} samples")
+
+
+def cmd_train_objects(
+    data: str,
+    base_model: str,
+    epochs: int,
+    imgsz: int,
+    batch: int,
+    project: str,
+    name: str,
+    set_default: bool,
+) -> None:
+    data_path = Path(data)
+    if not data_path.exists():
+        raise RuntimeError(f"Dataset YAML does not exist: {data_path}")
+
+    try:
+        from ultralytics import YOLO
+    except Exception as exc:
+        raise RuntimeError(
+            "Ultralytics is not available. Install dependency 'ultralytics'."
+        ) from exc
+
+    start_dt = _now_utc()
+    started = time.time()
+
+    print(f"Training custom YOLO model from: {data_path}")
+    print(
+        f"Config | base={base_model} epochs={epochs} imgsz={imgsz} batch={batch} "
+        f"project={project} name={name}"
+    )
+
+    yolo = YOLO(base_model)
+    train_result = yolo.train(
+        data=str(data_path),
+        epochs=int(epochs),
+        imgsz=int(imgsz),
+        batch=int(batch),
+        project=project,
+        name=name,
+        exist_ok=True,
+    )
+
+    save_dir = (
+        Path(getattr(train_result, "save_dir"))
+        if getattr(train_result, "save_dir", None)
+        else Path(getattr(getattr(yolo, "trainer", None), "save_dir", project))
+    )
+    best_path = save_dir / "weights" / "best.pt"
+    last_path = save_dir / "weights" / "last.pt"
+    resolved_model = best_path if best_path.exists() else last_path
+    if not resolved_model.exists():
+        raise RuntimeError(f"Training completed but no weights found in {save_dir / 'weights'}")
+
+    if set_default:
+        _save_default_custom_model_path(str(resolved_model))
+        print(f"Updated default custom model pointer: {CUSTOM_MODEL_POINTER_PATH}")
+
+    end_dt = _now_utc()
+    duration_sec = max(time.time() - started, 0.0)
+    _append_metric(
+        "object_train",
+        {
+            "schema_version": 1,
+            "start_utc": _iso(start_dt),
+            "end_utc": _iso(end_dt),
+            "duration_sec": round(duration_sec, 3),
+            "data_yaml": str(data_path),
+            "base_model": base_model,
+            "epochs": int(epochs),
+            "imgsz": int(imgsz),
+            "batch": int(batch),
+            "project": project,
+            "name": name,
+            "save_dir": str(save_dir),
+            "output_model": str(resolved_model),
+            "set_default_model": bool(set_default),
+        },
+    )
+
+    print(f"Training complete. Model weights: {resolved_model}")
+
+
+def cmd_memory_stats() -> None:
+    memory = SceneMemoryManager(base_dir=MEMORY_DIR)
+    stats = memory.get_memory_stats()
+    _append_metric(
+        "memory_query",
+        {
+            "query_type": "stats",
+            "hit": True,
+            "result_count": 1,
+        },
+    )
+    print(json.dumps(stats, indent=2, ensure_ascii=True))
+
+
+def cmd_memory_recent(minutes: int) -> None:
+    memory = SceneMemoryManager(base_dir=MEMORY_DIR)
+    rows = memory.get_recent_snapshots(minutes=minutes)
+    _append_metric(
+        "memory_query",
+        {
+            "query_type": "recent",
+            "minutes": int(minutes),
+            "hit": bool(rows),
+            "result_count": len(rows),
+        },
+    )
+
+    if not rows:
+        print(f"No snapshots found in the last {minutes} minutes.")
+        return
+
+    print(f"Recent snapshots in the last {minutes} minutes: {len(rows)}")
+    for row in rows:
+        print(
+            f"  {row.get('timestamp_local')} | {row.get('objects')} | "
+            f"{row.get('snapshot')}"
+        )
+
+
+def cmd_memory_find(object_name: str) -> None:
+    memory = SceneMemoryManager(base_dir=MEMORY_DIR)
+    row = memory.find_object_last_seen(object_name)
+    _append_metric(
+        "memory_query",
+        {
+            "query_type": "find",
+            "object": object_name,
+            "hit": bool(row),
+            "result_count": 1 if row else 0,
+        },
+    )
+
+    if not row:
+        print(f"Object not found: {object_name}")
+        return
+
+    print(
+        f"Last seen '{object_name}' at {row.get('timestamp_local')} | "
+        f"objects={row.get('objects')} | snapshot={row.get('snapshot')}"
+    )
+
+
+def cmd_memory_search(text: str) -> None:
+    memory = SceneMemoryManager(base_dir=MEMORY_DIR)
+    rows = memory.search_similar_scene(text, top_k=5)
+    _append_metric(
+        "memory_query",
+        {
+            "query_type": "search",
+            "text": text,
+            "hit": bool(rows),
+            "result_count": len(rows),
+        },
+    )
+
+    if not rows:
+        print("No matching scenes found.")
+        return
+
+    print(f"Search results for '{text}':")
+    for row in rows:
+        extra = (
+            f" distance={_safe_float(row.get('distance'), 0.0):.4f}"
+            if row.get("distance") is not None
+            else ""
+        )
+        print(
+            f"  {row.get('timestamp_local')} | {row.get('objects')} | "
+            f"{row.get('snapshot')}{extra}"
+        )
 
 
 # ── Reporting helpers ─────────────────────────────────────────────────────────
@@ -848,6 +1366,70 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
         ),
         "active_subjects": raw_aggregate.get("active_subjects", event.get("active_subjects", [])),
         "detection_timeline": raw_aggregate.get("detection_timeline", event.get("detection_timeline", [])),
+        "active_objects": raw_aggregate.get("active_objects", event.get("active_objects", [])),
+        "object_detections_total": _safe_int(
+            raw_aggregate.get("object_detections_total", event.get("object_detections_total", 0)),
+            0,
+        ),
+        "object_general_detections": _safe_int(
+            raw_aggregate.get("object_general_detections", event.get("object_general_detections", 0)),
+            0,
+        ),
+        "object_custom_detections": _safe_int(
+            raw_aggregate.get("object_custom_detections", event.get("object_custom_detections", 0)),
+            0,
+        ),
+        "object_avg_confidence": _safe_float(
+            raw_aggregate.get("object_avg_confidence", event.get("object_avg_confidence", 0.0)),
+            0.0,
+        ),
+        "object_avg_confidence_general": _safe_float(
+            raw_aggregate.get(
+                "object_avg_confidence_general", event.get("object_avg_confidence_general", 0.0)
+            ),
+            0.0,
+        ),
+        "object_avg_confidence_custom": _safe_float(
+            raw_aggregate.get(
+                "object_avg_confidence_custom", event.get("object_avg_confidence_custom", 0.0)
+            ),
+            0.0,
+        ),
+        "object_class_counts_total": raw_aggregate.get(
+            "object_class_counts_total", event.get("object_class_counts_total", {})
+        ),
+        "object_class_counts_general": raw_aggregate.get(
+            "object_class_counts_general", event.get("object_class_counts_general", {})
+        ),
+        "object_class_counts_custom": raw_aggregate.get(
+            "object_class_counts_custom", event.get("object_class_counts_custom", {})
+        ),
+        "object_detection_timeline": raw_aggregate.get(
+            "object_detection_timeline", event.get("object_detection_timeline", [])
+        ),
+        "yolo_state_final": raw_aggregate.get("yolo_state_final", event.get("yolo_state_final", {})),
+        "yolo_model_paths": raw_aggregate.get("yolo_model_paths", event.get("yolo_model_paths", {})),
+        "memory_snapshots_auto": _safe_int(
+            raw_aggregate.get("memory_snapshots_auto", event.get("memory_snapshots_auto", 0)),
+            0,
+        ),
+        "memory_snapshots_manual": _safe_int(
+            raw_aggregate.get("memory_snapshots_manual", event.get("memory_snapshots_manual", 0)),
+            0,
+        ),
+        "memory_snapshots_total_session": _safe_int(
+            raw_aggregate.get(
+                "memory_snapshots_total_session", event.get("memory_snapshots_total_session", 0)
+            ),
+            0,
+        ),
+        "memory_snapshot_total_store": _safe_int(
+            raw_aggregate.get("memory_snapshot_total_store", event.get("memory_snapshot_total_store", 0)),
+            0,
+        ),
+        "memory_query_counts": raw_aggregate.get("memory_query_counts", event.get("memory_query_counts", {})),
+        "memory_query_hits": raw_aggregate.get("memory_query_hits", event.get("memory_query_hits", {})),
+        "memory_query_misses": raw_aggregate.get("memory_query_misses", event.get("memory_query_misses", {})),
     }
 
     people = event.get("people") if isinstance(event.get("people"), dict) else {}
@@ -937,8 +1519,17 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
     hist_conf_weighted = 0.0
     hist_conf_weight = 0
     hist_event_count = 0
+    hist_object_detections = 0
+    hist_object_general = 0
+    hist_object_custom = 0
+    hist_object_conf_weighted = 0.0
+    hist_object_conf_weight = 0
+    hist_memory_auto = 0
+    hist_memory_manual = 0
+    hist_memory_queries_total = 0
 
     label_counter: Counter[str] = Counter()
+    object_label_counter: Counter[str] = Counter()
     people_acc: dict[str, dict[str, Any]] = defaultdict(
         lambda: {
             "detections": 0,
@@ -970,6 +1561,21 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
         det_weight = _safe_int(a.get("detections_total"), 0)
         hist_conf_weighted += avg_conf * det_weight
         hist_conf_weight += det_weight
+        hist_object_detections += _safe_int(a.get("object_detections_total"), 0)
+        hist_object_general += _safe_int(a.get("object_general_detections"), 0)
+        hist_object_custom += _safe_int(a.get("object_custom_detections"), 0)
+        object_avg_conf = _safe_float(a.get("object_avg_confidence"), 0.0)
+        object_weight = _safe_int(a.get("object_detections_total"), 0)
+        hist_object_conf_weighted += object_avg_conf * object_weight
+        hist_object_conf_weight += object_weight
+        hist_memory_auto += _safe_int(a.get("memory_snapshots_auto"), 0)
+        hist_memory_manual += _safe_int(a.get("memory_snapshots_manual"), 0)
+        query_counts = a.get("memory_query_counts", {})
+        if isinstance(query_counts, dict):
+            hist_memory_queries_total += sum(_safe_int(v) for v in query_counts.values())
+        class_counts = a.get("object_class_counts_total", {})
+        if isinstance(class_counts, dict):
+            object_label_counter.update({str(k): _safe_int(v) for k, v in class_counts.items()})
 
         hist_event_count += _safe_int(r.get("events_total_count"), len(r.get("events", [])))
         label_counter.update(r.get("label_counts", {}))
@@ -1037,6 +1643,9 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
     hist_faces_per_sec = (hist_detections / hist_runtime) if hist_runtime > 0 else 0.0
     hist_alert_density = (hist_unknown_alerts / (hist_runtime / 60.0)) if hist_runtime > 0 else 0.0
     hist_avg_conf = (hist_conf_weighted / hist_conf_weight) if hist_conf_weight > 0 else 0.0
+    hist_object_avg_conf = (
+        hist_object_conf_weighted / hist_object_conf_weight if hist_object_conf_weight > 0 else 0.0
+    )
 
     latest_agg = latest["aggregate"] if latest else {}
     latest_unknown_events = _safe_int(latest_agg.get("unknown_alert_events"), 0)
@@ -1083,6 +1692,15 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
             "alert_density_per_min": hist_alert_density,
             "event_timeline_total_count": hist_event_count,
             "top_labels": label_counter.most_common(15),
+            "object_detections_total": hist_object_detections,
+            "object_general_detections": hist_object_general,
+            "object_custom_detections": hist_object_custom,
+            "object_avg_confidence": hist_object_avg_conf,
+            "top_object_labels": object_label_counter.most_common(15),
+            "memory_auto_snapshots": hist_memory_auto,
+            "memory_manual_snapshots": hist_memory_manual,
+            "memory_total_snapshots": hist_memory_auto + hist_memory_manual,
+            "memory_queries_total": hist_memory_queries_total,
             "unique_individuals_seen": len(member_activity),
         },
         "member_activity": member_activity,
@@ -1129,15 +1747,32 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
     camera_status = "Active" if latest else "No recent session"
     processing_speed = _safe_float(latest_agg.get("avg_fps"), 0.0)
     total_faces_detected = _safe_int(latest_agg.get("detections_total"), 0)
+    total_objects_detected = _safe_int(latest_agg.get("object_detections_total"), 0)
+    objects_general = _safe_int(latest_agg.get("object_general_detections"), 0)
+    objects_custom = _safe_int(latest_agg.get("object_custom_detections"), 0)
+    object_avg_conf = _safe_float(latest_agg.get("object_avg_confidence"), 0.0)
     avg_latency_ms = _safe_float(latest_agg.get("avg_detection_latency_ms"), 0.0)
 
     recognized_members = _safe_int(latest_agg.get("known_detections"), 0)
     unknown_alerts = _safe_int(latest_agg.get("unknown_alert_events"), 0)
     unique_seen = _safe_int(latest_agg.get("unique_individuals_seen"), 0)
     current_visible = _safe_int(latest_agg.get("current_people_visible"), 0)
+    memory_snapshots_auto = _safe_int(latest_agg.get("memory_snapshots_auto"), 0)
+    memory_snapshots_manual = _safe_int(latest_agg.get("memory_snapshots_manual"), 0)
+    memory_query_counts = (
+        latest_agg.get("memory_query_counts", {})
+        if isinstance(latest_agg.get("memory_query_counts"), dict)
+        else {}
+    )
+    memory_queries_total = sum(_safe_int(v) for v in memory_query_counts.values())
     active_subjects = (
         latest_agg.get("active_subjects", [])
         if isinstance(latest_agg.get("active_subjects"), list)
+        else []
+    )
+    active_objects = (
+        latest_agg.get("active_objects", [])
+        if isinstance(latest_agg.get("active_objects"), list)
         else []
     )
     detection_timeline = (
@@ -1148,7 +1783,7 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
 
     lines = [
         "╔════════════════════════════════════════════════════╗",
-        "║            FACE MONITORING SECURITY CONSOLE       ║",
+        "║        FACE + OBJECT MONITORING CONSOLE           ║",
         "╚════════════════════════════════════════════════════╝",
         "",
         "SYSTEM STATUS",
@@ -1158,14 +1793,19 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
         f"Processing Speed        : {processing_speed:.2f} FPS",
         f"Average Detection Latency: {avg_latency_ms:.2f} ms",
         f"Total Faces Detected    : {total_faces_detected}",
+        f"Total Objects Detected  : {total_objects_detected}",
         "",
         "--------------------------------------------------------",
         "ACTIVITY OVERVIEW",
         "--------------------------------------------------------",
         f"Recognized Members      : {recognized_members} detections",
         f"Unknown Face Alerts     : {unknown_alerts} alerts",
+        f"Objects (Gen/Custom)    : {objects_general}/{objects_custom}",
+        f"Object Avg Confidence   : {object_avg_conf:.4f}",
         f"Unique Individuals Seen : {unique_seen} members",
         f"Current People Visible  : {current_visible}",
+        f"Memory Snapshots A/M    : {memory_snapshots_auto}/{memory_snapshots_manual}",
+        f"Memory Queries (session): {memory_queries_total}",
         "",
         "--------------------------------------------------------",
         "SESSION STATISTICS",
@@ -1187,6 +1827,20 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
             lines.append(f"{name} (confidence {conf:.2f})")
     else:
         lines.append("No known members currently visible")
+
+    lines.extend(
+        [
+            "",
+            "--------------------------------------------------------",
+            "ACTIVE OBJECTS",
+            "--------------------------------------------------------",
+        ]
+    )
+
+    if active_objects:
+        lines.append(", ".join(str(x) for x in active_objects[:16]))
+    else:
+        lines.append("No active objects")
 
     lines.extend(
         [
@@ -1284,11 +1938,18 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
             f"Average FPS             : {_safe_float(hist.get('avg_fps'), 0.0):.2f}",
             f"Peak Simultaneous Faces : {_safe_int(hist.get('peak_simultaneous_faces'), 0)}",
             f"Face Throughput         : {_safe_float(hist.get('faces_per_sec'), 0.0):.2f} faces/s",
+            f"Object Detections Total : {_safe_int(hist.get('object_detections_total'), 0)}",
+            f"Object Gen/Custom       : {_safe_int(hist.get('object_general_detections'), 0)}/"
+            f"{_safe_int(hist.get('object_custom_detections'), 0)}",
+            f"Object Avg Confidence   : {_safe_float(hist.get('object_avg_confidence'), 0.0):.4f}",
+            f"Memory Snapshots A/M    : {_safe_int(hist.get('memory_auto_snapshots'), 0)}/"
+            f"{_safe_int(hist.get('memory_manual_snapshots'), 0)}",
+            f"Memory Queries Total    : {_safe_int(hist.get('memory_queries_total'), 0)}",
             f"Alert Density           : {_safe_float(hist.get('alert_density_per_min'), 0.0):.2f} alerts/min",
             f"Average Confidence      : {_safe_float(hist.get('avg_confidence'), 0.0):.4f}",
             "",
             "╔════════════════════════════════════════════════════╗",
-            "║               END OF SECURITY REPORT              ║",
+            "║               END OF SECURITY REPORT               ║",
             "╚════════════════════════════════════════════════════╝",
         ]
     )
@@ -1318,7 +1979,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Live face enroll/recognize tool.")
     parser.add_argument(
         "--model",
-        default="buffalo_l",
+        default="buffalo_sc",
         choices=["buffalo_l", "buffalo_m", "buffalo_s", "buffalo_sc", "antelopev2"],
         help="InsightFace model pack  (default: buffalo_l)",
     )
@@ -1326,14 +1987,76 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd")
     p_e = sub.add_parser("enroll", help="Enroll a person from live camera")
     p_e.add_argument("--name", required=True, help="Identity label")
-    sub.add_parser("recognize", help="Live face recognition")
+    p_r = sub.add_parser("recognize", help="Live face + object recognition")
+    p_r.add_argument(
+        "--general-model",
+        default=None,
+        help="Path to general YOLO model (default: local reference or yolov8n.pt)",
+    )
+    p_r.add_argument(
+        "--custom-model",
+        default=None,
+        help="Path to custom YOLO model (default: pointer/latest trained model)",
+    )
+    p_r.add_argument("--disable-general", action="store_true", help="Disable general YOLO stream")
+    p_r.add_argument("--disable-custom", action="store_true", help="Disable custom YOLO stream")
+    p_r.add_argument(
+        "--snapshot-interval",
+        type=float,
+        default=15.0,
+        help="Automatic snapshot interval in seconds (default: 15)",
+    )
+
+    p_t = sub.add_parser("train-objects", help="Fine-tune YOLO on a custom dataset YAML")
+    p_t.add_argument("--data", required=True, help="Path to dataset YAML")
+    p_t.add_argument("--base-model", default="yolov8n.pt", help="Base YOLO checkpoint")
+    p_t.add_argument("--epochs", type=int, default=30, help="Training epochs")
+    p_t.add_argument("--imgsz", type=int, default=640, help="Input image size")
+    p_t.add_argument("--batch", type=int, default=16, help="Training batch size")
+    p_t.add_argument("--project", default="runs/detect", help="Ultralytics project directory")
+    p_t.add_argument("--name", default="custom-objects", help="Training run name")
+    p_t.add_argument(
+        "--set-default",
+        action="store_true",
+        help="Update custom model pointer after successful training",
+    )
+
+    sub.add_parser("memory-stats", help="Show memory storage statistics")
+    p_mr = sub.add_parser("memory-recent", help="List recent snapshots")
+    p_mr.add_argument("--minutes", type=int, default=5, help="Lookback window in minutes")
+    p_mf = sub.add_parser("memory-find", help="Find when an object was last seen")
+    p_mf.add_argument("--object", required=True, help="Object label or text")
+    p_ms = sub.add_parser("memory-search", help="Search similar scenes")
+    p_ms.add_argument("--text", required=True, help="Natural language scene query")
+
     sub.add_parser("list", help="List enrolled identities")
     sub.add_parser("report", help="Generate metrics/report files")
 
     args = parser.parse_args(sys.argv[1:] or ["recognize"])
     {
         "enroll": lambda: cmd_enroll(args.name, args.model),
-        "recognize": lambda: cmd_recognize(args.model),
+        "recognize": lambda: cmd_recognize(
+            args.model,
+            args.general_model,
+            args.custom_model,
+            args.disable_general,
+            args.disable_custom,
+            args.snapshot_interval,
+        ),
+        "train-objects": lambda: cmd_train_objects(
+            args.data,
+            args.base_model,
+            args.epochs,
+            args.imgsz,
+            args.batch,
+            args.project,
+            args.name,
+            args.set_default,
+        ),
+        "memory-stats": cmd_memory_stats,
+        "memory-recent": lambda: cmd_memory_recent(args.minutes),
+        "memory-find": lambda: cmd_memory_find(args.object),
+        "memory-search": lambda: cmd_memory_search(args.text),
         "list": cmd_list,
         "report": cmd_report,
     }.get(args.cmd, parser.print_help)()

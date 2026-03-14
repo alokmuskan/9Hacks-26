@@ -1,11 +1,24 @@
 [workspace]
 authors = ["Hemanth Damineni <hemanthdamineni@gmail.com>"]
 channels = ["conda-forge"]
-name = "9Hacks-26"
+name = "9hacks26"
 platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
+run = "python main.py recognize"
+enroll = "python main.py enroll"
+recognize = "python main.py recognize"
+list = "python main.py list"
+report = "python main.py report"
 
 [dependencies]
+python = "3.11.*"
 insightface = ">=0.7.3,<0.8"
+opencv = ">=4.10,<5"
+ultralytics = ">=8.4.0,<9"
+pytorch = ">=2.5,<3"
+torchvision = ">=0.20,<1"
+pillow = ">=11,<12"
+faiss-cpu = ">=1.9,<2"
+open-clip-torch = ">=3.0,<4"

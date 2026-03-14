@@ -1,3 +1,19 @@
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# editor
+.vscode/
+
+# python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# local runtime artifacts
+unknown_incidents/
+memory/
+metrics_log.jsonl
+report.txt
+face_db.npz
+custom_model_path.txt
