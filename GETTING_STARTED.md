@@ -124,7 +124,7 @@ The persisted session aggregate records `face_recognition_enabled` and
 | --- | --- | --- |
 | `AI_STUDIO_CAM_CAMERA_INDEX` | `0` | Camera index, `/dev/video*` path, or video file/URL |
 | `GROQ_API_KEY` | *(unset)* | Enables LLM chat fallback |
-| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Groq model |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | Groq model |
 | `PORT` | `8000` | API server port |
 | `UVICORN_GRACEFUL_SHUTDOWN_SEC` | `5` | Max seconds to wait for open streams (MJPEG/WebSocket) when shutting down with Ctrl+C |
 | `AI_STUDIO_GENERAL_YOLO_MODEL` | `yolov8n.pt` | General YOLO checkpoint |

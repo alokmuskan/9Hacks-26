@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+import traceback
 from collections import Counter, deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -29,6 +30,44 @@ import common
 
 LOGGER = logging.getLogger("monitoring-backend")
 logging.basicConfig(level=logging.INFO)
+
+
+class _ShutdownNoiseFilter(logging.Filter):
+    """Drop uvicorn ERROR records whose exception is a benign shutdown cancel.
+
+    When the server stops while browsers still hold the WebSocket event feed or
+    the MJPEG stream open, uvicorn/starlette/anyio surface the resulting
+    cancellation as ``CancelledError`` (or a re-raised ``KeyboardInterrupt``)
+    traceback logged at ERROR by uvicorn's error logger. That is normal
+    shutdown mechanics — the server still exits cleanly ("Finished server
+    process") — and logging it at ERROR hides real errors. Real failures (any
+    other exception type, or a benign signal wrapped around one) still log at
+    ERROR untouched.
+    """
+
+    _BENIGN_FINALS = ("CancelledError", "KeyboardInterrupt")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno < logging.ERROR:
+            return True
+        if record.exc_info and record.exc_info[0] is not None:
+            formatted = "\n".join(traceback.format_exception(*record.exc_info))
+        else:
+            formatted = record.getMessage()
+        final_line = formatted.rstrip().rsplit("\n", 1)[-1].strip()
+        # Final traceback line is "module.Exception: optional message"; match on
+        # the type part so a CancelledError carrying a message still matches.
+        exc_type = final_line.split(":", 1)[0].strip()
+        return not exc_type.endswith(self._BENIGN_FINALS)
+
+
+def _install_shutdown_noise_filter() -> None:
+    # uvicorn's protocol handlers log via the "uvicorn.error" logger directly,
+    # so a filter attached here sees every "Exception in ASGI application" record.
+    logging.getLogger("uvicorn.error").addFilter(_ShutdownNoiseFilter())
+
+
+_install_shutdown_noise_filter()
 
 FPS_CAP_DEFAULT = 20
 MJPEG_QUALITY = 75
@@ -1786,7 +1825,7 @@ def _query_groq_grounded(
     try:
         client = Groq(api_key=api_key)
         response = client.chat.completions.create(
-            model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip(),
+            model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip(),
             temperature=0.1,
             max_tokens=500,
             messages=[
@@ -1794,7 +1833,10 @@ def _query_groq_grounded(
                 {"role": "user", "content": user_prompt},
             ],
         )
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning(
+            "Groq chat call failed (%s); falling back to deterministic answer.", exc
+        )
         return None, False
     if not response.choices:
         return None, False

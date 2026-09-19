@@ -304,7 +304,7 @@ All variables are optional; the defaults below reflect the code.
 | `AI_STUDIO_MEMORY_MAX_AUTO_SNAPSHOTS` | `5000` | backend | Automatic snapshots to keep; `0` disables pruning. Manual snapshots are never pruned |
 | `AI_STUDIO_UNKNOWN_INCIDENT_MAX_FILES` | `500` | backend | Unknown-face captures to keep, oldest pruned first; `0` disables pruning |
 | `GROQ_API_KEY` *(or `groq_api_key`)* | unset | backend | Enables the LLM chat fallback |
-| `GROQ_MODEL` | `llama-3.3-70b-versatile` | backend | Groq model name |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | backend | Groq model name |
 | `PORT` | `8000` | backend | Port for `python server.py` |
 | `VITE_API_BASE` | `http://localhost:8000` | frontend | Backend base URL (also used to derive the WebSocket URL) |
 

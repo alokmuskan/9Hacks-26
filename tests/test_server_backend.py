@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import logging
 import time
 import unittest
 from typing import ClassVar
@@ -93,6 +94,41 @@ class ServerBackendTests(unittest.TestCase):
 
         row = asyncio.run(_run())
         self.assertEqual(row["id"], 2)
+
+    def test_shutdown_noise_filter_suppresses_only_benign_cancellations(self):
+        flt = self.server._ShutdownNoiseFilter()
+
+        def rec(level, exc=None, msg="ok"):
+            return logging.LogRecord(
+                name="uvicorn.error", level=level, pathname=__file__, lineno=0,
+                args=(), msg=msg, exc_info=exc,
+            )
+
+        cancelled = asyncio.CancelledError("queue.get cancelled during shutdown")
+        benign = rec(logging.ERROR, exc=(asyncio.CancelledError, cancelled, cancelled.__traceback__))
+        self.assertFalse(flt.filter(benign), "benign CancelledError record must be dropped")
+
+        real_fail = rec(logging.ERROR, exc=(RuntimeError, RuntimeError("camera exploded"), None))
+        self.assertTrue(flt.filter(real_fail), "real RuntimeError record must pass")
+
+        plain_msg = rec(logging.ERROR, msg="Exception in ASGI application\n...\nCancelledError")
+        self.assertFalse(flt.filter(plain_msg), "formatted CancelledError text must be dropped")
+
+        cancelled_msg = asyncio.CancelledError("queue.get cancelled during shutdown")
+        with_message = rec(logging.ERROR, exc=(asyncio.CancelledError, cancelled_msg, cancelled_msg.__traceback__))
+        self.assertFalse(flt.filter(with_message), "CancelledError with a message must also be dropped")
+
+        kb = rec(logging.ERROR, exc=(KeyboardInterrupt, KeyboardInterrupt(), None))
+        self.assertFalse(flt.filter(kb), "bare KeyboardInterrupt record must be dropped")
+
+        mentions = rec(logging.ERROR, msg="upload failed after CancelledError occurred mid-transfer")
+        self.assertTrue(flt.filter(mentions), "text that merely mentions the name must pass")
+
+        looks_cancelled = rec(logging.ERROR, msg="Exception in ASGI application\nTraceback ...\nasyncio.exceptions.CancelledError")
+        self.assertFalse(flt.filter(looks_cancelled), "message-embedded traceback ending in CancelledError must be dropped")
+
+        info_rec = rec(logging.INFO, exc=(asyncio.CancelledError, cancelled, cancelled.__traceback__))
+        self.assertTrue(flt.filter(info_rec), "non-ERROR records must always pass")
 
     def test_api_status_schema(self):
         with TestClient(self.server.app) as client:

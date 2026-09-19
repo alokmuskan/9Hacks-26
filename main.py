@@ -90,7 +90,7 @@ GAZE_SMOOTHING_WINDOW = 5
 GAZE_SWITCH_CONFIRMATION = 3
 BEHAVIOR_LOST_TIMEOUT_SEC = 1.0
 
-GROQ_MODEL_DEFAULT = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+GROQ_MODEL_DEFAULT = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 GROQ_SYSTEM_PROMPT = (
     "You are an assistant for an AI monitoring system. Prefer concise factual answers "
     "based on provided logs/memory context, avoid speculation, and include timestamps when relevant."
