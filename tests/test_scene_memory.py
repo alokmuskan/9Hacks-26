@@ -23,7 +23,7 @@ class SceneMemoryTests(unittest.TestCase):
                 manual=False,
                 faces=[
                     {
-                        "name": "Hemanth",
+                        "name": "Alok",
                         "confidence": 0.91,
                         "bbox": [0, 0, 10, 10],
                         "gaze": {"endpoint": [5, 5], "pitch": 0.1, "yaw": -0.2},
@@ -31,8 +31,8 @@ class SceneMemoryTests(unittest.TestCase):
                     }
                 ],
                 object_detections=d1,
-                people=["Hemanth"],
-                attention=[{"name": "Hemanth", "target_object": "bottle", "method": "inside", "distance_px": 0.0}],
+                people=["Alok"],
+                attention=[{"name": "Alok", "target_object": "bottle", "method": "inside", "distance_px": 0.0}],
             )
             self.assertTrue(Path(e1["snapshot_path"]).exists())
             self.assertFalse(memory.should_take_snapshot(10.5))
@@ -54,9 +54,9 @@ class SceneMemoryTests(unittest.TestCase):
             self.assertIsNotNone(found)
             self.assertIn("phone", [o.lower() for o in found.get("objects", [])])
 
-            found_person = memory.find_person_last_seen("hemanth")
+            found_person = memory.find_person_last_seen("alok")
             self.assertIsNotNone(found_person)
-            self.assertIn("Hemanth", found_person.get("people", []))
+            self.assertIn("Alok", found_person.get("people", []))
 
             hits = memory.search_similar_scene("phone", top_k=3)
             self.assertGreaterEqual(len(hits), 1)

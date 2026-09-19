@@ -69,4 +69,28 @@
   margin-top: 8px;
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 640px) {
+  .chat-card {
+    min-height: 65vh;
+  }
+
+  .chat-msg {
+    max-width: 92%;
+  }
+
+  .chat-form {
+    flex-wrap: wrap;
+  }
+
+  .chat-form input {
+    flex: 1 1 100%;
+  }
+
+  .chat-form button {
+    flex: 1 1 100%;
+    min-height: 44px;
+  }
 }

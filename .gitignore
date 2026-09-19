@@ -2,6 +2,14 @@
 .pixi/*
 !.pixi/config.toml
 
+# local tooling environments (lint / type checkers)
+.venv/
+.venv-tools/
+
+# local tooling environments (lint/type tools)
+.venv/
+.venv-tools/
+
 # local references and editor state
 .references/
 .vscode/
@@ -20,12 +28,16 @@ metrics_log.jsonl
 report.txt
 unknown_incidents/
 custom_model_path.txt
+# Sidecar lock files for cross-process advisory locking
+*.lock
 
 # local model/training artifacts
 models/
 runs/
 *.zip
 *.part
+# Downloaded by `bootstrap` (Ultralytics fetches it) or produced by training.
+*.pt
 
 # frontend build artifacts
 frontend/node_modules/
@@ -41,3 +53,4 @@ frontend/.cache/
 
 # os noise
 .DS_Store
+data/

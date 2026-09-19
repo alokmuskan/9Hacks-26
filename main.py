@@ -1,23 +1,35 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
+import platform
 import re
 import sys
 import threading
 import time
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from contextlib import suppress
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
-from insightface.app import FaceAnalysis
+
+import common
 from object_detection import DualYoloDetector, find_latest_custom_model
 from scene_memory import SceneMemoryManager
+
+# Face recognition is a degradable capability, so its import must not be fatal: a
+# machine without a usable insightface still runs object detection, gaze, memory
+# and the dashboard. `_try_build_face_app` turns a failure into a reason.
+try:
+    from insightface.app import FaceAnalysis
+except Exception:  # pragma: no cover - depends on the environment
+    FaceAnalysis = None  # type: ignore[assignment,misc]
 
 
 def _load_env_file() -> None:
@@ -31,18 +43,26 @@ def _load_env_file() -> None:
 _load_env_file()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-_DEFAULT_CAMERA_SOURCE = "/dev/video42" if sys.platform.startswith("linux") else "0"
+# /dev/video42 is a v4l2loopback virtual device: it only exists when something
+# (OBS, ffmpeg) is feeding it. Prefer it when present so an existing virtual-camera
+# setup keeps working, otherwise fall back to the first real device.
+_LINUX_VIRTUAL_CAMERA = "/dev/video42"
+_DEFAULT_CAMERA_SOURCE = (
+    _LINUX_VIRTUAL_CAMERA
+    if sys.platform.startswith("linux") and Path(_LINUX_VIRTUAL_CAMERA).exists()
+    else "0"
+)
 CAMERA_SOURCE = os.getenv("AI_STUDIO_CAM_CAMERA_INDEX", _DEFAULT_CAMERA_SOURCE).strip()
 DB_PATH = Path("face_db.npz")
-METRICS_LOG_PATH = Path("metrics_log.jsonl")
+METRICS_LOG_PATH = Path(common.METRICS_FILENAME)
 REPORT_TXT_PATH = Path("report.txt")
 UNKNOWN_INCIDENTS_DIR = Path("unknown_incidents")
 MEMORY_DIR = Path("memory")
 CUSTOM_MODEL_POINTER_PATH = Path("custom_model_path.txt")
-DEFAULT_GENERAL_MODEL = os.getenv(
-    "AI_STUDIO_GENERAL_YOLO_MODEL",
-    ".references/AI-Studio-Cam-(On-Hold)/models/yolov8n.pt",
-)
+# Ultralytics downloads `yolov8n.pt` on first use, so this default works on a clean
+# checkout. The previous default pointed into `.references/`, a git-ignored path
+# belonging to an older project, which made it a dead reference for every user.
+DEFAULT_GENERAL_MODEL = os.getenv("AI_STUDIO_GENERAL_YOLO_MODEL", "yolov8n.pt")
 
 ENROLL_SAMPLES = 25
 ENROLL_CAPTURE_INTERVAL_SEC = 0.25
@@ -53,23 +73,24 @@ UNKNOWN_LABEL = "Unknown"
 
 EVENTS_TIMELINE_CAP = 500
 UNKNOWN_ALERT_COOLDOWN_SEC = 3.0
-GAZE_INTERVAL_DEFAULT = 1
-GAZE_MAX_INTERVAL_DEFAULT = 4
-GAZE_TARGET_FPS_DROP_DEFAULT = 0.25
+# Shared with server.py via common so both entry points schedule gaze identically.
+GAZE_INTERVAL_DEFAULT = common.GAZE_INTERVAL_DEFAULT
+GAZE_MAX_INTERVAL_DEFAULT = common.GAZE_MAX_INTERVAL_DEFAULT
+GAZE_TARGET_FPS_DROP_DEFAULT = common.GAZE_TARGET_FPS_DROP_DEFAULT
 GAZE_ARCH_DEFAULT = "ResNet50"
 GAZE_WEIGHTS_DEFAULT = "models/L2CSNet_gaze360.pkl"
 GAZE_WEIGHTS_SOURCE_DEFAULT = (
     "https://drive.google.com/drive/folders/17p6ORr-JQJcw-eYtG2WGNiuS_qVKwdWd?usp=sharing"
 )
 GAZE_EMA_ALPHA = 0.10
-GAZE_RECOVERY_STREAK_MIN = 5
+GAZE_RECOVERY_STREAK_MIN = common.GAZE_RECOVERY_STREAK_MIN
 GAZE_OBJECT_HIT_PADDING_PX = 8.0
 GAZE_OBJECT_MAX_DIST_PX = 120.0
 GAZE_SMOOTHING_WINDOW = 5
 GAZE_SWITCH_CONFIRMATION = 3
 BEHAVIOR_LOST_TIMEOUT_SEC = 1.0
 
-GROQ_MODEL_DEFAULT = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+GROQ_MODEL_DEFAULT = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 GROQ_SYSTEM_PROMPT = (
     "You are an assistant for an AI monitoring system. Prefer concise factual answers "
     "based on provided logs/memory context, avoid speculation, and include timestamps when relevant."
@@ -92,11 +113,11 @@ class FaceDB:
     counts: np.ndarray
 
     @classmethod
-    def empty(cls) -> "FaceDB":
+    def empty(cls) -> FaceDB:
         return cls([], np.empty((0, 0), np.float32), np.empty((0,), np.int32))
 
     @classmethod
-    def load(cls) -> "FaceDB":
+    def load(cls) -> FaceDB:
         if not DB_PATH.exists():
             return cls.empty()
         d = np.load(DB_PATH, allow_pickle=False)
@@ -140,23 +161,15 @@ def _l2(v: np.ndarray) -> np.ndarray:
 
 
 def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return common.now_utc()
 
 
 def _iso(dt: datetime | None = None) -> str:
-    return (dt or _now_utc()).isoformat()
+    return common.iso(dt)
 
 
 def _parse_iso(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    try:
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        return None
+    return common.parse_iso(s)
 
 
 def _local_hms(iso_ts: str | None) -> str:
@@ -176,28 +189,23 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _safe_int(v: Any, default: int = 0) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return default
+    return common.safe_int(v, default)
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
+    return common.safe_float(v, default)
 
 
 def _session_id(prefix: str) -> str:
-    # Correlation-friendly ID shown in dashboards/logs.
-    return _now_utc().astimezone().strftime("%Y%m%d-%H%M%S")
+    # Correlation-friendly ID shown in dashboards/logs. The prefix used to be
+    # dropped here while the API kept it, so the two modes disagreed.
+    return common.session_id(prefix)
 
 
 def _timeline_bar(count: int, max_count: int, width: int = 12) -> str:
     if count <= 0 or max_count <= 0:
         return ""
-    n = max(1, int(round((count / max_count) * width)))
+    n = max(1, round((count / max_count) * width))
     return "█" * n
 
 
@@ -208,18 +216,73 @@ def _save_unknown_snapshot(
     ts_local = ts_utc.astimezone()
     base = ts_local.strftime("unknown_%Y-%m-%d_%H-%M-%S")
 
-    candidate = UNKNOWN_INCIDENTS_DIR / f"{base}.jpg"
-    suffix = 1
-    while candidate.exists():
-        candidate = UNKNOWN_INCIDENTS_DIR / f"{base}_{suffix:02d}.jpg"
-        suffix += 1
-
     snap = frame.copy()
     for bbox in unknown_bboxes:
         _bracket_box(snap, bbox, AMBER, thickness=2)
-    cv2.imwrite(str(candidate), snap)
+
+    # Reserving the name and writing the image must be one step. Checking
+    # `exists()` and writing afterwards let two concurrent writers pick the same
+    # filename, so one capture silently overwrote the other.
+    with common.process_lock(UNKNOWN_INCIDENTS_DIR / "incidents"):
+        candidate: Path | None = None
+        for suffix in range(1000):
+            name = f"{base}.jpg" if suffix == 0 else f"{base}_{suffix:02d}.jpg"
+            path = UNKNOWN_INCIDENTS_DIR / name
+            try:
+                handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                continue
+            except OSError:
+                break
+            os.close(handle)
+            candidate = path
+            break
+
+        if candidate is None:
+            candidate = UNKNOWN_INCIDENTS_DIR / f"{base}_overflow.jpg"
+
+        cv2.imwrite(str(candidate), snap)
+
+    pruned = _prune_unknown_incidents()
+    if pruned:
+        print(
+            f"Incident retention: pruned {pruned} capture(s); "
+            f"keeping the newest {common.UNKNOWN_INCIDENT_MAX_FILES}."
+        )
 
     return str(candidate)
+
+
+def _prune_unknown_incidents(keep: int | None = None) -> int:
+    """Delete the oldest unknown-face captures once the directory exceeds its cap.
+
+    Unlike the snapshot store there is no index to keep in step, so this prunes by
+    file modification time. 0 disables pruning.
+    """
+    limit = common.UNKNOWN_INCIDENT_MAX_FILES if keep is None else max(int(keep), 0)
+    if limit <= 0 or not UNKNOWN_INCIDENTS_DIR.exists():
+        return 0
+
+    try:
+        captures = sorted(
+            (path for path in UNKNOWN_INCIDENTS_DIR.iterdir() if path.is_file()),
+            key=lambda path: (path.stat().st_mtime, path.name),
+        )
+    except OSError:
+        return 0
+
+    excess = len(captures) - limit
+    if excess <= 0:
+        return 0
+
+    removed = 0
+    for path in captures[:excess]:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def _resolve_general_model_path(path: str | None) -> str:
@@ -261,7 +324,31 @@ def _print_runtime_help() -> None:
     print("  h  print this help")
 
 
+INSIGHTFACE_MIN_VERSION = (0, 7, 3)
+
+
+def _insightface_version() -> str:
+    try:
+        import insightface
+
+        return str(getattr(insightface, "__version__", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _insightface_unavailable_message(installed: str | None = None) -> str:
+    required = ".".join(str(part) for part in INSIGHTFACE_MIN_VERSION)
+    version = installed if installed is not None else (_insightface_version() or "not installed")
+    return (
+        f"insightface {version} cannot be used: FaceAnalysis(providers=...) requires "
+        f"insightface >= {required}. Install it with `pixi install` (pixi.toml pins "
+        f"insightface>=0.7.3,<0.8) or `pip install -U 'insightface>=0.7.3,<3'`."
+    )
+
+
 def _make_face_analysis(model: str, providers: list[str]) -> FaceAnalysis:
+    if FaceAnalysis is None:
+        raise RuntimeError(_insightface_unavailable_message())
     try:
         return FaceAnalysis(
             name=model,
@@ -269,7 +356,14 @@ def _make_face_analysis(model: str, providers: list[str]) -> FaceAnalysis:
             allowed_modules=["detection", "recognition"],
         )
     except TypeError:
+        pass
+    try:
         return FaceAnalysis(name=model, providers=providers)
+    except TypeError as exc:
+        # InsightFace 0.2.x had `FaceAnalysis(name, root=...)` and no `providers`
+        # argument, so both attempts above fail. Without this the user sees a bare
+        # TypeError from deep inside the stack and has nothing to act on.
+        raise RuntimeError(_insightface_unavailable_message()) from exc
 
 
 def _repair_insightface_model_layout(model: str) -> bool:
@@ -295,10 +389,8 @@ def _repair_insightface_model_layout(model: str) -> bool:
         item.replace(target)
         moved_any = True
 
-    try:
+    with suppress(OSError):
         nested_dir.rmdir()
-    except OSError:
-        pass
 
     if moved_any:
         print(f"Repaired InsightFace model layout for '{model}' in {model_dir}")
@@ -335,6 +427,20 @@ def _build_app(model: str) -> FaceAnalysis:
     app.prepare(ctx_id=ctx_id, det_size=(DET_SIZE, DET_SIZE))
     print(f"Model: {model}  |  Providers: {providers}")
     return app
+
+
+def _try_build_face_app(model: str) -> tuple[FaceAnalysis | None, str | None]:
+    """Build the InsightFace app, or explain why face recognition is unavailable.
+
+    Returning a reason instead of raising lets both entry points keep running and
+    report *why* the capability is off, through `degraded_reason`, `doctor`, and the
+    `face_recognition_enabled` session metric. A session that silently reported zero
+    faces would be indistinguishable from one where nobody was in frame.
+    """
+    try:
+        return _build_app(model), None
+    except Exception as exc:
+        return None, (str(exc).strip() or type(exc).__name__)
 
 
 def _open_camera() -> cv2.VideoCapture:
@@ -476,9 +582,21 @@ class _AsyncCameraReader:
             self._thread.join(timeout=0.2)
 
 
+def _face_score(face: object) -> float:
+    # InsightFace 2.x's Face.__getattr__ returns None for absent keys, which
+    # bypasses getattr()'s default. A missing score must degrade to a neutral
+    # value, not crash the frame loop with float(None).
+    raw = getattr(face, "det_score", None)
+    return 1.0 if raw is None else float(raw)
+
+
 def _detect(
-    app: FaceAnalysis, frame: np.ndarray
+    app: FaceAnalysis | None, frame: np.ndarray
 ) -> list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None]]:
+    if app is None:
+        # Face recognition is a degradable capability: without it the frame simply
+        # contributes no face rows and the session keeps running.
+        return []
     h, w = frame.shape[:2]
     scale = INFER_MAX_SIDE / max(h, w)
     inp = (
@@ -495,12 +613,12 @@ def _detect(
         (
             np.asarray(f.bbox, np.float32) * inv,
             _l2(np.asarray(f.normed_embedding, np.float32)),
-            float(getattr(f, "det_score", 1.0)),
+            _face_score(f),
             (
-                np.asarray(getattr(f, "kps"), np.float32) * inv
+                np.asarray(f.kps, np.float32) * inv
                 if getattr(f, "kps", None) is not None
                 else (
-                    np.asarray(getattr(f, "landmark"), np.float32) * inv
+                    np.asarray(f.landmark, np.float32) * inv
                     if getattr(f, "landmark", None) is not None
                     else None
                 )
@@ -545,9 +663,9 @@ def _select_gaze360_weight_path(
             if any(tok in name for tok in tokens):
                 arch_filtered.append(path)
         if arch_filtered:
-            return sorted(arch_filtered, key=lambda p: p.name.lower())[0]
+            return min(arch_filtered, key=lambda p: p.name.lower())
 
-    return sorted(filtered, key=lambda p: p.name.lower())[0]
+    return min(filtered, key=lambda p: p.name.lower())
 
 
 def _resolve_l2cs_weights_path(
@@ -615,10 +733,10 @@ def _expand_bbox_by_ratio(
     bh = max(y2 - y1, 1.0)
     pad_x = bw * ratio
     pad_y = bh * ratio
-    ex1 = max(0, int(round(x1 - pad_x)))
-    ey1 = max(0, int(round(y1 - pad_y)))
-    ex2 = min(max(frame_w - 1, 0), int(round(x2 + pad_x)))
-    ey2 = min(max(frame_h - 1, 0), int(round(y2 + pad_y)))
+    ex1 = max(0, round(x1 - pad_x))
+    ey1 = max(0, round(y1 - pad_y))
+    ex2 = min(max(frame_w - 1, 0), round(x2 + pad_x))
+    ey2 = min(max(frame_h - 1, 0), round(y2 + pad_y))
     return ex1, ey1, ex2, ey2
 
 
@@ -677,8 +795,7 @@ def _normalize_l2cs_state_dict(payload: Any) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
     for key, value in state_dict.items():
         k = str(key)
-        if k.startswith("module."):
-            k = k[len("module.") :]
+        k = k.removeprefix("module.")
         normalized[k] = value
     return normalized
 
@@ -690,10 +807,10 @@ def _infer_l2cs_arch_from_state_dict(state_dict: dict[str, Any]) -> str | None:
         return None
 
     width = int(fc_shape[1])
-    keyset = {str(k) for k in state_dict.keys()}
+    keyset = {str(k) for k in state_dict}
     if width == 512:
         # Distinguish 18 vs 34 by existence of deeper stage block indexes.
-        if any(k.startswith("layer1.2.") or k.startswith("layer2.3.") or k.startswith("layer3.5.") for k in keyset):
+        if any(k.startswith(("layer1.2.", "layer2.3.", "layer3.5.")) for k in keyset):
             return "ResNet34"
         return "ResNet18"
 
@@ -720,8 +837,8 @@ def _gaze_endpoint_from_pitch_yaw(
     # Match L2CS draw math: dx uses pitch, dy uses yaw.
     dx = -length * float(np.sin(pitch) * np.cos(yaw))
     dy = -length * float(np.sin(yaw))
-    gx = int(round(cx + dx))
-    gy = int(round(cy + dy))
+    gx = round(cx + dx)
+    gy = round(cy + dy)
     gx = int(np.clip(gx, 0, max(frame_w - 1, 0)))
     gy = int(np.clip(gy, 0, max(frame_h - 1, 0)))
     return gx, gy
@@ -935,6 +1052,75 @@ def _adapt_gaze_interval(
     return current_interval, 0
 
 
+class GazeScheduler:
+    """Decides which processed frames run gaze inference.
+
+    Adaptation is opt-in: it is only active when ``max_interval`` exceeds
+    ``base_interval``. At the default (both 1) every frame with faces runs gaze,
+    so attention/behaviour metrics stay per-frame rather than sampled.
+
+    When enabled, the interval grows by one whenever gaze inference costs more
+    than ``target_fps_drop`` of the frame budget, and shrinks back one step at a
+    time after ``GAZE_RECOVERY_STREAK_MIN`` consecutive cheap frames. Skipped
+    frames reuse the previous estimate, so tracking stays continuous.
+    """
+
+    def __init__(
+        self,
+        base_interval: int = GAZE_INTERVAL_DEFAULT,
+        max_interval: int = GAZE_INTERVAL_DEFAULT,
+        target_fps_drop: float = GAZE_TARGET_FPS_DROP_DEFAULT,
+    ) -> None:
+        self.base_interval = max(_safe_int(base_interval, GAZE_INTERVAL_DEFAULT), 1)
+        self.max_interval = max(_safe_int(max_interval, GAZE_INTERVAL_DEFAULT), self.base_interval)
+        self.target_fps_drop = _safe_float(target_fps_drop, GAZE_TARGET_FPS_DROP_DEFAULT)
+        self.interval = self.base_interval
+        self.recovery_streak = 0
+        self.frames_seen = 0
+
+    @property
+    def adaptive(self) -> bool:
+        return self.max_interval > self.base_interval
+
+    def should_run(self) -> bool:
+        """Call once per processed frame that has faces. True => run inference."""
+        self.frames_seen += 1
+        if not self.adaptive:
+            return True
+        return (self.frames_seen - 1) % self.interval == 0
+
+    def mode_label(self) -> str:
+        if not self.adaptive:
+            return "full-rate"
+        return (
+            f"adaptive(base={self.base_interval}, max={self.max_interval}, "
+            f"target-drop={self.target_fps_drop:g})"
+        )
+
+    def metrics(self) -> dict[str, float]:
+        """The aggregate fields describing what actually ran, in one place."""
+        return {
+            "gaze_base_interval_frames": self.base_interval,
+            "gaze_interval_frames_final": self.interval,
+            "gaze_target_fps_drop": self.target_fps_drop if self.adaptive else 0.0,
+        }
+
+    def observe(self, latency_ms: float, frame_ms: float) -> None:
+        """Feed back the cost of a frame that ran inference."""
+        if not self.adaptive:
+            return
+        frame_ms = _safe_float(frame_ms, 0.0)
+        overhead_ratio = (_safe_float(latency_ms, 0.0) / frame_ms) if frame_ms > 0 else 0.0
+        self.interval, self.recovery_streak = _adapt_gaze_interval(
+            current_interval=self.interval,
+            base_interval=self.base_interval,
+            max_interval=self.max_interval,
+            overhead_ratio=overhead_ratio,
+            target_drop=self.target_fps_drop,
+            recovery_streak=self.recovery_streak,
+        )
+
+
 def _best_face(
     faces: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None]]
 ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray | None] | None:
@@ -955,29 +1141,22 @@ def _match(emb: np.ndarray, db: FaceDB) -> tuple[str, float]:
 
 
 def _append_metric(event_type: str, payload: dict[str, Any]) -> None:
-    record = {
-        "timestamp_utc": _iso(),
-        "event_type": event_type,
-        **payload,
-    }
-    with METRICS_LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=True) + "\n")
+    common.append_jsonl(
+        METRICS_LOG_PATH,
+        {
+            "timestamp_utc": _iso(),
+            "event_type": event_type,
+            **payload,
+        },
+    )
+
+
+def _metrics_parse_errors() -> int:
+    return common.metrics_parse_errors()
 
 
 def _load_metric_events() -> list[dict[str, Any]]:
-    if not METRICS_LOG_PATH.exists():
-        return []
-    events: list[dict[str, Any]] = []
-    with METRICS_LOG_PATH.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return events
+    return common.read_jsonl(METRICS_LOG_PATH)
 
 
 def _bbox_to_list(bbox: Any) -> list[float]:
@@ -1156,7 +1335,7 @@ class _BehaviorTracker:
             "target_object": target_object,
             "previous_target": previous_target,
             "duration_sec": round(max(duration_sec, 0.0), 3),
-            "event_time_utc": _iso(datetime.fromtimestamp(now_ts, tz=timezone.utc)),
+            "event_time_utc": _iso(datetime.fromtimestamp(now_ts, tz=UTC)),
         }
         self.events_count += 1
         return payload
@@ -1200,7 +1379,7 @@ class _BehaviorTracker:
             self._accumulate(person, state, now_ts)
 
             target = observations.get(person)
-            state.history.append(target if target else None)
+            state.history.append(target or None)
             state.present = True
             state.last_seen_ts = now_ts
             state.last_update_ts = now_ts
@@ -1332,8 +1511,8 @@ def _phrase_for_attention(person: str, obj: str, seconds: float) -> str:
     if seconds < 30.0:
         return f"{person} briefly checked a {obj}."
     if seconds < 120.0:
-        return f"{person} looked at a {obj} for about {int(round(seconds))} seconds."
-    minutes = max(int(round(seconds / 60.0)), 1)
+        return f"{person} looked at a {obj} for about {round(seconds)} seconds."
+    minutes = max(round(seconds / 60.0), 1)
     return f"{person} looked at a {obj} for {minutes} minutes."
 
 
@@ -1511,7 +1690,9 @@ def _build_llm_context(question: str, lookback_minutes: int = 30) -> dict[str, A
 
 
 def _query_groq(question: str, context: dict[str, Any]) -> str | None:
-    api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq_api_key")
+    # Both spellings are supported on purpose: `.env.example` documents the lowercase
+    # form, so dropping it would break existing setups.
+    api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq_api_key")  # noqa: SIM112
     if not api_key:
         return None
     try:
@@ -1581,7 +1762,8 @@ def _answer_current_presence() -> str:
     return "No recognition session data is available yet."
 
 
-def _answer_attention_query(question: str, known_people: list[str]) -> str:
+def _answer_attention_query(question: str, known_people: list[str]) -> tuple[str, bool]:
+    """Answer an attention question, reporting whether any event backed it."""
     target_person = None
     ql = question.lower()
     for name in known_people:
@@ -1603,12 +1785,12 @@ def _answer_attention_query(question: str, known_people: list[str]) -> str:
             continue
         ts = event.get("timestamp_utc")
         if str(event.get("event")) == "end":
-            return f"{person} stopped attending {obj} around {_local_hms(ts)}."
-        return f"{person} was looking at {obj} around {_local_hms(ts)}."
+            return f"{person} stopped attending {obj} around {_local_hms(ts)}.", True
+        return f"{person} was looking at {obj} around {_local_hms(ts)}.", True
 
     if target_person:
-        return f"No recent attention events were found for {target_person}."
-    return "No recent gaze attention events were found."
+        return f"No recent attention events were found for {target_person}.", False
+    return "No recent gaze attention events were found.", False
 
 
 def _handle_chat_query(
@@ -1694,7 +1876,7 @@ def _handle_chat_query(
             answer = _answer_current_presence()
     elif "looking at" in q or "look at" in q:
         intent = "attention_lookup"
-        answer = _answer_attention_query(question, db.names)
+        answer, hit = _answer_attention_query(question, db.names)
     elif "most viewed object" in q:
         intent = "session_summary"
         summary_minutes = _parse_minutes_from_text(q, default=5)
@@ -1837,6 +2019,278 @@ def _progress_bar(frame: np.ndarray, value: int, total: int) -> None:
     cv2.rectangle(frame, (x1, y - bh), (x2, y), (130, 130, 130), 1)
 
 
+# ── Session aggregate ─────────────────────────────────────────────────────────
+# One definition of the `recognize_session.aggregate` contract, shared by the CLI
+# loop and the API worker. They used to each carry a ~70-line copy of this and had
+# already drifted apart (the API hardcoded its gaze metrics to zero).
+SESSION_AGGREGATE_KEYS: tuple[str, ...] = (
+    "session_id",
+    "frames_total",
+    "frames_with_faces",
+    "frames_empty",
+    "frames_dropped",
+    "average_faces_per_frame",
+    "detections_total",
+    "known_detections",
+    "unknown_detections",
+    "peak_simultaneous_faces",
+    "face_recognition_enabled",
+    "avg_fps",
+    "moving_avg_fps",
+    "min_fps",
+    "max_fps",
+    "faces_per_sec",
+    "avg_detection_latency_ms",
+    "min_detection_latency_ms",
+    "max_detection_latency_ms",
+    "detection_calls",
+    "avg_confidence",
+    "recognition_rate",
+    "unknown_rate",
+    "unknown_alert_events",
+    "unknown_alert_density_per_min",
+    "unique_individuals_seen",
+    "current_people_visible",
+    "active_subjects",
+    "active_objects",
+    "detection_timeline",
+    "object_detections_total",
+    "object_general_detections",
+    "object_custom_detections",
+    "object_avg_confidence",
+    "object_avg_confidence_general",
+    "object_avg_confidence_custom",
+    "gaze_enabled",
+    "gaze_model_loaded",
+    "gaze_base_interval_frames",
+    "gaze_interval_frames_final",
+    "gaze_target_fps_drop",
+    "gaze_inference_calls",
+    "gaze_inference_avg_ms",
+    "gaze_inference_min_ms",
+    "gaze_inference_max_ms",
+    "object_class_counts_total",
+    "object_class_counts_general",
+    "object_class_counts_custom",
+    "object_detection_timeline",
+    "yolo_state_final",
+    "yolo_model_paths",
+    "memory_snapshots_auto",
+    "memory_snapshots_manual",
+    "memory_snapshots_total_session",
+    "memory_snapshot_total_store",
+    "memory_query_counts",
+    "memory_query_hits",
+    "memory_query_misses",
+    "chat_queries_total",
+    "chat_queries_hit",
+    "chat_queries_llm",
+    "behavior_interactions_total",
+    "behavior_attention_total_sec",
+    "behavior_top_objects",
+    "behavior_attention_map",
+    "behavior_events_count",
+    "behavior_activity_patterns",
+)
+
+
+@dataclass
+class SessionAggregateInput:
+    """Counters a finished monitoring session hands to :meth:`build`.
+
+    Field defaults describe "nothing happened": unset minimums stay at infinity so
+    the builder can emit ``0.0`` for them, and gaze runs at full rate unless a
+    caller says otherwise.
+    """
+
+    session_id: str = ""
+    duration_sec: float = 0.0
+    frames_total: int = 0
+    frames_with_faces: int = 0
+    frames_empty: int = 0
+    frames_dropped: int = 0
+    detections_total: int = 0
+    known_detections: int = 0
+    unknown_detections: int = 0
+    peak_simultaneous_faces: int = 0
+    face_recognition_enabled: bool = True
+    confidence_sum: float = 0.0
+    detection_calls: int = 0
+    detection_latency_sum_ms: float = 0.0
+    detection_latency_min_ms: float = float("inf")
+    detection_latency_max_ms: float = 0.0
+    fps_ema: float = 0.0
+    fps_min: float = float("inf")
+    fps_max: float = 0.0
+    object_detections_total: int = 0
+    object_general_detections: int = 0
+    object_custom_detections: int = 0
+    object_conf_sum: float = 0.0
+    object_general_conf_sum: float = 0.0
+    object_custom_conf_sum: float = 0.0
+    unknown_alert_count: int = 0
+    memory_auto_snapshots: int = 0
+    memory_manual_snapshots: int = 0
+    memory_total_store: int = 0
+    memory_query_counts: dict[str, int] = field(default_factory=dict)
+    memory_query_hits: dict[str, int] = field(default_factory=dict)
+    memory_query_misses: dict[str, int] = field(default_factory=dict)
+    chat_queries_total: int = 0
+    chat_queries_hit: int = 0
+    chat_queries_llm: int = 0
+    unique_individuals_seen: int = 0
+    current_people_visible: int = 0
+    active_subjects: list[dict[str, Any]] = field(default_factory=list)
+    active_objects: list[str] = field(default_factory=list)
+    detection_timeline: dict[str, int] = field(default_factory=dict)
+    object_detection_timeline: dict[str, int] = field(default_factory=dict)
+    object_class_counts_total: dict[str, int] = field(default_factory=dict)
+    object_class_counts_general: dict[str, int] = field(default_factory=dict)
+    object_class_counts_custom: dict[str, int] = field(default_factory=dict)
+    behavior_summary: dict[str, Any] = field(default_factory=dict)
+    gaze_enabled: bool = False
+    gaze_model_loaded: bool = False
+    gaze_base_interval_frames: int = 1
+    gaze_interval_frames_final: int = 1
+    gaze_target_fps_drop: float = 0.0
+    gaze_inference_calls: int = 0
+    gaze_inference_sum_ms: float = 0.0
+    gaze_inference_min_ms: float = float("inf")
+    gaze_inference_max_ms: float = 0.0
+    detector_state: dict[str, Any] = field(default_factory=dict)
+    model_paths: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> dict[str, Any]:
+        frames_total = _safe_int(self.frames_total)
+        detections_total = _safe_int(self.detections_total)
+        object_detections_total = _safe_int(self.object_detections_total)
+        duration = max(_safe_float(self.duration_sec), 0.0)
+        minutes = duration / 60.0
+
+        behavior = self.behavior_summary if isinstance(self.behavior_summary, dict) else {}
+        behavior_interactions = _safe_int(behavior.get("interactions_total"), 0)
+        behavior_attention_sec = _safe_float(behavior.get("attention_total_sec"), 0.0)
+        behavior_top_objects = behavior.get("top_objects", [])
+        if not isinstance(behavior_top_objects, list):
+            behavior_top_objects = []
+
+        def ratio(numerator: float, denominator: float) -> float:
+            return (numerator / denominator) if denominator else 0.0
+
+        def real_min(value: float) -> float:
+            return 0.0 if value == float("inf") else _safe_float(value)
+
+        return {
+            "session_id": str(self.session_id),
+            "frames_total": frames_total,
+            "frames_with_faces": _safe_int(self.frames_with_faces),
+            "frames_empty": _safe_int(self.frames_empty),
+            "frames_dropped": _safe_int(self.frames_dropped),
+            "average_faces_per_frame": round(ratio(detections_total, frames_total), 4),
+            "detections_total": detections_total,
+            "known_detections": _safe_int(self.known_detections),
+            "unknown_detections": _safe_int(self.unknown_detections),
+            "peak_simultaneous_faces": _safe_int(self.peak_simultaneous_faces),
+            "face_recognition_enabled": bool(self.face_recognition_enabled),
+            "avg_fps": round(ratio(frames_total, duration), 3),
+            "moving_avg_fps": round(_safe_float(self.fps_ema), 3),
+            "min_fps": round(real_min(self.fps_min), 3),
+            "max_fps": round(_safe_float(self.fps_max), 3),
+            "faces_per_sec": round(ratio(detections_total, duration), 3),
+            "avg_detection_latency_ms": round(
+                ratio(_safe_float(self.detection_latency_sum_ms), _safe_int(self.detection_calls)), 2
+            ),
+            "min_detection_latency_ms": round(real_min(self.detection_latency_min_ms), 2),
+            "max_detection_latency_ms": round(_safe_float(self.detection_latency_max_ms), 2),
+            "detection_calls": _safe_int(self.detection_calls),
+            "avg_confidence": round(ratio(_safe_float(self.confidence_sum), detections_total), 4),
+            "recognition_rate": round(
+                ratio(_safe_int(self.known_detections), detections_total), 6
+            ),
+            "unknown_rate": round(
+                ratio(_safe_int(self.unknown_detections), detections_total), 6
+            ),
+            "unknown_alert_events": _safe_int(self.unknown_alert_count),
+            "unknown_alert_density_per_min": round(
+                ratio(_safe_int(self.unknown_alert_count), minutes), 3
+            ),
+            "unique_individuals_seen": _safe_int(self.unique_individuals_seen),
+            "current_people_visible": _safe_int(self.current_people_visible),
+            "active_subjects": list(self.active_subjects),
+            "active_objects": list(self.active_objects),
+            "detection_timeline": [
+                {"time_local": t, "detections": int(c)}
+                for t, c in list(self.detection_timeline.items())[-20:]
+            ],
+            "object_detections_total": object_detections_total,
+            "object_general_detections": _safe_int(self.object_general_detections),
+            "object_custom_detections": _safe_int(self.object_custom_detections),
+            "object_avg_confidence": round(
+                ratio(_safe_float(self.object_conf_sum), object_detections_total), 4
+            ),
+            "object_avg_confidence_general": round(
+                ratio(
+                    _safe_float(self.object_general_conf_sum),
+                    _safe_int(self.object_general_detections),
+                ),
+                4,
+            ),
+            "object_avg_confidence_custom": round(
+                ratio(
+                    _safe_float(self.object_custom_conf_sum),
+                    _safe_int(self.object_custom_detections),
+                ),
+                4,
+            ),
+            "gaze_enabled": bool(self.gaze_enabled),
+            "gaze_model_loaded": bool(self.gaze_model_loaded),
+            "gaze_base_interval_frames": _safe_int(self.gaze_base_interval_frames, 1),
+            "gaze_interval_frames_final": _safe_int(self.gaze_interval_frames_final, 1),
+            "gaze_target_fps_drop": _safe_float(self.gaze_target_fps_drop, 0.0),
+            "gaze_inference_calls": _safe_int(self.gaze_inference_calls),
+            "gaze_inference_avg_ms": round(
+                ratio(_safe_float(self.gaze_inference_sum_ms), _safe_int(self.gaze_inference_calls)), 2
+            ),
+            "gaze_inference_min_ms": round(real_min(self.gaze_inference_min_ms), 2),
+            "gaze_inference_max_ms": round(_safe_float(self.gaze_inference_max_ms), 2),
+            "object_class_counts_total": dict(self.object_class_counts_total),
+            "object_class_counts_general": dict(self.object_class_counts_general),
+            "object_class_counts_custom": dict(self.object_class_counts_custom),
+            "object_detection_timeline": [
+                {"time_local": t, "detections": int(c)}
+                for t, c in list(self.object_detection_timeline.items())[-20:]
+            ],
+            "yolo_state_final": dict(self.detector_state),
+            "yolo_model_paths": dict(self.model_paths),
+            "memory_snapshots_auto": _safe_int(self.memory_auto_snapshots),
+            "memory_snapshots_manual": _safe_int(self.memory_manual_snapshots),
+            "memory_snapshots_total_session": _safe_int(self.memory_auto_snapshots)
+            + _safe_int(self.memory_manual_snapshots),
+            "memory_snapshot_total_store": _safe_int(self.memory_total_store),
+            "memory_query_counts": dict(self.memory_query_counts),
+            "memory_query_hits": dict(self.memory_query_hits),
+            "memory_query_misses": dict(self.memory_query_misses),
+            "chat_queries_total": _safe_int(self.chat_queries_total),
+            "chat_queries_hit": _safe_int(self.chat_queries_hit),
+            "chat_queries_llm": _safe_int(self.chat_queries_llm),
+            "behavior_interactions_total": behavior_interactions,
+            "behavior_attention_total_sec": round(behavior_attention_sec, 3),
+            "behavior_top_objects": behavior_top_objects,
+            "behavior_attention_map": behavior.get("attention_map", {}),
+            "behavior_events_count": _safe_int(behavior.get("events_count"), 0),
+            "behavior_activity_patterns": {
+                "transitions_per_min": round(ratio(behavior_interactions, minutes), 3),
+                "unique_attended_objects": len(behavior_top_objects),
+                "focus_ratio": round(ratio(behavior_attention_sec, duration), 4),
+            },
+        }
+
+
+def build_session_aggregate(**kwargs: Any) -> dict[str, Any]:
+    """Convenience wrapper so callers can pass counters as keywords."""
+    return SessionAggregateInput(**kwargs).build()
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 def cmd_enroll(name: str, model: str) -> None:
     session_id = _session_id("enroll")
@@ -1906,7 +2360,7 @@ def cmd_enroll(name: str, model: str) -> None:
     _append_metric(
         "enroll",
         {
-            "schema_version": 2,
+            "schema_version": common.ENROLL_SCHEMA_VERSION,
             "session_id": session_id,
             "name": name,
             "model": model,
@@ -1938,10 +2392,34 @@ def cmd_recognize(
     gaze_weights: str,
     gaze_weights_source: str,
     disable_gaze_auto_download: bool,
+    gaze_max_interval: int = GAZE_INTERVAL_DEFAULT,
+    gaze_target_fps_drop: float = GAZE_TARGET_FPS_DROP_DEFAULT,
 ) -> None:
+    app, face_reason = _try_build_face_app(model)
+    if app is None:
+        # Degrade loudly: a session without faces is still useful (objects, gaze,
+        # memory), but the operator must be told why identities are not matched.
+        print(f"Face recognition DISABLED: {face_reason}")
+        print("Continuing with object detection only; no identities will be matched.")
+
     db = FaceDB.load()
     if not db.names:
-        raise RuntimeError("No enrolled identities. Run:  enroll --name <n>")
+        if app is None:
+            # The "no identities" setup error only applies when matching is possible.
+            # With face recognition off, every detection is an object anyway, and
+            # `enroll` cannot even run, so refusing to start would be a dead end.
+            print(
+                "No enrolled identities and face recognition is unavailable; "
+                "continuing with object detection only."
+            )
+        else:
+            # Fail fast in the CLI: an interactive session with no identities would only
+            # ever report Unknown, so this is a setup error, not a runtime condition.
+            # The API deliberately degrades instead (a service should still serve frames).
+            raise RuntimeError(
+                "No enrolled identities. Run `pixi run python main.py enroll --name <name>` "
+                "first, then start monitoring again."
+            )
 
     session_id = _session_id("recognize")
     start_dt = _now_utc()
@@ -1958,14 +2436,20 @@ def cmd_recognize(
     )
     memory = SceneMemoryManager(snapshot_interval_sec=snapshot_interval, base_dir=MEMORY_DIR)
 
-    app, cap = _build_app(model), _open_camera()
+    cap = _open_camera()
     reader = _AsyncCameraReader(cap)
     gaze_enabled = not disable_gaze
     gaze_auto_download = not disable_gaze_auto_download
+    gaze_scheduler = GazeScheduler(
+        base_interval=GAZE_INTERVAL_DEFAULT,
+        max_interval=gaze_max_interval,
+        target_fps_drop=gaze_target_fps_drop,
+    )
     gaze_inference_calls = 0
     gaze_inference_sum_ms = 0.0
     gaze_inference_min_ms = float("inf")
     gaze_inference_max_ms = 0.0
+    last_gaze_rows: list[tuple[int, int, float, float] | None] | None = None
     gaze_runtime = (
         _load_gaze_runtime(
             gaze_arch=gaze_arch,
@@ -1981,7 +2465,10 @@ def cmd_recognize(
 
     cv2.namedWindow(win := "Recognize", cv2.WINDOW_NORMAL)
 
-    print("Running unified stream: InsightFace + YOLO + memory.")
+    print(
+        "Running unified stream: "
+        + ("InsightFace + YOLO + memory." if app is not None else "YOLO + memory (faces disabled).")
+    )
     _print_runtime_help()
     if custom_model_path:
         print(f"Custom YOLO model: {custom_model_path}")
@@ -1993,7 +2480,7 @@ def cmd_recognize(
             loaded_arch = str(gaze_runtime.get("arch", gaze_arch)) if gaze_runtime else gaze_arch
             print(
                 f"Gaze active: model=L2CS-Net {loaded_arch} weights={loaded_path} "
-                "mode=full-rate"
+                f"mode={gaze_scheduler.mode_label()}"
             )
         else:
             print("Gaze requested but unavailable. Continuing with gaze OFF.")
@@ -2202,23 +2689,31 @@ def cmd_recognize(
 
             gaze_rows: list[tuple[int, int, float, float] | None] = [None for _ in render_rows]
             ran_gaze_this_frame = False
-            if (
-                gaze_active
-                and render_rows
-            ):
-                ran_gaze_this_frame = True
-                gaze_t0 = time.perf_counter()
-                gaze_rows = _estimate_gaze_points(
-                    frame,
-                    [row[0] for row in render_rows],
-                    [row[1] for row in render_rows],
-                    gaze_runtime,
-                )
-                gaze_latency_ms = (time.perf_counter() - gaze_t0) * 1000.0
-                gaze_inference_calls += 1
-                gaze_inference_sum_ms += gaze_latency_ms
-                gaze_inference_min_ms = min(gaze_inference_min_ms, gaze_latency_ms)
-                gaze_inference_max_ms = max(gaze_inference_max_ms, gaze_latency_ms)
+            if gaze_active and render_rows:
+                if gaze_scheduler.should_run():
+                    ran_gaze_this_frame = True
+                    gaze_t0 = time.perf_counter()
+                    gaze_rows = _estimate_gaze_points(
+                        frame,
+                        [row[0] for row in render_rows],
+                        [row[1] for row in render_rows],
+                        gaze_runtime,
+                    )
+                    gaze_latency_ms = (time.perf_counter() - gaze_t0) * 1000.0
+                    gaze_inference_calls += 1
+                    gaze_inference_sum_ms += gaze_latency_ms
+                    gaze_inference_min_ms = min(gaze_inference_min_ms, gaze_latency_ms)
+                    gaze_inference_max_ms = max(gaze_inference_max_ms, gaze_latency_ms)
+                    gaze_scheduler.observe(gaze_latency_ms, dt * 1000.0)
+                    last_gaze_rows = gaze_rows
+                elif last_gaze_rows is not None:
+                    # Skipped by the adaptive schedule: reuse the last estimate so
+                    # attention tracking stays continuous between inferences.
+                    ran_gaze_this_frame = True
+                    gaze_rows = [
+                        last_gaze_rows[i] if i < len(last_gaze_rows) else None
+                        for i in range(len(render_rows))
+                    ]
 
             gaze_observations: dict[str, str | None] = {}
             attention_rows: list[dict[str, Any]] = []
@@ -2370,14 +2865,18 @@ def cmd_recognize(
                         WHITE,
                     ),
                     (
-                        f"Known:{known_detections} Unknown:{unknown_detections} "
-                        f"G:{'ON' if state['general']['enabled'] else 'OFF'} "
-                        f"C:{'ON' if state['custom']['enabled'] else 'OFF'}",
+                        (
+                            f"Known:{known_detections} Unknown:{unknown_detections} "
+                            f"G:{'ON' if state['general']['enabled'] else 'OFF'} "
+                            f"C:{'ON' if state['custom']['enabled'] else 'OFF'}"
+                        ),
                         (180, 180, 180),
                     ),
                     (
-                        f"Gaze:{gaze_status} L:{'Y' if gaze_model_loaded else 'N'} "
-                        f"Calls:{gaze_inference_calls}",
+                        (
+                            f"Gaze:{gaze_status} L:{'Y' if gaze_model_loaded else 'N'} "
+                            f"Calls:{gaze_inference_calls}"
+                        ),
                         (170, 170, 170),
                     ),
                     (
@@ -2531,38 +3030,6 @@ def cmd_recognize(
             info["last_enter_ts"] = None
             info["present"] = False
 
-    current_people_visible = len(visible_prev)
-    avg_fps = (frames_total / duration_sec) if duration_sec > 0 else 0.0
-    faces_per_sec = (detections_total / duration_sec) if duration_sec > 0 else 0.0
-    avg_conf = (confidence_sum / detections_total) if detections_total > 0 else 0.0
-    avg_detection_latency_ms = (
-        detection_latency_sum_ms / detection_calls if detection_calls > 0 else 0.0
-    )
-    avg_faces_per_frame = (detections_total / frames_total) if frames_total > 0 else 0.0
-
-    recognition_rate = (known_detections / detections_total) if detections_total > 0 else 0.0
-    unknown_rate = (unknown_detections / detections_total) if detections_total > 0 else 0.0
-    unknown_alert_density_per_min = (
-        unknown_alert_count / (duration_sec / 60.0) if duration_sec > 0 else 0.0
-    )
-
-    object_avg_conf = (
-        object_conf_sum / object_detections_total if object_detections_total > 0 else 0.0
-    )
-    object_avg_conf_general = (
-        object_general_conf_sum / object_general_detections
-        if object_general_detections > 0
-        else 0.0
-    )
-    object_avg_conf_custom = (
-        object_custom_conf_sum / object_custom_detections
-        if object_custom_detections > 0
-        else 0.0
-    )
-    gaze_inference_avg_ms = (
-        gaze_inference_sum_ms / gaze_inference_calls if gaze_inference_calls > 0 else 0.0
-    )
-
     people_clean: dict[str, dict[str, Any]] = {}
     for name, info in people.items():
         detections = _safe_int(info.get("detections"))
@@ -2576,108 +3043,69 @@ def cmd_recognize(
         }
 
     behavior_summary = behavior_tracker.summary()
-    behavior_interactions_total = _safe_int(behavior_summary.get("interactions_total"), 0)
-    behavior_attention_total_sec = _safe_float(behavior_summary.get("attention_total_sec"), 0.0)
-    transitions_per_min = (
-        behavior_interactions_total / (duration_sec / 60.0) if duration_sec > 0 else 0.0
-    )
-    unique_attended_objects = len(behavior_summary.get("top_objects", []))
-    focus_ratio = (
-        behavior_attention_total_sec / duration_sec if duration_sec > 0 else 0.0
-    )
 
     memory_stats = memory.get_memory_stats()
-    aggregate = {
-        "session_id": session_id,
-        "frames_total": frames_total,
-        "frames_with_faces": frames_with_faces,
-        "frames_empty": frames_empty,
-        "frames_dropped": frames_dropped,
-        "average_faces_per_frame": round(avg_faces_per_frame, 4),
-        "detections_total": detections_total,
-        "known_detections": known_detections,
-        "unknown_detections": unknown_detections,
-        "peak_simultaneous_faces": peak_simultaneous_faces,
-        "avg_fps": round(avg_fps, 3),
-        "moving_avg_fps": round(fps_ema, 3),
-        "min_fps": round(0.0 if fps_min == float("inf") else fps_min, 3),
-        "max_fps": round(fps_max, 3),
-        "faces_per_sec": round(faces_per_sec, 3),
-        "avg_detection_latency_ms": round(avg_detection_latency_ms, 2),
-        "min_detection_latency_ms": round(
-            0.0 if detection_latency_min_ms == float("inf") else detection_latency_min_ms, 2
-        ),
-        "max_detection_latency_ms": round(detection_latency_max_ms, 2),
-        "detection_calls": detection_calls,
-        "avg_confidence": round(avg_conf, 4),
-        "recognition_rate": round(recognition_rate, 6),
-        "unknown_rate": round(unknown_rate, 6),
-        "unknown_alert_events": unknown_alert_count,
-        "unknown_alert_density_per_min": round(unknown_alert_density_per_min, 3),
-        "unique_individuals_seen": len(people_clean),
-        "current_people_visible": current_people_visible,
-        "active_subjects": latest_active_subjects,
-        "active_objects": latest_object_labels,
-        "detection_timeline": [
-            {"time_local": t, "detections": int(c)}
-            for t, c in list(detection_timeline.items())[-20:]
-        ],
-        "object_detections_total": object_detections_total,
-        "object_general_detections": object_general_detections,
-        "object_custom_detections": object_custom_detections,
-        "object_avg_confidence": round(object_avg_conf, 4),
-        "object_avg_confidence_general": round(object_avg_conf_general, 4),
-        "object_avg_confidence_custom": round(object_avg_conf_custom, 4),
-        "gaze_enabled": gaze_enabled,
-        "gaze_model_loaded": gaze_model_loaded,
-        "gaze_base_interval_frames": 1,
-        "gaze_interval_frames_final": 1,
-        "gaze_target_fps_drop": 0.0,
-        "gaze_inference_calls": gaze_inference_calls,
-        "gaze_inference_avg_ms": round(gaze_inference_avg_ms, 2),
-        "gaze_inference_min_ms": round(
-            0.0 if gaze_inference_min_ms == float("inf") else gaze_inference_min_ms,
-            2,
-        ),
-        "gaze_inference_max_ms": round(gaze_inference_max_ms, 2),
-        "object_class_counts_total": dict(object_class_counts_total),
-        "object_class_counts_general": dict(object_class_counts_general),
-        "object_class_counts_custom": dict(object_class_counts_custom),
-        "object_detection_timeline": [
-            {"time_local": t, "detections": int(c)}
-            for t, c in list(object_detection_timeline.items())[-20:]
-        ],
-        "yolo_state_final": detector.get_state(),
-        "yolo_model_paths": {
-            "general": general_model_path,
-            "custom": custom_model_path,
-        },
-        "memory_snapshots_auto": memory_auto_snapshots,
-        "memory_snapshots_manual": memory_manual_snapshots,
-        "memory_snapshots_total_session": memory_auto_snapshots + memory_manual_snapshots,
-        "memory_snapshot_total_store": _safe_int(memory_stats.get("total_snapshots"), 0),
-        "memory_query_counts": dict(memory_query_counts),
-        "memory_query_hits": dict(memory_query_hits),
-        "memory_query_misses": dict(memory_query_misses),
-        "chat_queries_total": chat_queries_total,
-        "chat_queries_hit": chat_queries_hit,
-        "chat_queries_llm": chat_queries_llm,
-        "behavior_interactions_total": behavior_interactions_total,
-        "behavior_attention_total_sec": round(behavior_attention_total_sec, 3),
-        "behavior_top_objects": behavior_summary.get("top_objects", []),
-        "behavior_attention_map": behavior_summary.get("attention_map", {}),
-        "behavior_events_count": _safe_int(behavior_summary.get("events_count"), 0),
-        "behavior_activity_patterns": {
-            "transitions_per_min": round(transitions_per_min, 3),
-            "unique_attended_objects": unique_attended_objects,
-            "focus_ratio": round(focus_ratio, 4),
-        },
-    }
+    aggregate = build_session_aggregate(
+        session_id=session_id,
+        duration_sec=duration_sec,
+        frames_total=frames_total,
+        frames_with_faces=frames_with_faces,
+        frames_empty=frames_empty,
+        frames_dropped=frames_dropped,
+        detections_total=detections_total,
+        known_detections=known_detections,
+        unknown_detections=unknown_detections,
+        peak_simultaneous_faces=peak_simultaneous_faces,
+        confidence_sum=confidence_sum,
+        detection_calls=detection_calls,
+        detection_latency_sum_ms=detection_latency_sum_ms,
+        detection_latency_min_ms=detection_latency_min_ms,
+        detection_latency_max_ms=detection_latency_max_ms,
+        fps_ema=fps_ema,
+        fps_min=fps_min,
+        fps_max=fps_max,
+        object_detections_total=object_detections_total,
+        object_general_detections=object_general_detections,
+        object_custom_detections=object_custom_detections,
+        object_conf_sum=object_conf_sum,
+        object_general_conf_sum=object_general_conf_sum,
+        object_custom_conf_sum=object_custom_conf_sum,
+        unknown_alert_count=unknown_alert_count,
+        memory_auto_snapshots=memory_auto_snapshots,
+        memory_manual_snapshots=memory_manual_snapshots,
+        memory_total_store=_safe_int(memory_stats.get("total_snapshots"), 0),
+        memory_query_counts=memory_query_counts,
+        memory_query_hits=memory_query_hits,
+        memory_query_misses=memory_query_misses,
+        chat_queries_total=chat_queries_total,
+        chat_queries_hit=chat_queries_hit,
+        chat_queries_llm=chat_queries_llm,
+        unique_individuals_seen=len(people_clean),
+        current_people_visible=len(visible_prev),
+        active_subjects=latest_active_subjects,
+        active_objects=latest_object_labels,
+        detection_timeline=detection_timeline,
+        object_detection_timeline=object_detection_timeline,
+        object_class_counts_total=object_class_counts_total,
+        object_class_counts_general=object_class_counts_general,
+        object_class_counts_custom=object_class_counts_custom,
+        behavior_summary=behavior_summary,
+        gaze_enabled=gaze_enabled,
+        gaze_model_loaded=gaze_model_loaded,
+        **gaze_scheduler.metrics(),
+        gaze_inference_calls=gaze_inference_calls,
+        gaze_inference_sum_ms=gaze_inference_sum_ms,
+        gaze_inference_min_ms=gaze_inference_min_ms,
+        gaze_inference_max_ms=gaze_inference_max_ms,
+        detector_state=detector.get_state(),
+        model_paths={"general": general_model_path, "custom": custom_model_path},
+        face_recognition_enabled=app is not None,
+    )
 
     _append_metric(
         "recognize_session",
         {
-            "schema_version": 4,
+            "schema_version": common.SESSION_SCHEMA_VERSION,
             "session_id": session_id,
             "model": model,
             "camera_source": CAMERA_SOURCE,
@@ -2693,7 +3121,7 @@ def cmd_recognize(
     )
 
     print(
-        f"Session summary | frames={frames_total} avg_fps={avg_fps:.2f} "
+        f"Session summary | frames={frames_total} avg_fps={aggregate['avg_fps']:.2f} "
         f"faces={detections_total} objects={object_detections_total} "
         f"known={known_detections} unknown={unknown_detections}"
     )
@@ -2705,7 +3133,9 @@ def cmd_list() -> None:
         print("No enrolled identities found.")
         return
     print(f"Database: {DB_PATH}")
-    for name, count in zip(db.names, db.counts):
+    # strict=False: a hand-edited or truncated face_db.npz should list what it has
+    # rather than crash a diagnostic command.
+    for name, count in zip(db.names, db.counts, strict=False):
         print(f"  {name}: {int(count)} samples")
 
 
@@ -2751,7 +3181,7 @@ def cmd_train_objects(
     )
 
     save_dir = (
-        Path(getattr(train_result, "save_dir"))
+        Path(train_result.save_dir)
         if getattr(train_result, "save_dir", None)
         else Path(getattr(getattr(yolo, "trainer", None), "save_dir", project))
     )
@@ -2770,7 +3200,7 @@ def cmd_train_objects(
     _append_metric(
         "object_train",
         {
-            "schema_version": 1,
+            "schema_version": common.OBJECT_TRAIN_SCHEMA_VERSION,
             "start_utc": _iso(start_dt),
             "end_utc": _iso(end_dt),
             "duration_sec": round(duration_sec, 3),
@@ -3339,7 +3769,7 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
                 weight = _safe_float(row[1], 0.0)
                 if weight <= 0.0:
                     continue
-                behavior_object_counter[str(row[0])] += max(1, int(round(weight)))
+                behavior_object_counter[str(row[0])] += max(1, round(weight))
 
         hist_event_count += _safe_int(r.get("events_total_count"), len(r.get("events", [])))
         label_counter.update(r.get("label_counts", {}))
@@ -3426,12 +3856,13 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
             "total_samples": int(np.sum(db.counts)) if len(db.counts) else 0,
             "identities": [
                 {"name": name, "samples": int(count)}
-                for name, count in zip(db.names, db.counts)
+                for name, count in zip(db.names, db.counts, strict=False)
             ],
         },
         "metrics": {
             "path": str(METRICS_LOG_PATH),
             "events_total": len(events),
+            "parse_errors": _metrics_parse_errors(),
             "enroll_events": len(enroll_events),
             "recognize_sessions": len(recognize_events),
             "chat_queries": len(chat_query_events),
@@ -3509,9 +3940,7 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
         or (latest_agg.get("session_id") if isinstance(latest_agg, dict) else None)
         or "N/A"
     )
-    if isinstance(session_id, str) and (
-        session_id.startswith("legacy-") or session_id.startswith("recognize-")
-    ):
+    if isinstance(session_id, str) and session_id.startswith(("legacy-", "recognize-")):
         fallback_dt = _parse_iso(
             (latest.get("start_utc") if isinstance(latest, dict) else None)
             or (latest.get("end_utc") if isinstance(latest, dict) else None)
@@ -3724,20 +4153,27 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
             f"Peak Simultaneous Faces : {_safe_int(hist.get('peak_simultaneous_faces'), 0)}",
             f"Face Throughput         : {_safe_float(hist.get('faces_per_sec'), 0.0):.2f} faces/s",
             f"Object Detections Total : {_safe_int(hist.get('object_detections_total'), 0)}",
-            f"Object Gen/Custom       : {_safe_int(hist.get('object_general_detections'), 0)}/"
-            f"{_safe_int(hist.get('object_custom_detections'), 0)}",
+            (
+                f"Object Gen/Custom       : {_safe_int(hist.get('object_general_detections'), 0)}/"
+                f"{_safe_int(hist.get('object_custom_detections'), 0)}"
+            ),
             f"Object Avg Confidence   : {_safe_float(hist.get('object_avg_confidence'), 0.0):.4f}",
-            f"Memory Snapshots A/M    : {_safe_int(hist.get('memory_auto_snapshots'), 0)}/"
-            f"{_safe_int(hist.get('memory_manual_snapshots'), 0)}",
+            (
+                f"Memory Snapshots A/M    : {_safe_int(hist.get('memory_auto_snapshots'), 0)}/"
+                f"{_safe_int(hist.get('memory_manual_snapshots'), 0)}"
+            ),
             f"Memory Queries Total    : {_safe_int(hist.get('memory_queries_total'), 0)}",
             f"Chat Queries Total      : {_safe_int(hist.get('chat_queries_total'), 0)}",
-            f"Chat Queries Hit/LLM    : {_safe_int(hist.get('chat_queries_hit'), 0)}/"
-            f"{_safe_int(hist.get('chat_queries_llm'), 0)}",
+            (
+                f"Chat Queries Hit/LLM    : {_safe_int(hist.get('chat_queries_hit'), 0)}/"
+                f"{_safe_int(hist.get('chat_queries_llm'), 0)}"
+            ),
             f"Summary Queries Total   : {_safe_int(hist.get('summary_queries_total'), 0)}",
             f"Behavior Interactions   : {_safe_int(hist.get('behavior_interactions_total'), 0)}",
             f"Behavior Attention (s)  : {_safe_float(hist.get('behavior_attention_total_sec'), 0.0):.1f}",
             f"Behavior Events         : {_safe_int(hist.get('behavior_events_count'), 0)}",
             f"Alert Density           : {_safe_float(hist.get('alert_density_per_min'), 0.0):.2f} alerts/min",
+            f"Metrics Parse Errors    : {_metrics_parse_errors()}",
             f"Average Confidence      : {_safe_float(hist.get('avg_confidence'), 0.0):.4f}",
             "",
             "╔════════════════════════════════════════════════════╗",
@@ -3761,6 +4197,279 @@ def cmd_report() -> None:
     print("Report files generated:")
     print(f"  Metrics JSONL: {METRICS_LOG_PATH}")
     print(f"  ASCII: {REPORT_TXT_PATH}")
+
+
+# ── Environment readiness ─────────────────────────────────────────────────────
+# (status, name, detail) rows. "fail" items block a monitoring session; "warn"
+# items disable one feature but let the pipeline run.
+_REQUIRED_MODULES = ("numpy", "cv2", "PIL", "onnxruntime", "ultralytics", "torch")
+
+# Modules whose absence disables exactly one capability rather than blocking a
+# session. A missing or too-old entry here is reported as `warn`, never `fail`:
+# the pipeline still runs, and `degraded_reason` names what is switched off.
+_DEGRADABLE_MODULES = {"insightface": "face recognition"}
+
+# Importable is not the same as usable: the pipeline calls APIs that only exist in
+# recent releases, so a module can import cleanly and still break the first session.
+# Only lower bounds are enforced here -- falling below a pinned minimum is a proven
+# break, whereas exceeding an upper bound is a forward-looking risk.
+_MIN_MODULE_VERSIONS: dict[str, tuple[tuple[int, ...], str]] = {
+    "insightface": (INSIGHTFACE_MIN_VERSION, "FaceAnalysis(providers=...) requires 0.7+ (2.x supported)"),
+    "numpy": ((1, 26), "pixi.toml pins numpy >=1.26,<3"),
+    "torch": ((2, 5), "pixi.toml pins torch >=2.5,<3"),
+    "ultralytics": ((8, 4), "pixi.toml pins ultralytics >=8.4,<9"),
+    "onnxruntime": ((1, 17), "required for the InsightFace execution providers"),
+    "PIL": ((11,), "pixi.toml pins pillow >=11,<12"),
+}
+
+
+def _parse_version(value: Any) -> tuple[int, ...]:
+    match = re.match(r"\s*(\d+(?:\.\d+)*)", str(value or ""))
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(1).split("."))
+_OPTIONAL_MODULES = {
+    "l2cs": "gaze estimation",
+    "gdown": "gaze weight auto-download",
+    "groq": "LLM chat fallback",
+    "faiss": "vector scene search",
+    "open_clip": "vector scene search",
+    "dotenv": ".env loading",
+    "fastapi": "API server",
+    "uvicorn": "API server",
+}
+
+
+def _check_import(name: str) -> tuple[bool, str]:
+    try:
+        module = importlib.import_module(name)
+    except Exception as exc:
+        return False, f"not importable ({type(exc).__name__})"
+    version = str(getattr(module, "__version__", "") or "").strip()
+    return True, version or "installed"
+
+
+def _dir_summary(path: Path, pattern: str) -> str:
+    if not path.exists():
+        return f"{path} (absent)"
+    try:
+        count = sum(1 for _ in path.glob(pattern))
+    except OSError:
+        count = 0
+    return f"{path} ({count} file(s))"
+
+
+def collect_environment_report(check_camera: bool = False) -> list[tuple[str, str, str]]:
+    """Describe what this machine can actually run. Pure apart from the optional
+    camera probe, so it is safe to call from tests."""
+    rows: list[tuple[str, str, str]] = []
+
+    python_version = platform.python_version()
+    pinned = python_version.startswith("3.11")
+    rows.append(
+        (
+            "ok" if pinned else "warn",
+            "Python",
+            f"{python_version} (pixi workspace pins 3.11)"
+            if not pinned
+            else python_version,
+        )
+    )
+
+    for name in (*_REQUIRED_MODULES, *_DEGRADABLE_MODULES):
+        available, detail = _check_import(name)
+        degradable = name in _DEGRADABLE_MODULES
+        unavailable_status = "warn" if degradable else "fail"
+        status = "ok" if available else unavailable_status
+        minimum = _MIN_MODULE_VERSIONS.get(name)
+        if available and minimum:
+            parsed = _parse_version(detail)
+            if parsed and parsed < minimum[0]:
+                status = unavailable_status
+                want = ".".join(str(part) for part in minimum[0])
+                detail = f"{detail} is too old (need >= {want}: {minimum[1]})"
+        if degradable:
+            detail = f"{detail} - {_DEGRADABLE_MODULES[name]} disabled without it"
+        rows.append((status, f"module:{name}", detail))
+
+    for name, purpose in _OPTIONAL_MODULES.items():
+        available, detail = _check_import(name)
+        rows.append(
+            ("ok" if available else "warn", f"module:{name}", f"{detail} - {purpose}")
+        )
+
+    general_path = _resolve_general_model_path(None)
+    rows.append(
+        (
+            "ok" if Path(general_path).exists() else "warn",
+            "general YOLO",
+            f"{general_path} "
+            + ("present" if Path(general_path).exists() else "missing (Ultralytics downloads it on first run)"),
+        )
+    )
+
+    custom_path = _load_default_custom_model_path()
+    rows.append(
+        ("ok" if custom_path else "warn", "custom YOLO", custom_path or "not configured"),
+    )
+
+    gaze_weights = Path(GAZE_WEIGHTS_DEFAULT)
+    rows.append(
+        (
+            "ok" if gaze_weights.exists() else "warn",
+            "gaze weights",
+            f"{gaze_weights} "
+            + ("present" if gaze_weights.exists() else "missing (see `bootstrap`)"),
+        )
+    )
+
+    db = FaceDB.load()
+    rows.append(
+        (
+            "ok" if db.names else "warn",
+            "enrolled identities",
+            f"{len(db.names)} identity(ies) in {DB_PATH}"
+            if db.names
+            else f"none in {DB_PATH} - run `enroll --name <name>`",
+        )
+    )
+
+    rows.append(("ok", "memory store", _dir_summary(MEMORY_DIR / "snapshots", "*.jpg")))
+    rows.append(("ok", "incidents", _dir_summary(UNKNOWN_INCIDENTS_DIR, "*.jpg")))
+    rows.append(
+        (
+            "ok",
+            "retention caps",
+            (
+                f"auto snapshots {common.MEMORY_MAX_AUTO_SNAPSHOTS}, "
+                f"incidents {common.UNKNOWN_INCIDENT_MAX_FILES}, "
+                f"metrics {common.METRICS_MAX_BYTES} B x {common.METRICS_BACKUP_COUNT} backups"
+            ),
+        )
+    )
+
+    lock_backend = common.lock_backend_name()
+    lock_timeouts = common.lock_timeouts()
+    rows.append(
+        (
+            "ok" if lock_backend != "none" and lock_timeouts == 0 else "warn",
+            "cross-process lock",
+            f"backend {lock_backend}"
+            + (
+                ", no timeouts"
+                if lock_timeouts == 0
+                else f", {lock_timeouts} timeout(s): work proceeded without the lock"
+            )
+            + (
+                ""
+                if lock_backend != "none"
+                else " - metrics and snapshot writes are only thread-safe here"
+            ),
+        )
+    )
+
+    rows.append(("ok", "camera source", f"{CAMERA_SOURCE} (from AI_STUDIO_CAM_CAMERA_INDEX)"))
+    if check_camera:
+        try:
+            cap = _open_camera()
+            cap.release()
+            rows.append(("ok", "camera probe", "opened successfully"))
+        except Exception as exc:
+            rows.append(("fail", "camera probe", str(exc)))
+
+    return rows
+
+
+def cmd_doctor(check_camera: bool = False) -> None:
+    rows = collect_environment_report(check_camera=check_camera)
+    symbols = {"ok": "[ ok ]", "warn": "[warn]", "fail": "[FAIL]"}
+
+    print("Environment readiness")
+    print("-" * 72)
+    for status, name, detail in rows:
+        print(f"{symbols.get(status, '[ ?? ]')} {name:<20} {detail}")
+
+    failures = [name for status, name, _ in rows if status == "fail"]
+    warnings = [name for status, name, _ in rows if status == "warn"]
+    print("-" * 72)
+    print(f"{len(rows) - len(failures) - len(warnings)} ok, {len(warnings)} warning(s), {len(failures)} failure(s)")
+
+    if failures:
+        print("Blocking: " + ", ".join(failures))
+        print("These must be installed before monitoring can start. See the README install steps.")
+    elif warnings:
+        print("The pipeline can start; each warning above disables one feature only.")
+    else:
+        print("Everything the pipeline needs is present.")
+
+    if failures:
+        sys.exit(1)
+
+
+def cmd_bootstrap(download_gaze: bool = True) -> None:
+    """Create runtime directories and fetch the model assets a session needs."""
+    print("Bootstrapping runtime assets")
+    print("-" * 72)
+
+    for directory in (MEMORY_DIR / "snapshots", UNKNOWN_INCIDENTS_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
+        print(f"[ ok ] directory  {directory}")
+
+    problems: list[str] = []
+
+    general_path = _resolve_general_model_path(None)
+    if Path(general_path).exists():
+        print(f"[ ok ] general YOLO already present: {general_path}")
+    else:
+        try:
+            from ultralytics import YOLO
+
+            YOLO("yolov8n.pt")
+            print(f"[ ok ] general YOLO ready: {general_path}")
+        except Exception as exc:
+            problems.append(f"general YOLO weights unavailable ({exc})")
+            print(f"[warn] general YOLO could not be prepared: {exc}")
+
+    gaze_weights = Path(GAZE_WEIGHTS_DEFAULT)
+    if gaze_weights.exists():
+        print(f"[ ok ] gaze weights already present: {gaze_weights}")
+    elif not download_gaze:
+        print(f"[warn] gaze weights missing: {gaze_weights} (download skipped)")
+    else:
+        try:
+            runtime = _load_gaze_runtime(
+                gaze_arch=GAZE_ARCH_DEFAULT,
+                gaze_weights=str(gaze_weights),
+                gaze_weights_source=GAZE_WEIGHTS_SOURCE_DEFAULT,
+                gaze_auto_download=True,
+            )
+        except Exception as exc:
+            runtime = None
+            print(f"[warn] gaze weights could not be downloaded: {exc}")
+        if runtime is not None and Path(str(runtime.get("weights_path", gaze_weights))).exists():
+            print(f"[ ok ] gaze weights ready: {runtime.get('weights_path')}")
+        else:
+            problems.append("gaze weights unavailable")
+            print(
+                "[warn] gaze weights still missing. Place L2CSNet_gaze360.pkl in models/ "
+                "manually; gaze stays disabled until then."
+            )
+
+    db = FaceDB.load()
+    if db.names:
+        print(f"[ ok ] enrolled identities: {len(db.names)}")
+    else:
+        problems.append("no enrolled identities")
+        print("[warn] no enrolled identities yet.")
+
+    print("-" * 72)
+    print("Next steps:")
+    print("  1. pixi run python main.py doctor            # confirm the environment")
+    print("  2. pixi run python main.py enroll --name <your name>")
+    print("  3. pixi run python main.py recognize")
+
+    if problems:
+        print("Unresolved: " + "; ".join(problems))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -3816,6 +4525,26 @@ def main() -> None:
         help="Source URL used for auto-downloading gaze weights when local file is missing",
     )
     p_r.add_argument(
+        "--gaze-max-interval",
+        type=int,
+        default=GAZE_INTERVAL_DEFAULT,
+        help=(
+            "Maximum frames between gaze inferences. 1 (default) keeps gaze at "
+            "full rate so attention metrics stay per-frame; above 1 lets the "
+            f"interval adapt to its own cost (recommended: {GAZE_MAX_INTERVAL_DEFAULT})"
+        ),
+    )
+    p_r.add_argument(
+        "--gaze-target-fps-drop",
+        type=float,
+        default=GAZE_TARGET_FPS_DROP_DEFAULT,
+        help=(
+            "Gaze cost as a fraction of the frame budget above which the adaptive "
+            f"interval grows (default: {GAZE_TARGET_FPS_DROP_DEFAULT}; only used when "
+            "--gaze-max-interval > 1)"
+        ),
+    )
+    p_r.add_argument(
         "--disable-gaze-auto-download",
         action="store_true",
         help="Disable automatic gaze weight download fallback",
@@ -3852,6 +4581,18 @@ def main() -> None:
 
     sub.add_parser("list", help="List enrolled identities")
     sub.add_parser("report", help="Generate metrics/report files")
+    p_doc = sub.add_parser("doctor", help="Report which parts of the pipeline can run here")
+    p_doc.add_argument(
+        "--check-camera",
+        action="store_true",
+        help="Also probe the configured camera (opens and releases the device)",
+    )
+    p_boot = sub.add_parser("bootstrap", help="Create runtime directories and fetch model assets")
+    p_boot.add_argument(
+        "--no-gaze-download",
+        action="store_true",
+        help="Skip the L2CS gaze-weight download",
+    )
 
     args = parser.parse_args(sys.argv[1:] or ["recognize"])
     {
@@ -3868,6 +4609,8 @@ def main() -> None:
             args.gaze_weights,
             args.gaze_weights_source,
             args.disable_gaze_auto_download,
+            args.gaze_max_interval,
+            args.gaze_target_fps_drop,
         ),
         "train-objects": lambda: cmd_train_objects(
             args.data,
@@ -3888,6 +4631,8 @@ def main() -> None:
         "chat": lambda: cmd_chat(args.question),
         "list": cmd_list,
         "report": cmd_report,
+        "doctor": lambda: cmd_doctor(args.check_camera),
+        "bootstrap": lambda: cmd_bootstrap(download_gaze=not args.no_gaze_download),
     }.get(args.cmd, parser.print_help)()
 
 

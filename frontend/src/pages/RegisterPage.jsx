@@ -57,7 +57,7 @@ function RegisterPage() {
           <form onSubmit={onStart} className="register-form">
             <div className="field">
               <label>Name</label>
-              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Hemanth" />
+              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Your Name" />
             </div>
             <div className="register-actions">
               <button className="btn-primary" type="submit" disabled={busy || !name.trim() || active}>

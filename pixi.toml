@@ -1,16 +1,21 @@
 [workspace]
-authors = ["Hemanth Damineni <hemanthdamineni@gmail.com>"]
+authors = ["Alok Raj <alokraj1319@gmail.com>"]
 channels = ["conda-forge"]
 name = "9hacks26"
 platforms = ["linux-64"]
 version = "0.1.0"
 
+# The camera index is intentionally NOT hardcoded here: set AI_STUDIO_CAM_CAMERA_INDEX
+# in your shell or .env instead. Hardcoding it made these tasks unable to target a
+# real webcam. See docs/ and the README for the v4l2loopback virtual-camera setup.
 [tasks]
-run = "AI_STUDIO_CAM_CAMERA_INDEX=/dev/video42 python main.py recognize"
-enroll = "AI_STUDIO_CAM_CAMERA_INDEX=/dev/video42 python main.py enroll"
-recognize = "AI_STUDIO_CAM_CAMERA_INDEX=/dev/video42 python main.py recognize"
+run = "python main.py recognize"
+enroll = "python main.py enroll"
+recognize = "python main.py recognize"
 list = "python main.py list"
 report = "python main.py report"
+doctor = "python main.py doctor"
+bootstrap = "python main.py bootstrap"
 
 [dependencies]
 python = "3.11.*"

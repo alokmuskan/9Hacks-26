@@ -12,8 +12,13 @@ function DashboardPage() {
       ("known_detections" in detections.counts || "unknown_detections" in detections.counts);
 
     if (hasLiveCounts) {
-      const known = Number(detections?.counts?.known_detections || 0);
-      const unknown = Number(detections?.counts?.unknown_detections || 0);
+      // known_unique/unknown_alerts ride along with the live counts payload.
+      // Fall back to the cumulative match counters when the backend predates
+      // the new fields (sentinel -1 means "field absent").
+      const knownUnique = Number(detections?.counts?.known_unique ?? -1);
+      const known = knownUnique >= 0 ? knownUnique : Number(detections?.counts?.known_detections || 0);
+      const alerts = Number(detections?.counts?.unknown_alerts ?? -1);
+      const unknown = alerts >= 0 ? alerts : Number(detections?.counts?.unknown_detections || 0);
       return {
         known,
         unknown,
@@ -23,8 +28,9 @@ function DashboardPage() {
 
     const latestSession = [...logs].reverse().find((row) => row?.event_type === "recognize_session") || null;
     const aggregate = latestSession?.aggregate && typeof latestSession.aggregate === "object" ? latestSession.aggregate : {};
-    const known = Number(aggregate?.known_detections ?? latestSession?.known_detections ?? 0);
-    const unknown = Number(aggregate?.unknown_detections ?? latestSession?.unknown_detections ?? 0);
+    // Prefer the people-level fields; older sessions only have the per-frame counters.
+    const known = Number(aggregate?.unique_individuals_seen ?? latestSession?.unique_individuals_seen ?? 0);
+    const unknown = Number(aggregate?.unknown_alert_events ?? latestSession?.unknown_alert_events ?? 0);
 
     return {
       known,
@@ -60,7 +66,7 @@ function DashboardPage() {
             <UserCheck size={24} />
           </div>
           <div className="metric-copy">
-            <h4>Known Faces</h4>
+            <h4>Known People</h4>
             <div>{metrics.known}</div>
           </div>
         </div>
@@ -69,7 +75,7 @@ function DashboardPage() {
             <ShieldAlert size={24} />
           </div>
           <div className="metric-copy">
-            <h4>Unknown Faces</h4>
+            <h4>Unknown Alerts</h4>
             <div>{metrics.unknown}</div>
           </div>
         </div>

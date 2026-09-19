@@ -7,12 +7,15 @@ import os
 import re
 import threading
 import time
+import traceback
 from collections import Counter, deque
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import cv2
@@ -23,8 +26,48 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import common
+
 LOGGER = logging.getLogger("monitoring-backend")
 logging.basicConfig(level=logging.INFO)
+
+
+class _ShutdownNoiseFilter(logging.Filter):
+    """Drop uvicorn ERROR records whose exception is a benign shutdown cancel.
+
+    When the server stops while browsers still hold the WebSocket event feed or
+    the MJPEG stream open, uvicorn/starlette/anyio surface the resulting
+    cancellation as ``CancelledError`` (or a re-raised ``KeyboardInterrupt``)
+    traceback logged at ERROR by uvicorn's error logger. That is normal
+    shutdown mechanics — the server still exits cleanly ("Finished server
+    process") — and logging it at ERROR hides real errors. Real failures (any
+    other exception type, or a benign signal wrapped around one) still log at
+    ERROR untouched.
+    """
+
+    _BENIGN_FINALS = ("CancelledError", "KeyboardInterrupt")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno < logging.ERROR:
+            return True
+        if record.exc_info and record.exc_info[0] is not None:
+            formatted = "\n".join(traceback.format_exception(*record.exc_info))
+        else:
+            formatted = record.getMessage()
+        final_line = formatted.rstrip().rsplit("\n", 1)[-1].strip()
+        # Final traceback line is "module.Exception: optional message"; match on
+        # the type part so a CancelledError carrying a message still matches.
+        exc_type = final_line.split(":", 1)[0].strip()
+        return not exc_type.endswith(self._BENIGN_FINALS)
+
+
+def _install_shutdown_noise_filter() -> None:
+    # uvicorn's protocol handlers log via the "uvicorn.error" logger directly,
+    # so a filter attached here sees every "Exception in ASGI application" record.
+    logging.getLogger("uvicorn.error").addFilter(_ShutdownNoiseFilter())
+
+
+_install_shutdown_noise_filter()
 
 FPS_CAP_DEFAULT = 20
 MJPEG_QUALITY = 75
@@ -40,9 +83,16 @@ CHAT_SESSION_TTL_SEC = 30 * 60
 CHAT_CONFIRM_TTL_SEC = 2 * 60
 CHAT_HISTORY_MAX_TURNS = 10
 CHAT_CONTEXT_LOOKBACK_MIN = 30
-GAZE_ARCH_DEFAULT = "ResNet50"
+# Backbones L2CS-Net can instantiate. The CLI restricts `--gaze-arch`, the API used
+# to silently rewrite whatever the caller asked for.
+GazeArch = Literal["ResNet18", "ResNet34", "ResNet50", "ResNet101", "ResNet152"]
+GAZE_ARCH_DEFAULT: GazeArch = "ResNet50"
+# Gaze scheduling defaults come from `common` so the CLI and the API schedule gaze
+# identically; the interval only adapts when the caller opts in.
+GAZE_INTERVAL_DEFAULT = common.GAZE_INTERVAL_DEFAULT
+GAZE_TARGET_FPS_DROP_DEFAULT = common.GAZE_TARGET_FPS_DROP_DEFAULT
 
-METRICS_PATH = Path("metrics_log.jsonl")
+METRICS_PATH = Path(common.METRICS_FILENAME)
 MEMORY_DIR = Path("memory")
 SNAPSHOTS_DIR = MEMORY_DIR / "snapshots"
 INCIDENTS_DIR = Path("unknown_incidents")
@@ -57,39 +107,26 @@ def _core() -> Any:
     return core
 
 
+# Thin aliases over `common` so both entry points behave identically and there is
+# one implementation to fix. The CV stack stays unimported here on purpose.
 def _iso(dt: datetime | None = None) -> str:
-    return (dt or datetime.now(timezone.utc)).isoformat()
+    return common.iso(dt)
 
 
 def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value)
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        return None
+    return common.parse_iso(value)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
+    return common.safe_int(value, default)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
+    return common.safe_float(value, default)
 
 
 def _session_id(prefix: str) -> str:
-    ts = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
-    return f"{prefix}-{ts}"
+    return common.session_id(prefix)
 
 
 def _encode_jpeg(frame: np.ndarray, quality: int = MJPEG_QUALITY) -> bytes | None:
@@ -205,15 +242,11 @@ class EventHub:
             subs = list(self._subscribers)
         for q in subs:
             if q.full():
-                try:
+                with suppress(asyncio.QueueEmpty):
                     q.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            try:
+            # Dropping oldest already attempted; skip if still full.
+            with suppress(asyncio.QueueFull):
                 q.put_nowait(event)
-            except asyncio.QueueFull:
-                # Dropping oldest already attempted; skip if still full.
-                pass
 
 
 class MonitorStartRequest(BaseModel):
@@ -222,14 +255,16 @@ class MonitorStartRequest(BaseModel):
     custom_model: str | None = None
     disable_general: bool = False
     disable_custom: bool = False
-    snapshot_interval: float = 15.0
+    snapshot_interval: float = Field(default=15.0, ge=1.0, le=3600.0)
     disable_gaze: bool = False
-    gaze_arch: str = GAZE_ARCH_DEFAULT
+    gaze_arch: GazeArch = GAZE_ARCH_DEFAULT
     gaze_weights: str = "models/L2CSNet_gaze360.pkl"
     gaze_weights_source: str = (
         "https://drive.google.com/drive/folders/17p6ORr-JQJcw-eYtG2WGNiuS_qVKwdWd?usp=sharing"
     )
     disable_gaze_auto_download: bool = False
+    gaze_max_interval: int = Field(default=GAZE_INTERVAL_DEFAULT, ge=1, le=60)
+    gaze_target_fps_drop: float = Field(default=GAZE_TARGET_FPS_DROP_DEFAULT, ge=0.0, le=0.9)
     fps_cap: int = Field(default=FPS_CAP_DEFAULT, ge=1, le=60)
 
 
@@ -302,6 +337,7 @@ class PipelineManager:
         self._latest_config: dict[str, Any] = {}
 
         self._enroll = EnrollStatus()
+        self._manual_snapshots = 0
 
     def _set_startup_phase(self, phase: str, failure_reason: str | None = None, publish: bool = True) -> None:
         with self._lock:
@@ -309,7 +345,7 @@ class PipelineManager:
             if phase == "starting":
                 now = _iso()
                 self._startup_started_utc = now
-                self._startup_deadline_utc = _iso(datetime.now(timezone.utc) + timedelta(seconds=STARTUP_TIMEOUT_SEC))
+                self._startup_deadline_utc = _iso(datetime.now(UTC) + timedelta(seconds=STARTUP_TIMEOUT_SEC))
                 self._startup_failure_reason = None
             elif phase == "failed":
                 self._startup_failure_reason = failure_reason or "startup_failed"
@@ -389,7 +425,7 @@ class PipelineManager:
                 started = _parse_iso(self._startup_started_utc)
                 if started is not None:
                     startup_elapsed_ms = max(
-                        int((datetime.now(timezone.utc) - started).total_seconds() * 1000.0),
+                        int((datetime.now(UTC) - started).total_seconds() * 1000.0),
                         0,
                     )
             last_seq = _safe_int(frame.get("sequence"), 0)
@@ -448,6 +484,12 @@ class PipelineManager:
         if self._thread and self._thread.is_alive():
             raise HTTPException(status_code=409, detail=f"Pipeline already running in '{self._mode}' mode")
 
+    def note_manual_snapshot(self) -> int:
+        """Count a snapshot saved outside the worker (API request or chat action)."""
+        with self._lock:
+            self._manual_snapshots += 1
+            return int(self._manual_snapshots)
+
     def start_monitor(self, req: MonitorStartRequest) -> dict[str, Any]:
         with self._lock:
             self._validate_can_start()
@@ -462,13 +504,13 @@ class PipelineManager:
             self._last_error = None
             self._startup_phase = "starting"
             self._startup_started_utc = _iso()
-            self._startup_deadline_utc = _iso(datetime.now(timezone.utc) + timedelta(seconds=STARTUP_TIMEOUT_SEC))
+            self._startup_deadline_utc = _iso(datetime.now(UTC) + timedelta(seconds=STARTUP_TIMEOUT_SEC))
             self._startup_failure_reason = None
             self._enroll = EnrollStatus()
             self._latest_session_summary = None
+            self._manual_snapshots = 0
 
             cfg = req.model_dump()
-            cfg["gaze_arch"] = GAZE_ARCH_DEFAULT
             self._latest_config = dict(cfg)
             self._thread = threading.Thread(
                 target=self._run_monitor_worker,
@@ -733,7 +775,7 @@ class PipelineManager:
                 core._append_metric(
                     "enroll",
                     {
-                        "schema_version": 3,
+                        "schema_version": common.ENROLL_SCHEMA_VERSION,
                         "session_id": self._session_id,
                         "name": name,
                         "model": model,
@@ -760,17 +802,14 @@ class PipelineManager:
                 )
         except Exception as exc:
             self._last_error = str(exc)
-            LOGGER.exception("Enrollment worker failed: %s", exc)
+            # logging.exception already includes the exception and traceback.
+            LOGGER.exception("Enrollment worker failed")
             self._publish_event("pipeline_state", {"error": str(exc)})
         finally:
-            try:
+            with suppress(Exception):
                 reader.close()
-            except Exception:
-                pass
-            try:
+            with suppress(Exception):
                 cap.release()
-            except Exception:
-                pass
             with self._lock:
                 if self._mode == "enroll":
                     self._mode = "idle"
@@ -798,6 +837,8 @@ class PipelineManager:
         gaze_weights_source: str,
         disable_gaze_auto_download: bool,
         fps_cap: int,
+        gaze_max_interval: int = GAZE_INTERVAL_DEFAULT,
+        gaze_target_fps_drop: float = GAZE_TARGET_FPS_DROP_DEFAULT,
         **_: Any,
     ) -> None:
         core = _core()
@@ -821,7 +862,10 @@ class PipelineManager:
                 enable_vectors=False,
             )
 
-            app = core._build_app(model)
+            # Face recognition is degradable: object detection, gaze, memory and the
+            # dashboard all keep working without it, so a failure here becomes a
+            # reported reason rather than a dead monitor.
+            app, face_reason = core._try_build_face_app(model)
             gaze_enabled = not disable_gaze
             gaze_runtime = (
                 core._load_gaze_runtime(
@@ -838,10 +882,15 @@ class PipelineManager:
                 "custom": detector.get_state()["custom"]["enabled"],
                 "gaze": bool(gaze_runtime is not None and gaze_enabled),
             }
+            gaze_scheduler = core.GazeScheduler(
+                base_interval=GAZE_INTERVAL_DEFAULT,
+                max_interval=gaze_max_interval,
+                target_fps_drop=gaze_target_fps_drop,
+            )
         except Exception as exc:
             startup_failed_reason = f"startup_init_error:{exc}"
             self._mark_startup_failed(startup_failed_reason)
-            LOGGER.exception("Monitor startup failed before frame loop: %s", exc)
+            LOGGER.exception("Monitor startup failed before frame loop")
             return
 
         behavior_tracker = core._BehaviorTracker()
@@ -881,7 +930,6 @@ class PipelineManager:
         events: list[dict[str, Any]] = []
         events_total = 0
         memory_auto_snapshots = 0
-        memory_manual_snapshots = 0
         memory_query_counts: Counter[str] = Counter()
         memory_query_hits: Counter[str] = Counter()
         memory_query_misses: Counter[str] = Counter()
@@ -892,6 +940,11 @@ class PipelineManager:
         detection_calls = 0
         detection_latency_min_ms = float("inf")
         detection_latency_max_ms = 0.0
+        gaze_inference_calls = 0
+        gaze_inference_sum_ms = 0.0
+        gaze_inference_min_ms = float("inf")
+        gaze_inference_max_ms = 0.0
+        last_gaze_rows: list[tuple[int, int, float, float] | None] | None = None
         fps_ema = 0.0
         fps_min = float("inf")
         fps_max = 0.0
@@ -901,9 +954,10 @@ class PipelineManager:
         visible_prev: set[str] = set()
         latest_active_subjects: list[dict[str, Any]] = []
         latest_object_labels: list[str] = []
-        start_dt = datetime.now(timezone.utc)
+        start_dt = datetime.now(UTC)
         start_ts = time.time()
         camera_failures = 0
+        detector_error_seen = False
 
         def add_event(
             event_type: str,
@@ -939,14 +993,10 @@ class PipelineManager:
                     camera_failures += 1
                     fail_threshold = STARTUP_CAMERA_FAILURE_THRESHOLD if not startup_ready else CAMERA_FAILURE_THRESHOLD
                     if camera_failures >= fail_threshold:
-                        try:
+                        with suppress(Exception):
                             reader.close()
-                        except Exception:
-                            pass
-                        try:
+                        with suppress(Exception):
                             cap.release()
-                        except Exception:
-                            pass
                         capture = self._attempt_camera_recovery(
                             startup=not startup_ready,
                             deadline_monotonic=startup_deadline_monotonic if not startup_ready else None,
@@ -965,6 +1015,18 @@ class PipelineManager:
                 if not startup_ready:
                     startup_ready = True
                     self._set_startup_phase("ready")
+                    if face_reason is not None:
+                        # Marked once the camera is up, so camera recovery cannot
+                        # clear the flag by setting degraded=False on its success path.
+                        self._set_pipeline_state(
+                            degraded=True,
+                            reason=f"face_recognition_unavailable:{face_reason}",
+                        )
+                        add_event(
+                            "face_recognition_unavailable",
+                            str(face_reason),
+                            severity="alert",
+                        )
                 frames_total += 1
                 now_ts = time.time()
 
@@ -983,12 +1045,21 @@ class PipelineManager:
                 detection_latency_min_ms = min(detection_latency_min_ms, det_ms)
                 detection_latency_max_ms = max(detection_latency_max_ms, det_ms)
 
-                object_rows = detector.detect(frame)
+                try:
+                    object_rows = detector.detect(frame)
+                except Exception as exc:
+                    # A detector failure must not tear down the whole session; the
+                    # CLI path already tolerated this, the API path did not.
+                    object_rows = []
+                    if not detector_error_seen:
+                        detector_error_seen = True
+                        add_event("object_detect_error", str(exc), severity="alert")
+                        LOGGER.warning("Object detection error: %s", exc)
 
                 face_count = len(face_rows)
                 object_count = len(object_rows)
                 peak_simultaneous_faces = max(peak_simultaneous_faces, face_count)
-                timeline_key = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
+                timeline_key = datetime.now(UTC).astimezone().strftime("%H:%M:%S")
                 detection_timeline[timeline_key] = detection_timeline.get(timeline_key, 0) + face_count
                 object_detection_timeline[timeline_key] = object_detection_timeline.get(timeline_key, 0) + object_count
 
@@ -1058,7 +1129,7 @@ class PipelineManager:
                 if unknown_in_frame and (now_ts - last_unknown_alert_ts) >= core.UNKNOWN_ALERT_COOLDOWN_SEC:
                     unknown_alert_count += 1
                     last_unknown_alert_ts = now_ts
-                    snap = core._save_unknown_snapshot(frame, unknown_bboxes, datetime.now(timezone.utc))
+                    snap = core._save_unknown_snapshot(frame, unknown_bboxes, datetime.now(UTC))
                     add_event(
                         "unknown_alert",
                         "Unknown face detected",
@@ -1071,12 +1142,28 @@ class PipelineManager:
 
                 gaze_rows: list[tuple[int, int, float, float] | None] = [None for _ in render_rows]
                 if gaze_state["gaze"] and gaze_runtime and render_rows:
-                    gaze_rows = core._estimate_gaze_points(
-                        frame,
-                        [row[0] for row in render_rows],
-                        [row[1] for row in render_rows],
-                        gaze_runtime,
-                    )
+                    if gaze_scheduler.should_run():
+                        gaze_t0 = time.perf_counter()
+                        gaze_rows = core._estimate_gaze_points(
+                            frame,
+                            [row[0] for row in render_rows],
+                            [row[1] for row in render_rows],
+                            gaze_runtime,
+                        )
+                        gaze_latency_ms = (time.perf_counter() - gaze_t0) * 1000.0
+                        gaze_inference_calls += 1
+                        gaze_inference_sum_ms += gaze_latency_ms
+                        gaze_inference_min_ms = min(gaze_inference_min_ms, gaze_latency_ms)
+                        gaze_inference_max_ms = max(gaze_inference_max_ms, gaze_latency_ms)
+                        gaze_scheduler.observe(gaze_latency_ms, dt * 1000.0)
+                        last_gaze_rows = gaze_rows
+                    elif last_gaze_rows is not None:
+                        # Skipped by the adaptive schedule: reuse the last estimate so
+                        # attention tracking stays continuous between inferences.
+                        gaze_rows = [
+                            last_gaze_rows[i] if i < len(last_gaze_rows) else None
+                            for i in range(len(render_rows))
+                        ]
 
                 gaze_observations: dict[str, str | None] = {}
                 attention_rows: list[dict[str, Any]] = []
@@ -1202,19 +1289,23 @@ class PipelineManager:
                 yolo_state = detector.get_state()
                 self._latest_yolo_state = yolo_state
                 gaze_status = "ON" if gaze_state["gaze"] else "OFF"
+                if gaze_state["gaze"] and gaze_scheduler.adaptive:
+                    gaze_status = f"ON 1/{gaze_scheduler.interval}"
                 core._hud(
                     frame,
                     [
                         (f"Faces:{face_count} Objects:{object_count} FPS:{fps_ema:.1f}", (255, 255, 255)),
                         (
-                            f"Known:{known_detections} Unknown:{unknown_detections} "
-                            f"G:{'ON' if yolo_state['general']['enabled'] else 'OFF'} "
-                            f"C:{'ON' if yolo_state['custom']['enabled'] else 'OFF'}",
+                            (
+                                f"Known:{known_detections} Unknown:{unknown_detections} "
+                                f"G:{'ON' if yolo_state['general']['enabled'] else 'OFF'} "
+                                f"C:{'ON' if yolo_state['custom']['enabled'] else 'OFF'}"
+                            ),
                             (180, 180, 180),
                         ),
                         (f"Gaze:{gaze_status} Seq:{self.frame_store.get().get('sequence', 0)}", (170, 170, 170)),
                         (
-                            f"Snapshots(auto/manual): {memory_auto_snapshots}/{memory_manual_snapshots}",
+                            f"Snapshots(auto/manual): {memory_auto_snapshots}/{self._manual_snapshots}",
                             (160, 160, 160),
                         ),
                     ],
@@ -1235,8 +1326,14 @@ class PipelineManager:
                         "counts": {
                             "face_count": face_count,
                             "object_count": object_count,
+                            # Cumulative per-frame match counters (a face seen in
+                            # N frames adds N). Unique people and cooldown-gated
+                            # alert events are published alongside so the UI can
+                            # show honest "how many faces" numbers.
                             "known_detections": known_detections,
                             "unknown_detections": unknown_detections,
+                            "known_unique": len(people),
+                            "unknown_alerts": unknown_alert_count,
                         },
                     }
                     with self._lock:
@@ -1259,34 +1356,35 @@ class PipelineManager:
                 time.sleep(self._compute_sleep_duration(interval, processing))
         except Exception as exc:
             self._last_error = str(exc)
-            LOGGER.exception("Monitor worker crashed: %s", exc)
+            # logging.exception already includes the exception and traceback.
+            LOGGER.exception("Monitor worker crashed")
             if not startup_ready:
                 startup_failed_reason = f"startup_exception:{exc}"
                 self._mark_startup_failed(startup_failed_reason)
             else:
                 self._publish_event("pipeline_state", {"error": str(exc)})
         finally:
-            try:
+            with suppress(Exception):
                 reader.close()
-            except Exception:
-                pass
-            try:
+            with suppress(Exception):
                 cap.release()
-            except Exception:
-                pass
-            try:
+            with suppress(Exception):
                 memory.save_all_memory()
-            except Exception:
-                pass
 
             if startup_failed_reason is not None and not startup_ready:
                 with self._lock:
                     if self._mode == "monitor":
                         self._mode = "idle"
                         self._thread = None
-                return
+                # This early exit is intentional and must stay inside `finally`: the
+                # cleanup above has to run before the worker releases its slot, and the
+                # session summary below must not be written for a session that never
+                # started. (Ruff B012 flags it because a `return` in `finally` can also
+                # swallow a BaseException; the practical exposure here is nil, since
+                # this runs on a worker thread and no signal is delivered to it.)
+                return  # noqa: B012
 
-            end_dt = datetime.now(timezone.utc)
+            end_dt = datetime.now(UTC)
             end_ts = time.time()
             duration_sec = max(end_ts - start_ts, 0.0)
 
@@ -1296,10 +1394,10 @@ class PipelineManager:
                 self._publish_event("behavior_event", evt)
 
             for name in visible_prev:
-                info = people.get(name)
-                if info and info["present"] and info["last_enter_ts"] is not None:
-                    info["presence_sec"] += max(end_ts - float(info["last_enter_ts"]), 0.0)
-                    info["last_enter_ts"] = None
+                presence = people.get(name)
+                if presence and presence["present"] and presence["last_enter_ts"] is not None:
+                    presence["presence_sec"] += max(end_ts - float(presence["last_enter_ts"]), 0.0)
+                    presence["last_enter_ts"] = None
                     info["present"] = False
 
             people_clean: dict[str, dict[str, Any]] = {}
@@ -1315,122 +1413,72 @@ class PipelineManager:
                 }
 
             behavior_summary = behavior_tracker.summary()
-            avg_fps = (frames_total / duration_sec) if duration_sec > 0 else 0.0
-            avg_conf = (confidence_sum / detections_total) if detections_total > 0 else 0.0
-            avg_detection_ms = detection_latency_sum_ms / detection_calls if detection_calls > 0 else 0.0
-            object_avg_conf = object_conf_sum / object_detections_total if object_detections_total > 0 else 0.0
-            object_avg_conf_general = (
-                object_general_conf_sum / object_general_detections if object_general_detections > 0 else 0.0
-            )
-            object_avg_conf_custom = (
-                object_custom_conf_sum / object_custom_detections if object_custom_detections > 0 else 0.0
-            )
-            recognition_rate = known_detections / detections_total if detections_total > 0 else 0.0
-            unknown_rate = unknown_detections / detections_total if detections_total > 0 else 0.0
-
-            aggregate = {
-                "session_id": self._session_id,
-                "frames_total": frames_total,
-                "frames_with_faces": frames_with_faces,
-                "frames_empty": frames_empty,
-                "frames_dropped": frames_dropped,
-                "average_faces_per_frame": round(detections_total / frames_total, 4) if frames_total else 0.0,
-                "detections_total": detections_total,
-                "known_detections": known_detections,
-                "unknown_detections": unknown_detections,
-                "peak_simultaneous_faces": peak_simultaneous_faces,
-                "avg_fps": round(avg_fps, 3),
-                "moving_avg_fps": round(fps_ema, 3),
-                "min_fps": round(0.0 if fps_min == float("inf") else fps_min, 3),
-                "max_fps": round(fps_max, 3),
-                "faces_per_sec": round(detections_total / duration_sec, 3) if duration_sec > 0 else 0.0,
-                "avg_detection_latency_ms": round(avg_detection_ms, 2),
-                "min_detection_latency_ms": round(
-                    0.0 if detection_latency_min_ms == float("inf") else detection_latency_min_ms,
-                    2,
-                ),
-                "max_detection_latency_ms": round(detection_latency_max_ms, 2),
-                "detection_calls": detection_calls,
-                "avg_confidence": round(avg_conf, 4),
-                "recognition_rate": round(recognition_rate, 6),
-                "unknown_rate": round(unknown_rate, 6),
-                "unknown_alert_events": unknown_alert_count,
-                "unknown_alert_density_per_min": round(
-                    unknown_alert_count / (duration_sec / 60.0), 3
-                )
-                if duration_sec > 0
-                else 0.0,
-                "unique_individuals_seen": len(people_clean),
-                "current_people_visible": len(visible_prev),
-                "active_subjects": latest_active_subjects,
-                "active_objects": latest_object_labels,
-                "detection_timeline": [
-                    {"time_local": t, "detections": int(c)}
-                    for t, c in list(detection_timeline.items())[-20:]
-                ],
-                "object_detections_total": object_detections_total,
-                "object_general_detections": object_general_detections,
-                "object_custom_detections": object_custom_detections,
-                "object_avg_confidence": round(object_avg_conf, 4),
-                "object_avg_confidence_general": round(object_avg_conf_general, 4),
-                "object_avg_confidence_custom": round(object_avg_conf_custom, 4),
-                "gaze_enabled": gaze_enabled,
-                "gaze_model_loaded": bool(gaze_runtime is not None),
-                "gaze_base_interval_frames": 1,
-                "gaze_interval_frames_final": 1,
-                "gaze_target_fps_drop": 0.0,
-                "gaze_inference_calls": 0,
-                "gaze_inference_avg_ms": 0.0,
-                "gaze_inference_min_ms": 0.0,
-                "gaze_inference_max_ms": 0.0,
-                "object_class_counts_total": dict(object_class_counts_total),
-                "object_class_counts_general": dict(object_class_counts_general),
-                "object_class_counts_custom": dict(object_class_counts_custom),
-                "object_detection_timeline": [
-                    {"time_local": t, "detections": int(c)}
-                    for t, c in list(object_detection_timeline.items())[-20:]
-                ],
-                "yolo_state_final": detector.get_state(),
-                "yolo_model_paths": {
+            with self._lock:
+                manual_snapshots = int(self._manual_snapshots)
+            aggregate = core.build_session_aggregate(
+                session_id=self._session_id,
+                duration_sec=duration_sec,
+                frames_total=frames_total,
+                frames_with_faces=frames_with_faces,
+                frames_empty=frames_empty,
+                frames_dropped=frames_dropped,
+                detections_total=detections_total,
+                known_detections=known_detections,
+                unknown_detections=unknown_detections,
+                peak_simultaneous_faces=peak_simultaneous_faces,
+                confidence_sum=confidence_sum,
+                detection_calls=detection_calls,
+                detection_latency_sum_ms=detection_latency_sum_ms,
+                detection_latency_min_ms=detection_latency_min_ms,
+                detection_latency_max_ms=detection_latency_max_ms,
+                fps_ema=fps_ema,
+                fps_min=fps_min,
+                fps_max=fps_max,
+                object_detections_total=object_detections_total,
+                object_general_detections=object_general_detections,
+                object_custom_detections=object_custom_detections,
+                object_conf_sum=object_conf_sum,
+                object_general_conf_sum=object_general_conf_sum,
+                object_custom_conf_sum=object_custom_conf_sum,
+                unknown_alert_count=unknown_alert_count,
+                memory_auto_snapshots=memory_auto_snapshots,
+                memory_manual_snapshots=manual_snapshots,
+                memory_total_store=_safe_int(memory.get_memory_stats().get("total_snapshots"), 0),
+                memory_query_counts=memory_query_counts,
+                memory_query_hits=memory_query_hits,
+                memory_query_misses=memory_query_misses,
+                chat_queries_total=chat_queries_total,
+                chat_queries_hit=chat_queries_hit,
+                chat_queries_llm=chat_queries_llm,
+                unique_individuals_seen=len(people_clean),
+                current_people_visible=len(visible_prev),
+                active_subjects=latest_active_subjects,
+                active_objects=latest_object_labels,
+                detection_timeline=detection_timeline,
+                object_detection_timeline=object_detection_timeline,
+                object_class_counts_total=object_class_counts_total,
+                object_class_counts_general=object_class_counts_general,
+                object_class_counts_custom=object_class_counts_custom,
+                behavior_summary=behavior_summary,
+                gaze_enabled=gaze_enabled,
+                gaze_model_loaded=bool(gaze_runtime is not None),
+                **gaze_scheduler.metrics(),
+                gaze_inference_calls=gaze_inference_calls,
+                gaze_inference_sum_ms=gaze_inference_sum_ms,
+                gaze_inference_min_ms=gaze_inference_min_ms,
+                gaze_inference_max_ms=gaze_inference_max_ms,
+                detector_state=detector.get_state(),
+                model_paths={
                     "general": core._resolve_general_model_path(general_model),
                     "custom": custom_model or core._load_default_custom_model_path(),
                 },
-                "memory_snapshots_auto": memory_auto_snapshots,
-                "memory_snapshots_manual": memory_manual_snapshots,
-                "memory_snapshots_total_session": memory_auto_snapshots + memory_manual_snapshots,
-                "memory_snapshot_total_store": _safe_int(memory.get_memory_stats().get("total_snapshots"), 0),
-                "memory_query_counts": dict(memory_query_counts),
-                "memory_query_hits": dict(memory_query_hits),
-                "memory_query_misses": dict(memory_query_misses),
-                "chat_queries_total": chat_queries_total,
-                "chat_queries_hit": chat_queries_hit,
-                "chat_queries_llm": chat_queries_llm,
-                "behavior_interactions_total": _safe_int(behavior_summary.get("interactions_total"), 0),
-                "behavior_attention_total_sec": _safe_float(behavior_summary.get("attention_total_sec"), 0.0),
-                "behavior_top_objects": behavior_summary.get("top_objects", []),
-                "behavior_attention_map": behavior_summary.get("attention_map", {}),
-                "behavior_events_count": _safe_int(behavior_summary.get("events_count"), 0),
-                "behavior_activity_patterns": {
-                    "transitions_per_min": round(
-                        _safe_int(behavior_summary.get("interactions_total"), 0) / (duration_sec / 60.0),
-                        3,
-                    )
-                    if duration_sec > 0
-                    else 0.0,
-                    "unique_attended_objects": len(behavior_summary.get("top_objects", [])),
-                    "focus_ratio": round(
-                        _safe_float(behavior_summary.get("attention_total_sec"), 0.0) / duration_sec,
-                        4,
-                    )
-                    if duration_sec > 0
-                    else 0.0,
-                },
-            }
+                face_recognition_enabled=app is not None,
+            )
 
             core._append_metric(
                 "recognize_session",
                 {
-                    "schema_version": 5,
+                    "schema_version": common.SESSION_SCHEMA_VERSION,
                     "session_id": self._session_id,
                     "model": model,
                     "camera_source": str(core.CAMERA_SOURCE),
@@ -1497,7 +1545,21 @@ class PipelineManager:
 
 MANAGER = PipelineManager()
 
-app = FastAPI(title="Monitoring Backend", version="1.0.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Startup/shutdown hooks. `@app.on_event` is deprecated in current FastAPI."""
+    MANAGER.set_event_loop(asyncio.get_running_loop())
+    MANAGER._set_pipeline_state(mode="idle", running=False, degraded=False)
+    try:
+        yield
+    finally:
+        # Stop any worker still running so a shutdown does not leave a camera open.
+        with suppress(Exception):
+            MANAGER.stop()
+
+
+app = FastAPI(title="Monitoring Backend", version="1.0.0", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1509,28 +1571,8 @@ app.mount("/incidents", StaticFiles(directory=str(INCIDENTS_DIR)), name="inciden
 app.mount("/snapshots", StaticFiles(directory=str(SNAPSHOTS_DIR)), name="snapshots")
 
 
-@app.on_event("startup")
-async def _startup() -> None:
-    MANAGER.set_event_loop(asyncio.get_running_loop())
-    MANAGER._set_pipeline_state(mode="idle", running=False, degraded=False)
-
-
 def _load_metric_events() -> list[dict[str, Any]]:
-    if not METRICS_PATH.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    with METRICS_PATH.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-                if isinstance(row, dict):
-                    rows.append(row)
-            except json.JSONDecodeError:
-                continue
-    return rows
+    return common.read_jsonl(METRICS_PATH)
 
 
 def _filter_metric_events(
@@ -1540,20 +1582,13 @@ def _filter_metric_events(
     from_ts: str | None,
     to_ts: str | None,
 ) -> list[dict[str, Any]]:
-    rows = _load_metric_events()
-    from_dt = _parse_iso(from_ts)
-    to_dt = _parse_iso(to_ts)
-    out: list[dict[str, Any]] = []
-    for row in rows:
-        if event_type and str(row.get("event_type")) != event_type:
-            continue
-        dt = _parse_iso(row.get("timestamp_utc"))
-        if from_dt and dt and dt < from_dt:
-            continue
-        if to_dt and dt and dt > to_dt:
-            continue
-        out.append(row)
-    return out[-max(1, int(limit)) :]
+    return common.filter_events(
+        _load_metric_events(),
+        event_type=event_type,
+        limit=limit,
+        from_ts=from_ts,
+        to_ts=to_ts,
+    )
 
 
 @dataclass
@@ -1589,7 +1624,7 @@ class ChatSessionStore:
             if sid and sid in self._sessions:
                 self._sessions[sid].last_seen_monotonic = now
                 return sid
-            sid = f"chat-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
+            sid = f"chat-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
             self._sessions[sid] = ChatSessionState(
                 created_monotonic=now,
                 last_seen_monotonic=now,
@@ -1664,7 +1699,7 @@ def _compact_citation(row: dict[str, Any], idx: int) -> dict[str, Any]:
 
 
 def _build_chat_grounding(question: str, runtime_context: dict[str, Any]) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cutoff = now - timedelta(minutes=CHAT_CONTEXT_LOOKBACK_MIN)
     metrics = _load_metric_events()
     recent_metric_rows: list[dict[str, Any]] = []
@@ -1693,7 +1728,9 @@ def _build_chat_grounding(question: str, runtime_context: dict[str, Any]) -> dic
             latest_session = row
             break
     if isinstance(latest_session, dict):
-        agg = latest_session.get("aggregate") if isinstance(latest_session.get("aggregate"), dict) else {}
+        # Bind once so the isinstance check actually narrows the value used below.
+        raw_agg = latest_session.get("aggregate")
+        agg = raw_agg if isinstance(raw_agg, dict) else {}
         citations_raw.append(
             {
                 "source": "recognize_session",
@@ -1755,7 +1792,9 @@ def _query_groq_grounded(
     session_history: list[dict[str, Any]],
     grounding: dict[str, Any],
 ) -> tuple[str | None, bool]:
-    api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq_api_key")
+    # Both spellings are supported on purpose: `.env.example` documents the lowercase
+    # form, so dropping it would break existing setups.
+    api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq_api_key")  # noqa: SIM112
     if not api_key:
         return None, False
     try:
@@ -1786,7 +1825,7 @@ def _query_groq_grounded(
     try:
         client = Groq(api_key=api_key)
         response = client.chat.completions.create(
-            model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip(),
+            model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip(),
             temperature=0.1,
             max_tokens=500,
             messages=[
@@ -1794,15 +1833,18 @@ def _query_groq_grounded(
                 {"role": "user", "content": user_prompt},
             ],
         )
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning(
+            "Groq chat call failed (%s); falling back to deterministic answer.", exc
+        )
         return None, False
     if not response.choices:
         return None, False
     msg = response.choices[0].message
-    content = getattr(msg, "content", None)
-    if not content:
+    raw_content = getattr(msg, "content", None)
+    if not raw_content:
         return None, False
-    return str(content).strip(), True
+    return str(raw_content).strip(), True
 
 
 def _extract_minutes_from_query(question: str, default: int = 5) -> int:
@@ -1826,7 +1868,7 @@ def _collect_recent_people_signal(
 ) -> tuple[int, list[str]]:
     core = _core()
     lookback = max(int(minutes), 1)
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback)
+    cutoff = datetime.now(UTC) - timedelta(minutes=lookback)
     events = _load_metric_events()
     names: set[str] = set()
     max_unique = 0
@@ -1838,11 +1880,12 @@ def _collect_recent_people_signal(
             continue
         et = str(event.get("event_type", ""))
         if et == "recognize_session":
-            agg = event.get("aggregate") if isinstance(event.get("aggregate"), dict) else {}
+            raw_agg = event.get("aggregate")
+            agg = raw_agg if isinstance(raw_agg, dict) else {}
             max_unique = max(max_unique, _safe_int(agg.get("unique_individuals_seen"), 0))
             people_map = event.get("people")
             if isinstance(people_map, dict):
-                for name in people_map.keys():
+                for name in people_map:
                     label = str(name).strip()
                     if label and label.lower() not in unknown_tokens:
                         names.add(label)
@@ -1955,6 +1998,7 @@ def _capture_snapshot_for_action() -> dict[str, Any]:
         people=context.get("people"),
         attention=context.get("attention_rows"),
     )
+    MANAGER.note_manual_snapshot()
     MANAGER._publish_event("memory_event", {"action": "snapshot_manual", "snapshot": snap})
     return snap
 
@@ -2108,11 +2152,12 @@ def _deterministic_chat_response(question: str, runtime_context: dict[str, Any])
         return {"reply": core._answer_current_presence(), "intent": "presence", "hit": True}
     if "looking at" in q or "look at" in q:
         db = core.FaceDB.load()
+        attention_reply, attention_found = core._answer_attention_query(question, db.names)
         return {
-            "reply": core._answer_attention_query(question, db.names),
+            "reply": attention_reply,
             "intent": "attention_lookup",
-            "hit": True,
-            }
+            "hit": bool(attention_found),
+        }
     return None
 
 
@@ -2195,11 +2240,12 @@ def api_monitor_snapshot() -> dict[str, Any]:
         people=context.get("people"),
         attention=context.get("attention_rows"),
     )
+    MANAGER.note_manual_snapshot()
     MANAGER._publish_event("memory_event", {"action": "snapshot_manual", "snapshot": snap})
     return {"status": "ok", "snapshot": snap}
 
 
-def build_video_stream_generator() -> Any:
+async def build_video_stream_generator() -> AsyncIterator[bytes]:
     last_seq = -1
     last_emit_mono = 0.0
     while True:
@@ -2214,11 +2260,16 @@ def build_video_stream_generator() -> Any:
             elif (now_mono - last_emit_mono) >= MJPEG_KEEPALIVE_SEC:
                 # Keepalive chunk to prevent clients from hanging indefinitely on quiet sequences.
                 should_emit = True
-        if should_emit:
+        # Re-narrow here: `should_emit` is only ever set inside the isinstance check
+        # above, but type checkers cannot follow that across the boolean.
+        if should_emit and isinstance(frame_bytes, (bytes, bytearray)):
             last_seq = seq
             last_emit_mono = now_mono
             yield _mjpeg_chunk(bytes(frame_bytes))
-        time.sleep(FRAME_WAIT_IDLE_SEC)
+        # Async sleep keeps this generator on the event loop, so shutdown/client
+        # disconnect cancels it at the await instead of blocking a threadpool
+        # thread that never observes the stop event (the old Ctrl+C hang).
+        await asyncio.sleep(FRAME_WAIT_IDLE_SEC)
 
 
 @app.get("/api/v1/stream/video")
@@ -2467,6 +2518,9 @@ def api_chat_query(req: ChatRequest) -> dict[str, Any]:
                             "Ask about summary, last-seen, memory stats, or attention."
                         )
 
+    # "Grounded" means the reply is backed by retrieved evidence. A running
+    # pipeline or a successfully executed action is not evidence.
+    grounded = bool(citations)
     CHAT_SESSIONS.append_turn(session_id, "assistant", reply)
     duration_ms = (time.perf_counter() - started) * 1000.0
     core._append_metric(
@@ -2583,4 +2637,11 @@ def legacy_enroll_status() -> dict[str, Any]:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    # Bound the graceful-shutdown wait: an open MJPEG/WS stream otherwise keeps
+    # uvicorn in "Waiting for connection to close" for a very long time.
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        timeout_graceful_shutdown=int(os.getenv("UVICORN_GRACEFUL_SHUTDOWN_SEC", "5")),
+    )

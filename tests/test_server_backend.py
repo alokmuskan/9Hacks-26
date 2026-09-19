@@ -1,7 +1,9 @@
 import asyncio
 import importlib
+import logging
 import time
 import unittest
+from typing import ClassVar
 from unittest import mock
 
 import numpy as np
@@ -51,8 +53,8 @@ class ServerBackendTests(unittest.TestCase):
         # If stream path accidentally touches core inference stack, this will fail.
         with mock.patch.object(self.server, "_core", side_effect=AssertionError("core should not be called")):
             gen = self.server.build_video_stream_generator()
-            data = next(gen)
-            gen.close()
+            data = asyncio.run(gen.__anext__())
+            asyncio.run(gen.aclose())
             self.assertIn(b"Content-Type: image/jpeg", data)
 
     def test_camera_recovery_retries_and_recovers(self):
@@ -92,6 +94,41 @@ class ServerBackendTests(unittest.TestCase):
 
         row = asyncio.run(_run())
         self.assertEqual(row["id"], 2)
+
+    def test_shutdown_noise_filter_suppresses_only_benign_cancellations(self):
+        flt = self.server._ShutdownNoiseFilter()
+
+        def rec(level, exc=None, msg="ok"):
+            return logging.LogRecord(
+                name="uvicorn.error", level=level, pathname=__file__, lineno=0,
+                args=(), msg=msg, exc_info=exc,
+            )
+
+        cancelled = asyncio.CancelledError("queue.get cancelled during shutdown")
+        benign = rec(logging.ERROR, exc=(asyncio.CancelledError, cancelled, cancelled.__traceback__))
+        self.assertFalse(flt.filter(benign), "benign CancelledError record must be dropped")
+
+        real_fail = rec(logging.ERROR, exc=(RuntimeError, RuntimeError("camera exploded"), None))
+        self.assertTrue(flt.filter(real_fail), "real RuntimeError record must pass")
+
+        plain_msg = rec(logging.ERROR, msg="Exception in ASGI application\n...\nCancelledError")
+        self.assertFalse(flt.filter(plain_msg), "formatted CancelledError text must be dropped")
+
+        cancelled_msg = asyncio.CancelledError("queue.get cancelled during shutdown")
+        with_message = rec(logging.ERROR, exc=(asyncio.CancelledError, cancelled_msg, cancelled_msg.__traceback__))
+        self.assertFalse(flt.filter(with_message), "CancelledError with a message must also be dropped")
+
+        kb = rec(logging.ERROR, exc=(KeyboardInterrupt, KeyboardInterrupt(), None))
+        self.assertFalse(flt.filter(kb), "bare KeyboardInterrupt record must be dropped")
+
+        mentions = rec(logging.ERROR, msg="upload failed after CancelledError occurred mid-transfer")
+        self.assertTrue(flt.filter(mentions), "text that merely mentions the name must pass")
+
+        looks_cancelled = rec(logging.ERROR, msg="Exception in ASGI application\nTraceback ...\nasyncio.exceptions.CancelledError")
+        self.assertFalse(flt.filter(looks_cancelled), "message-embedded traceback ending in CancelledError must be dropped")
+
+        info_rec = rec(logging.INFO, exc=(asyncio.CancelledError, cancelled, cancelled.__traceback__))
+        self.assertTrue(flt.filter(info_rec), "non-ERROR records must always pass")
 
     def test_api_status_schema(self):
         with TestClient(self.server.app) as client:
@@ -146,10 +183,10 @@ class ServerBackendTests(unittest.TestCase):
         with mock.patch.object(self.server, "_core", side_effect=AssertionError("core should not be called")):
             g1 = self.server.build_video_stream_generator()
             g2 = self.server.build_video_stream_generator()
-            c1 = next(g1)
-            c2 = next(g2)
-            g1.close()
-            g2.close()
+            c1 = asyncio.run(g1.__anext__())
+            c2 = asyncio.run(g2.__anext__())
+            asyncio.run(g1.aclose())
+            asyncio.run(g2.aclose())
 
         self.assertIn(jpeg, c1)
         self.assertIn(jpeg, c2)
@@ -161,8 +198,8 @@ class ServerBackendTests(unittest.TestCase):
 
         with mock.patch.object(self.server, "_encode_jpeg", side_effect=AssertionError("should not encode in stream")):
             gen = self.server.build_video_stream_generator()
-            chunk = next(gen)
-            gen.close()
+            chunk = asyncio.run(gen.__anext__())
+            asyncio.run(gen.aclose())
         self.assertIn(raw, chunk)
 
     def test_stream_generator_keepalive_emits_when_sequence_static(self):
@@ -174,9 +211,9 @@ class ServerBackendTests(unittest.TestCase):
             self.server, "FRAME_WAIT_IDLE_SEC", 0.0
         ):
             gen = self.server.build_video_stream_generator()
-            first = next(gen)
-            second = next(gen)
-            gen.close()
+            first = asyncio.run(gen.__anext__())
+            second = asyncio.run(gen.__anext__())
+            asyncio.run(gen.aclose())
 
         self.assertIn(raw, first)
         self.assertIn(raw, second)
@@ -212,7 +249,7 @@ class ServerBackendTests(unittest.TestCase):
         manager = self.server.PipelineManager()
 
         class _FakeDB:
-            names = []
+            names: ClassVar[list[str]] = []
 
         class _FakeFaceDB:
             @staticmethod

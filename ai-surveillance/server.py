@@ -9,7 +9,6 @@ if str(ROOT) not in sys.path:
 
 from server import app  # noqa: E402
 
-
 if __name__ == "__main__":
     import uvicorn
 

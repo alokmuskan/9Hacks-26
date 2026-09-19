@@ -1,40 +1,7 @@
 import importlib
-import sys
-import types
 import unittest
 
-
-def _install_stubs():
-    if "cv2" not in sys.modules:
-        cv2_stub = types.ModuleType("cv2")
-        cv2_stub.CAP_V4L2 = 200
-        cv2_stub.CAP_ANY = 0
-        cv2_stub.CAP_PROP_BUFFERSIZE = 38
-        cv2_stub.CAP_PROP_FRAME_WIDTH = 3
-        cv2_stub.CAP_PROP_FRAME_HEIGHT = 4
-        cv2_stub.FONT_HERSHEY_SIMPLEX = 0
-        cv2_stub.LINE_AA = 16
-        cv2_stub.WINDOW_NORMAL = 0
-        sys.modules["cv2"] = cv2_stub
-
-    if "insightface" not in sys.modules:
-        insightface_stub = types.ModuleType("insightface")
-        app_stub = types.ModuleType("insightface.app")
-
-        class _FaceAnalysis:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def prepare(self, *args, **kwargs):
-                pass
-
-            def get(self, *args, **kwargs):
-                return []
-
-        app_stub.FaceAnalysis = _FaceAnalysis
-        insightface_stub.app = app_stub
-        sys.modules["insightface"] = insightface_stub
-        sys.modules["insightface.app"] = app_stub
+from _stubs import install as _install_stubs
 
 
 class MetricsSchemaTests(unittest.TestCase):
@@ -67,7 +34,7 @@ class MetricsSchemaTests(unittest.TestCase):
                 "behavior_interactions_total": 7,
                 "behavior_attention_total_sec": 123.4,
                 "behavior_top_objects": [["laptop", 90.2]],
-                "behavior_attention_map": {"Hemanth": {"laptop": 90.2}},
+                "behavior_attention_map": {"Alok": {"laptop": 90.2}},
                 "behavior_events_count": 11,
                 "behavior_activity_patterns": {"transitions_per_min": 1.2},
                 "gaze_enabled": True,
@@ -100,7 +67,7 @@ class MetricsSchemaTests(unittest.TestCase):
         self.assertEqual(agg["behavior_interactions_total"], 7)
         self.assertAlmostEqual(agg["behavior_attention_total_sec"], 123.4, places=6)
         self.assertEqual(agg["behavior_top_objects"], [["laptop", 90.2]])
-        self.assertEqual(agg["behavior_attention_map"], {"Hemanth": {"laptop": 90.2}})
+        self.assertEqual(agg["behavior_attention_map"], {"Alok": {"laptop": 90.2}})
         self.assertEqual(agg["behavior_events_count"], 11)
         self.assertEqual(agg["behavior_activity_patterns"], {"transitions_per_min": 1.2})
         self.assertTrue(agg["gaze_enabled"])

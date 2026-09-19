@@ -96,7 +96,7 @@ function MemoryPage() {
           <div className="lookup-row">
             <div className="field">
               <label>Person</label>
-              <input value={personQuery} onChange={(e) => setPersonQuery(e.target.value)} placeholder="Hemanth" />
+              <input value={personQuery} onChange={(e) => setPersonQuery(e.target.value)} placeholder="Your Name" />
             </div>
             <button
               className="btn-secondary"

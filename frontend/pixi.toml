@@ -1,5 +1,5 @@
 [workspace]
-authors = ["Hemanth Damineni <hemanthdamineni@gmail.com>"]
+authors = ["Alok Raj <alokraj1319@gmail.com>"]
 channels = ["conda-forge"]
 name = "frontend"
 platforms = ["linux-64"]

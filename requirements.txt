@@ -1,0 +1,57 @@
+# pip fallback for environments the pixi workspace does not cover.
+#
+# The supported, tested environment is the linux-64 pixi workspace described in
+# pixi.toml (see `pixi install`). This file exists so the project can also be set
+# up with plain pip on Linux, macOS or Windows.
+#
+# This path is NOT verified on every platform. The computer-vision wheels below
+# (insightface, onnxruntime, faiss-cpu, open-clip-torch) resolve differently per
+# platform and Python version, and the two git dependencies need a working
+# compiler on some setups. Run `python main.py doctor` afterwards to see exactly
+# which parts came up.
+#
+#   python -m venv .venv && . .venv/bin/activate
+#   pip install -r requirements.txt
+#   python main.py doctor
+
+# Core inference
+numpy>=1.26,<3
+opencv-python>=4.10,<5
+onnxruntime>=1.17
+# 0.7.x needs a C++ toolchain to build from source; the 2.x line ships a
+# pure-Python wheel (py3-none-any) and is verified against this project's API
+# (FaceAnalysis(providers=..., allowed_modules=...), prepare, get).
+insightface>=0.7.3,<3
+ultralytics>=8.4.0,<9
+torch>=2.5,<3
+torchvision>=0.20,<1
+pillow>=11,<12
+huggingface_hub>=1.7.1,<2
+
+# Gaze estimation (L2CS-Net) and its face-detection dependency
+l2cs @ git+https://github.com/Ahmednull/L2CS-Net.git@a4d8f7fa5436a2b2b9f088471623b552a85811bd
+face_detection @ git+https://github.com/elliottzheng/face-detection.git
+gdown
+
+# Optional: vector scene search (both required together for CLIP + FAISS)
+faiss-cpu>=1.9,<2
+open-clip-torch>=3.0,<4
+
+# Optional: LLM chat fallback
+groq
+
+# API server and configuration
+fastapi
+uvicorn
+httpx
+websockets
+python-dotenv
+
+# Test suite
+pytest>=9.0.2,<10
+
+# Lint and static types. Configuration lives in ruff.toml and mypy.ini:
+#   ruff check .     # lint
+#   mypy             # types (main.py is currently opted out; see mypy.ini)
+ruff>=0.9
+mypy>=1.13

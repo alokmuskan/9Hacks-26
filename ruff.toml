@@ -1,0 +1,62 @@
+# Ruff configuration for the backend Python code (main.py, server.py, common.py,
+# object_detection.py, scene_memory.py, tests/, ai-surveillance/).
+#
+# The rule set is listed explicitly rather than relying on the tool's defaults,
+# which change between releases and would make CI results drift.
+
+target-version = "py311"
+line-length = 100
+
+exclude = [
+    ".git",
+    ".pixi",
+    ".venv",
+    ".venv-tools",
+    "__pycache__",
+    "frontend",
+    "runs",
+]
+
+[lint]
+# Rule families are grouped by what they protect against:
+#   E4/E7/E9, F  - real errors: unused names, undefined names, syntax problems
+#   I            - import sorting, so diffs stay small and merges stay clean
+#   UP           - outdated syntax for the pinned Python version
+#   B, C4, SIM, PIE, ISC, FURB - bug-prone or obscure constructs
+#   DTZ          - naive datetime usage, which this project has already been bitten by
+#   RUF          - ruff's own correctness checks
+# Deliberately NOT selected, with reasons:
+#   BLE (flake8-blind-except) - `except Exception` is intentional throughout: the
+#     optional dependencies (torch, l2cs, groq, faiss) fail in platform-specific
+#     ways and a monitoring session must degrade rather than abort.
+#   S (flake8-bandit)         - the same excepts trip S110 (try/except/pass), which
+#     is used for best-effort cleanup: unlinking a locked file, releasing a camera
+#     that is already gone.
+#   D, ANN                    - the codebase documents behaviour in tests and the
+#     README rather than in 500+ docstrings; adding them is a separate decision.
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "C4", "SIM", "PIE", "ISC", "DTZ", "RUF", "FURB", "TRY"]
+
+ignore = [
+    # Nested `with` blocks keep lock/guard scopes explicit and readable; collapsing
+    # them into one statement obscures which resource is held where.
+    "SIM117",
+    # Messages in `raise` are intentionally long and actionable (they name the exact
+    # command to run), so the "raise should take a variable" rule does not apply.
+    "TRY003",
+    # try/except/else around optional imports reads clearly as-is.
+    "TRY300",
+]
+
+[lint.per-file-ignores]
+# Tests reach into private helpers on purpose, and assert with unittest's methods.
+"tests/*" = ["SLF001", "PT009", "ARG002"]
+# The launcher and inspector are thin utilities that print to stdout.
+"ai-surveillance/*" = ["INP001"]
+
+[lint.isort]
+known-first-party = ["common", "main", "server", "object_detection", "scene_memory", "_stubs"]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"

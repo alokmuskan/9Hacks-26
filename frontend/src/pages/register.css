@@ -28,3 +28,18 @@
     grid-template-columns: 1fr;
   }
 }
+
+@media (max-width: 640px) {
+  .register-actions {
+    flex-wrap: wrap;
+  }
+
+  .register-actions button {
+    flex: 1 1 140px;
+  }
+
+  .register-stream {
+    min-height: 0;
+    height: 56vw;
+  }
+}
