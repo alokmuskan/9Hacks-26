@@ -1,12 +1,77 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
+
+
+# Guards metadata read/merge/write across every SceneMemoryManager instance in the
+# process. The monitor worker and per-request API handlers all share one file.
+_STORE_LOCK = threading.RLock()
+
+
+def _entry_key(entry: dict[str, Any]) -> str:
+    for field in ("snapshot_path", "snapshot", "timestamp_utc", "datetime"):
+        value = str(entry.get(field) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _merge_entries(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Union several in-memory views of the index into one canonical list.
+
+    Entries are deduplicated by snapshot identity, ordered chronologically and
+    re-indexed so `id` stays unique even when instances were loaded separately.
+    Later groups win on conflicts, so pass the freshest view last.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for rows in groups:
+        for entry in rows:
+            if not isinstance(entry, dict):
+                continue
+            key = _entry_key(entry)
+            if not key:
+                continue
+            merged[key] = entry
+
+    ordered = sorted(
+        merged.values(),
+        key=lambda row: str(row.get("timestamp_utc") or row.get("datetime") or ""),
+    )
+    for idx, row in enumerate(ordered, start=1):
+        row["id"] = idx
+    return ordered
+
+
+def _read_metadata_file(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [entry for entry in raw if isinstance(entry, dict)]
+
+
+def _write_metadata_file(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Write the index atomically so a crash mid-write cannot truncate it."""
+    payload = json.dumps(rows, ensure_ascii=True, indent=2) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
 
 
 class SceneMemoryManager:
@@ -16,7 +81,8 @@ class SceneMemoryManager:
         base_dir: str | Path = "memory",
         enable_vectors: bool = True,
     ) -> None:
-        self.snapshot_interval_sec = float(snapshot_interval_sec)
+        # Floor the interval so a zero/negative value cannot snapshot every frame.
+        self.snapshot_interval_sec = max(float(snapshot_interval_sec), 1.0)
         self.last_snapshot_time = 0.0
 
         self.base_dir = Path(base_dir)
@@ -43,18 +109,19 @@ class SceneMemoryManager:
             self._init_vector_backend()
 
     def _load_metadata(self) -> list[dict[str, Any]]:
-        if not self.metadata_path.exists():
-            return []
-        try:
-            raw = json.loads(self.metadata_path.read_text(encoding="utf-8"))
-            if isinstance(raw, list):
-                return [entry for entry in raw if isinstance(entry, dict)]
-        except Exception:
-            pass
-        return []
+        return _read_metadata_file(self.metadata_path)
 
     def _save_metadata(self) -> None:
-        self.metadata_path.write_text(json.dumps(self.metadata, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+        """Merge the on-disk index with this instance's view, then replace atomically.
+
+        Without the merge a stale in-memory list silently drops entries appended
+        by another instance (for example a manual snapshot taken through the API
+        while the monitor worker holds an older view).
+        """
+        with _STORE_LOCK:
+            disk_rows = _read_metadata_file(self.metadata_path)
+            self.metadata = _merge_entries(disk_rows, self.metadata)
+            _write_metadata_file(self.metadata_path, self.metadata)
 
     def _init_vector_backend(self) -> None:
         try:
@@ -100,6 +167,18 @@ class SceneMemoryManager:
         # cv2 frames are BGR.
         rgb = frame[..., ::-1]
         return Image.fromarray(rgb)
+
+    def _save_snapshot_image(self, image: Image.Image, timestamp_utc: datetime) -> Path:
+        """Reserve a unique snapshot path and write the image, atomically.
+
+        Path selection and file creation must happen together: `_next_snapshot_path`
+        only checks `exists()`, so two concurrent writers would otherwise pick the
+        same filename and one image would overwrite the other.
+        """
+        with _STORE_LOCK:
+            path = self._next_snapshot_path(timestamp_utc)
+            image.save(path, format="JPEG", quality=95)
+            return path
 
     def _next_snapshot_path(self, timestamp_utc: datetime) -> Path:
         stamp = timestamp_utc.astimezone().strftime("snap_%Y-%m-%d_%H-%M-%S")
@@ -201,10 +280,8 @@ class SceneMemoryManager:
         attention: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         ts_utc = datetime.now(timezone.utc)
-        snapshot_path = self._next_snapshot_path(ts_utc)
-
         image = self._frame_to_rgb_image(frame)
-        image.save(snapshot_path, format="JPEG", quality=95)
+        snapshot_path = self._save_snapshot_image(image, ts_utc)
 
         labels = self._extract_labels(detections)
         object_rows = self._normalize_object_rows(object_detections or [])
@@ -216,7 +293,6 @@ class SceneMemoryManager:
                 self._faiss_index.add(emb)
 
         entry = {
-            "id": len(self.metadata) + 1,
             "timestamp_utc": ts_utc.isoformat(),
             "timestamp_local": ts_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
             "datetime": ts_utc.isoformat(),
@@ -263,8 +339,14 @@ class SceneMemoryManager:
             if safe_attention:
                 entry["attention"] = safe_attention
 
-        self.metadata.append(entry)
-        self._save_metadata()
+        # Merge under the store lock so a concurrent writer cannot win the race
+        # between reading the index and replacing it.
+        with _STORE_LOCK:
+            merged = _merge_entries(_read_metadata_file(self.metadata_path), self.metadata)
+            entry["id"] = len(merged) + 1
+            merged.append(entry)
+            self.metadata = merged
+            _write_metadata_file(self.metadata_path, self.metadata)
 
         if self.vectors_enabled and self._faiss is not None and self._faiss_index is not None:
             self._faiss.write_index(self._faiss_index, str(self.embedding_path))

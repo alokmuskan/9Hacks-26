@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import cv2
@@ -22,6 +22,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+
+import common
 
 LOGGER = logging.getLogger("monitoring-backend")
 logging.basicConfig(level=logging.INFO)
@@ -41,8 +43,15 @@ CHAT_CONFIRM_TTL_SEC = 2 * 60
 CHAT_HISTORY_MAX_TURNS = 10
 CHAT_CONTEXT_LOOKBACK_MIN = 30
 GAZE_ARCH_DEFAULT = "ResNet50"
+# Gaze scheduling defaults come from `common` so the CLI and the API schedule gaze
+# identically; the interval only adapts when the caller opts in.
+GAZE_INTERVAL_DEFAULT = common.GAZE_INTERVAL_DEFAULT
+GAZE_TARGET_FPS_DROP_DEFAULT = common.GAZE_TARGET_FPS_DROP_DEFAULT
+# Backbones L2CS-Net can instantiate. The CLI restricts `--gaze-arch`, the API used
+# to silently rewrite whatever the caller asked for.
+GazeArch = Literal["ResNet18", "ResNet34", "ResNet50", "ResNet101", "ResNet152"]
 
-METRICS_PATH = Path("metrics_log.jsonl")
+METRICS_PATH = Path(common.METRICS_FILENAME)
 MEMORY_DIR = Path("memory")
 SNAPSHOTS_DIR = MEMORY_DIR / "snapshots"
 INCIDENTS_DIR = Path("unknown_incidents")
@@ -57,39 +66,26 @@ def _core() -> Any:
     return core
 
 
+# Thin aliases over `common` so both entry points behave identically and there is
+# one implementation to fix. The CV stack stays unimported here on purpose.
 def _iso(dt: datetime | None = None) -> str:
-    return (dt or datetime.now(timezone.utc)).isoformat()
+    return common.iso(dt)
 
 
 def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value)
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        return None
+    return common.parse_iso(value)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
+    return common.safe_int(value, default)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
+    return common.safe_float(value, default)
 
 
 def _session_id(prefix: str) -> str:
-    ts = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
-    return f"{prefix}-{ts}"
+    return common.session_id(prefix)
 
 
 def _encode_jpeg(frame: np.ndarray, quality: int = MJPEG_QUALITY) -> bytes | None:
@@ -222,14 +218,16 @@ class MonitorStartRequest(BaseModel):
     custom_model: str | None = None
     disable_general: bool = False
     disable_custom: bool = False
-    snapshot_interval: float = 15.0
+    snapshot_interval: float = Field(default=15.0, ge=1.0, le=3600.0)
     disable_gaze: bool = False
-    gaze_arch: str = GAZE_ARCH_DEFAULT
+    gaze_arch: GazeArch = GAZE_ARCH_DEFAULT
     gaze_weights: str = "models/L2CSNet_gaze360.pkl"
     gaze_weights_source: str = (
         "https://drive.google.com/drive/folders/17p6ORr-JQJcw-eYtG2WGNiuS_qVKwdWd?usp=sharing"
     )
     disable_gaze_auto_download: bool = False
+    gaze_max_interval: int = Field(default=GAZE_INTERVAL_DEFAULT, ge=1, le=60)
+    gaze_target_fps_drop: float = Field(default=GAZE_TARGET_FPS_DROP_DEFAULT, ge=0.0, le=0.9)
     fps_cap: int = Field(default=FPS_CAP_DEFAULT, ge=1, le=60)
 
 
@@ -302,6 +300,7 @@ class PipelineManager:
         self._latest_config: dict[str, Any] = {}
 
         self._enroll = EnrollStatus()
+        self._manual_snapshots = 0
 
     def _set_startup_phase(self, phase: str, failure_reason: str | None = None, publish: bool = True) -> None:
         with self._lock:
@@ -448,6 +447,12 @@ class PipelineManager:
         if self._thread and self._thread.is_alive():
             raise HTTPException(status_code=409, detail=f"Pipeline already running in '{self._mode}' mode")
 
+    def note_manual_snapshot(self) -> int:
+        """Count a snapshot saved outside the worker (API request or chat action)."""
+        with self._lock:
+            self._manual_snapshots += 1
+            return int(self._manual_snapshots)
+
     def start_monitor(self, req: MonitorStartRequest) -> dict[str, Any]:
         with self._lock:
             self._validate_can_start()
@@ -466,9 +471,9 @@ class PipelineManager:
             self._startup_failure_reason = None
             self._enroll = EnrollStatus()
             self._latest_session_summary = None
+            self._manual_snapshots = 0
 
             cfg = req.model_dump()
-            cfg["gaze_arch"] = GAZE_ARCH_DEFAULT
             self._latest_config = dict(cfg)
             self._thread = threading.Thread(
                 target=self._run_monitor_worker,
@@ -733,7 +738,7 @@ class PipelineManager:
                 core._append_metric(
                     "enroll",
                     {
-                        "schema_version": 3,
+                        "schema_version": common.ENROLL_SCHEMA_VERSION,
                         "session_id": self._session_id,
                         "name": name,
                         "model": model,
@@ -798,6 +803,8 @@ class PipelineManager:
         gaze_weights_source: str,
         disable_gaze_auto_download: bool,
         fps_cap: int,
+        gaze_max_interval: int = GAZE_INTERVAL_DEFAULT,
+        gaze_target_fps_drop: float = GAZE_TARGET_FPS_DROP_DEFAULT,
         **_: Any,
     ) -> None:
         core = _core()
@@ -838,6 +845,11 @@ class PipelineManager:
                 "custom": detector.get_state()["custom"]["enabled"],
                 "gaze": bool(gaze_runtime is not None and gaze_enabled),
             }
+            gaze_scheduler = core.GazeScheduler(
+                base_interval=GAZE_INTERVAL_DEFAULT,
+                max_interval=gaze_max_interval,
+                target_fps_drop=gaze_target_fps_drop,
+            )
         except Exception as exc:
             startup_failed_reason = f"startup_init_error:{exc}"
             self._mark_startup_failed(startup_failed_reason)
@@ -881,7 +893,6 @@ class PipelineManager:
         events: list[dict[str, Any]] = []
         events_total = 0
         memory_auto_snapshots = 0
-        memory_manual_snapshots = 0
         memory_query_counts: Counter[str] = Counter()
         memory_query_hits: Counter[str] = Counter()
         memory_query_misses: Counter[str] = Counter()
@@ -892,6 +903,11 @@ class PipelineManager:
         detection_calls = 0
         detection_latency_min_ms = float("inf")
         detection_latency_max_ms = 0.0
+        gaze_inference_calls = 0
+        gaze_inference_sum_ms = 0.0
+        gaze_inference_min_ms = float("inf")
+        gaze_inference_max_ms = 0.0
+        last_gaze_rows: list[tuple[int, int, float, float] | None] | None = None
         fps_ema = 0.0
         fps_min = float("inf")
         fps_max = 0.0
@@ -904,6 +920,7 @@ class PipelineManager:
         start_dt = datetime.now(timezone.utc)
         start_ts = time.time()
         camera_failures = 0
+        detector_error_seen = False
 
         def add_event(
             event_type: str,
@@ -983,7 +1000,16 @@ class PipelineManager:
                 detection_latency_min_ms = min(detection_latency_min_ms, det_ms)
                 detection_latency_max_ms = max(detection_latency_max_ms, det_ms)
 
-                object_rows = detector.detect(frame)
+                try:
+                    object_rows = detector.detect(frame)
+                except Exception as exc:
+                    # A detector failure must not tear down the whole session; the
+                    # CLI path already tolerated this, the API path did not.
+                    object_rows = []
+                    if not detector_error_seen:
+                        detector_error_seen = True
+                        add_event("object_detect_error", str(exc), severity="alert")
+                        LOGGER.warning("Object detection error: %s", exc)
 
                 face_count = len(face_rows)
                 object_count = len(object_rows)
@@ -1071,12 +1097,28 @@ class PipelineManager:
 
                 gaze_rows: list[tuple[int, int, float, float] | None] = [None for _ in render_rows]
                 if gaze_state["gaze"] and gaze_runtime and render_rows:
-                    gaze_rows = core._estimate_gaze_points(
-                        frame,
-                        [row[0] for row in render_rows],
-                        [row[1] for row in render_rows],
-                        gaze_runtime,
-                    )
+                    if gaze_scheduler.should_run():
+                        gaze_t0 = time.perf_counter()
+                        gaze_rows = core._estimate_gaze_points(
+                            frame,
+                            [row[0] for row in render_rows],
+                            [row[1] for row in render_rows],
+                            gaze_runtime,
+                        )
+                        gaze_latency_ms = (time.perf_counter() - gaze_t0) * 1000.0
+                        gaze_inference_calls += 1
+                        gaze_inference_sum_ms += gaze_latency_ms
+                        gaze_inference_min_ms = min(gaze_inference_min_ms, gaze_latency_ms)
+                        gaze_inference_max_ms = max(gaze_inference_max_ms, gaze_latency_ms)
+                        gaze_scheduler.observe(gaze_latency_ms, dt * 1000.0)
+                        last_gaze_rows = gaze_rows
+                    elif last_gaze_rows is not None:
+                        # Skipped by the adaptive schedule: reuse the last estimate so
+                        # attention tracking stays continuous between inferences.
+                        gaze_rows = [
+                            last_gaze_rows[i] if i < len(last_gaze_rows) else None
+                            for i in range(len(render_rows))
+                        ]
 
                 gaze_observations: dict[str, str | None] = {}
                 attention_rows: list[dict[str, Any]] = []
@@ -1202,6 +1244,8 @@ class PipelineManager:
                 yolo_state = detector.get_state()
                 self._latest_yolo_state = yolo_state
                 gaze_status = "ON" if gaze_state["gaze"] else "OFF"
+                if gaze_state["gaze"] and gaze_scheduler.adaptive:
+                    gaze_status = f"ON 1/{gaze_scheduler.interval}"
                 core._hud(
                     frame,
                     [
@@ -1214,7 +1258,7 @@ class PipelineManager:
                         ),
                         (f"Gaze:{gaze_status} Seq:{self.frame_store.get().get('sequence', 0)}", (170, 170, 170)),
                         (
-                            f"Snapshots(auto/manual): {memory_auto_snapshots}/{memory_manual_snapshots}",
+                            f"Snapshots(auto/manual): {memory_auto_snapshots}/{self._manual_snapshots}",
                             (160, 160, 160),
                         ),
                     ],
@@ -1315,122 +1359,71 @@ class PipelineManager:
                 }
 
             behavior_summary = behavior_tracker.summary()
-            avg_fps = (frames_total / duration_sec) if duration_sec > 0 else 0.0
-            avg_conf = (confidence_sum / detections_total) if detections_total > 0 else 0.0
-            avg_detection_ms = detection_latency_sum_ms / detection_calls if detection_calls > 0 else 0.0
-            object_avg_conf = object_conf_sum / object_detections_total if object_detections_total > 0 else 0.0
-            object_avg_conf_general = (
-                object_general_conf_sum / object_general_detections if object_general_detections > 0 else 0.0
-            )
-            object_avg_conf_custom = (
-                object_custom_conf_sum / object_custom_detections if object_custom_detections > 0 else 0.0
-            )
-            recognition_rate = known_detections / detections_total if detections_total > 0 else 0.0
-            unknown_rate = unknown_detections / detections_total if detections_total > 0 else 0.0
-
-            aggregate = {
-                "session_id": self._session_id,
-                "frames_total": frames_total,
-                "frames_with_faces": frames_with_faces,
-                "frames_empty": frames_empty,
-                "frames_dropped": frames_dropped,
-                "average_faces_per_frame": round(detections_total / frames_total, 4) if frames_total else 0.0,
-                "detections_total": detections_total,
-                "known_detections": known_detections,
-                "unknown_detections": unknown_detections,
-                "peak_simultaneous_faces": peak_simultaneous_faces,
-                "avg_fps": round(avg_fps, 3),
-                "moving_avg_fps": round(fps_ema, 3),
-                "min_fps": round(0.0 if fps_min == float("inf") else fps_min, 3),
-                "max_fps": round(fps_max, 3),
-                "faces_per_sec": round(detections_total / duration_sec, 3) if duration_sec > 0 else 0.0,
-                "avg_detection_latency_ms": round(avg_detection_ms, 2),
-                "min_detection_latency_ms": round(
-                    0.0 if detection_latency_min_ms == float("inf") else detection_latency_min_ms,
-                    2,
-                ),
-                "max_detection_latency_ms": round(detection_latency_max_ms, 2),
-                "detection_calls": detection_calls,
-                "avg_confidence": round(avg_conf, 4),
-                "recognition_rate": round(recognition_rate, 6),
-                "unknown_rate": round(unknown_rate, 6),
-                "unknown_alert_events": unknown_alert_count,
-                "unknown_alert_density_per_min": round(
-                    unknown_alert_count / (duration_sec / 60.0), 3
-                )
-                if duration_sec > 0
-                else 0.0,
-                "unique_individuals_seen": len(people_clean),
-                "current_people_visible": len(visible_prev),
-                "active_subjects": latest_active_subjects,
-                "active_objects": latest_object_labels,
-                "detection_timeline": [
-                    {"time_local": t, "detections": int(c)}
-                    for t, c in list(detection_timeline.items())[-20:]
-                ],
-                "object_detections_total": object_detections_total,
-                "object_general_detections": object_general_detections,
-                "object_custom_detections": object_custom_detections,
-                "object_avg_confidence": round(object_avg_conf, 4),
-                "object_avg_confidence_general": round(object_avg_conf_general, 4),
-                "object_avg_confidence_custom": round(object_avg_conf_custom, 4),
-                "gaze_enabled": gaze_enabled,
-                "gaze_model_loaded": bool(gaze_runtime is not None),
-                "gaze_base_interval_frames": 1,
-                "gaze_interval_frames_final": 1,
-                "gaze_target_fps_drop": 0.0,
-                "gaze_inference_calls": 0,
-                "gaze_inference_avg_ms": 0.0,
-                "gaze_inference_min_ms": 0.0,
-                "gaze_inference_max_ms": 0.0,
-                "object_class_counts_total": dict(object_class_counts_total),
-                "object_class_counts_general": dict(object_class_counts_general),
-                "object_class_counts_custom": dict(object_class_counts_custom),
-                "object_detection_timeline": [
-                    {"time_local": t, "detections": int(c)}
-                    for t, c in list(object_detection_timeline.items())[-20:]
-                ],
-                "yolo_state_final": detector.get_state(),
-                "yolo_model_paths": {
+            with self._lock:
+                manual_snapshots = int(self._manual_snapshots)
+            aggregate = core.build_session_aggregate(
+                session_id=self._session_id,
+                duration_sec=duration_sec,
+                frames_total=frames_total,
+                frames_with_faces=frames_with_faces,
+                frames_empty=frames_empty,
+                frames_dropped=frames_dropped,
+                detections_total=detections_total,
+                known_detections=known_detections,
+                unknown_detections=unknown_detections,
+                peak_simultaneous_faces=peak_simultaneous_faces,
+                confidence_sum=confidence_sum,
+                detection_calls=detection_calls,
+                detection_latency_sum_ms=detection_latency_sum_ms,
+                detection_latency_min_ms=detection_latency_min_ms,
+                detection_latency_max_ms=detection_latency_max_ms,
+                fps_ema=fps_ema,
+                fps_min=fps_min,
+                fps_max=fps_max,
+                object_detections_total=object_detections_total,
+                object_general_detections=object_general_detections,
+                object_custom_detections=object_custom_detections,
+                object_conf_sum=object_conf_sum,
+                object_general_conf_sum=object_general_conf_sum,
+                object_custom_conf_sum=object_custom_conf_sum,
+                unknown_alert_count=unknown_alert_count,
+                memory_auto_snapshots=memory_auto_snapshots,
+                memory_manual_snapshots=manual_snapshots,
+                memory_total_store=_safe_int(memory.get_memory_stats().get("total_snapshots"), 0),
+                memory_query_counts=memory_query_counts,
+                memory_query_hits=memory_query_hits,
+                memory_query_misses=memory_query_misses,
+                chat_queries_total=chat_queries_total,
+                chat_queries_hit=chat_queries_hit,
+                chat_queries_llm=chat_queries_llm,
+                unique_individuals_seen=len(people_clean),
+                current_people_visible=len(visible_prev),
+                active_subjects=latest_active_subjects,
+                active_objects=latest_object_labels,
+                detection_timeline=detection_timeline,
+                object_detection_timeline=object_detection_timeline,
+                object_class_counts_total=object_class_counts_total,
+                object_class_counts_general=object_class_counts_general,
+                object_class_counts_custom=object_class_counts_custom,
+                behavior_summary=behavior_summary,
+                gaze_enabled=gaze_enabled,
+                gaze_model_loaded=bool(gaze_runtime is not None),
+                **gaze_scheduler.metrics(),
+                gaze_inference_calls=gaze_inference_calls,
+                gaze_inference_sum_ms=gaze_inference_sum_ms,
+                gaze_inference_min_ms=gaze_inference_min_ms,
+                gaze_inference_max_ms=gaze_inference_max_ms,
+                detector_state=detector.get_state(),
+                model_paths={
                     "general": core._resolve_general_model_path(general_model),
                     "custom": custom_model or core._load_default_custom_model_path(),
                 },
-                "memory_snapshots_auto": memory_auto_snapshots,
-                "memory_snapshots_manual": memory_manual_snapshots,
-                "memory_snapshots_total_session": memory_auto_snapshots + memory_manual_snapshots,
-                "memory_snapshot_total_store": _safe_int(memory.get_memory_stats().get("total_snapshots"), 0),
-                "memory_query_counts": dict(memory_query_counts),
-                "memory_query_hits": dict(memory_query_hits),
-                "memory_query_misses": dict(memory_query_misses),
-                "chat_queries_total": chat_queries_total,
-                "chat_queries_hit": chat_queries_hit,
-                "chat_queries_llm": chat_queries_llm,
-                "behavior_interactions_total": _safe_int(behavior_summary.get("interactions_total"), 0),
-                "behavior_attention_total_sec": _safe_float(behavior_summary.get("attention_total_sec"), 0.0),
-                "behavior_top_objects": behavior_summary.get("top_objects", []),
-                "behavior_attention_map": behavior_summary.get("attention_map", {}),
-                "behavior_events_count": _safe_int(behavior_summary.get("events_count"), 0),
-                "behavior_activity_patterns": {
-                    "transitions_per_min": round(
-                        _safe_int(behavior_summary.get("interactions_total"), 0) / (duration_sec / 60.0),
-                        3,
-                    )
-                    if duration_sec > 0
-                    else 0.0,
-                    "unique_attended_objects": len(behavior_summary.get("top_objects", [])),
-                    "focus_ratio": round(
-                        _safe_float(behavior_summary.get("attention_total_sec"), 0.0) / duration_sec,
-                        4,
-                    )
-                    if duration_sec > 0
-                    else 0.0,
-                },
-            }
+            )
 
             core._append_metric(
                 "recognize_session",
                 {
-                    "schema_version": 5,
+                    "schema_version": common.SESSION_SCHEMA_VERSION,
                     "session_id": self._session_id,
                     "model": model,
                     "camera_source": str(core.CAMERA_SOURCE),
@@ -1516,21 +1509,7 @@ async def _startup() -> None:
 
 
 def _load_metric_events() -> list[dict[str, Any]]:
-    if not METRICS_PATH.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    with METRICS_PATH.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-                if isinstance(row, dict):
-                    rows.append(row)
-            except json.JSONDecodeError:
-                continue
-    return rows
+    return common.read_jsonl(METRICS_PATH)
 
 
 def _filter_metric_events(
@@ -1540,20 +1519,13 @@ def _filter_metric_events(
     from_ts: str | None,
     to_ts: str | None,
 ) -> list[dict[str, Any]]:
-    rows = _load_metric_events()
-    from_dt = _parse_iso(from_ts)
-    to_dt = _parse_iso(to_ts)
-    out: list[dict[str, Any]] = []
-    for row in rows:
-        if event_type and str(row.get("event_type")) != event_type:
-            continue
-        dt = _parse_iso(row.get("timestamp_utc"))
-        if from_dt and dt and dt < from_dt:
-            continue
-        if to_dt and dt and dt > to_dt:
-            continue
-        out.append(row)
-    return out[-max(1, int(limit)) :]
+    return common.filter_events(
+        _load_metric_events(),
+        event_type=event_type,
+        limit=limit,
+        from_ts=from_ts,
+        to_ts=to_ts,
+    )
 
 
 @dataclass
@@ -1955,6 +1927,7 @@ def _capture_snapshot_for_action() -> dict[str, Any]:
         people=context.get("people"),
         attention=context.get("attention_rows"),
     )
+    MANAGER.note_manual_snapshot()
     MANAGER._publish_event("memory_event", {"action": "snapshot_manual", "snapshot": snap})
     return snap
 
@@ -2108,11 +2081,12 @@ def _deterministic_chat_response(question: str, runtime_context: dict[str, Any])
         return {"reply": core._answer_current_presence(), "intent": "presence", "hit": True}
     if "looking at" in q or "look at" in q:
         db = core.FaceDB.load()
+        attention_reply, attention_found = core._answer_attention_query(question, db.names)
         return {
-            "reply": core._answer_attention_query(question, db.names),
+            "reply": attention_reply,
             "intent": "attention_lookup",
-            "hit": True,
-            }
+            "hit": bool(attention_found),
+        }
     return None
 
 
@@ -2195,6 +2169,7 @@ def api_monitor_snapshot() -> dict[str, Any]:
         people=context.get("people"),
         attention=context.get("attention_rows"),
     )
+    MANAGER.note_manual_snapshot()
     MANAGER._publish_event("memory_event", {"action": "snapshot_manual", "snapshot": snap})
     return {"status": "ok", "snapshot": snap}
 
@@ -2467,6 +2442,9 @@ def api_chat_query(req: ChatRequest) -> dict[str, Any]:
                             "Ask about summary, last-seen, memory stats, or attention."
                         )
 
+    # "Grounded" means the reply is backed by retrieved evidence. A running
+    # pipeline or a successfully executed action is not evidence.
+    grounded = bool(citations)
     CHAT_SESSIONS.append_turn(session_id, "assistant", reply)
     duration_ms = (time.perf_counter() - started) * 1000.0
     core._append_metric(

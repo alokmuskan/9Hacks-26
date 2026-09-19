@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -16,6 +16,7 @@ from typing import Any
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
+import common
 from object_detection import DualYoloDetector, find_latest_custom_model
 from scene_memory import SceneMemoryManager
 
@@ -34,7 +35,7 @@ _load_env_file()
 _DEFAULT_CAMERA_SOURCE = "/dev/video42" if sys.platform.startswith("linux") else "0"
 CAMERA_SOURCE = os.getenv("AI_STUDIO_CAM_CAMERA_INDEX", _DEFAULT_CAMERA_SOURCE).strip()
 DB_PATH = Path("face_db.npz")
-METRICS_LOG_PATH = Path("metrics_log.jsonl")
+METRICS_LOG_PATH = Path(common.METRICS_FILENAME)
 REPORT_TXT_PATH = Path("report.txt")
 UNKNOWN_INCIDENTS_DIR = Path("unknown_incidents")
 MEMORY_DIR = Path("memory")
@@ -53,16 +54,17 @@ UNKNOWN_LABEL = "Unknown"
 
 EVENTS_TIMELINE_CAP = 500
 UNKNOWN_ALERT_COOLDOWN_SEC = 3.0
-GAZE_INTERVAL_DEFAULT = 1
-GAZE_MAX_INTERVAL_DEFAULT = 4
-GAZE_TARGET_FPS_DROP_DEFAULT = 0.25
+# Shared with server.py via common so both entry points schedule gaze identically.
+GAZE_INTERVAL_DEFAULT = common.GAZE_INTERVAL_DEFAULT
+GAZE_MAX_INTERVAL_DEFAULT = common.GAZE_MAX_INTERVAL_DEFAULT
+GAZE_TARGET_FPS_DROP_DEFAULT = common.GAZE_TARGET_FPS_DROP_DEFAULT
 GAZE_ARCH_DEFAULT = "ResNet50"
 GAZE_WEIGHTS_DEFAULT = "models/L2CSNet_gaze360.pkl"
 GAZE_WEIGHTS_SOURCE_DEFAULT = (
     "https://drive.google.com/drive/folders/17p6ORr-JQJcw-eYtG2WGNiuS_qVKwdWd?usp=sharing"
 )
 GAZE_EMA_ALPHA = 0.10
-GAZE_RECOVERY_STREAK_MIN = 5
+GAZE_RECOVERY_STREAK_MIN = common.GAZE_RECOVERY_STREAK_MIN
 GAZE_OBJECT_HIT_PADDING_PX = 8.0
 GAZE_OBJECT_MAX_DIST_PX = 120.0
 GAZE_SMOOTHING_WINDOW = 5
@@ -140,23 +142,15 @@ def _l2(v: np.ndarray) -> np.ndarray:
 
 
 def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return common.now_utc()
 
 
 def _iso(dt: datetime | None = None) -> str:
-    return (dt or _now_utc()).isoformat()
+    return common.iso(dt)
 
 
 def _parse_iso(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    try:
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        return None
+    return common.parse_iso(s)
 
 
 def _local_hms(iso_ts: str | None) -> str:
@@ -176,22 +170,17 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _safe_int(v: Any, default: int = 0) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return default
+    return common.safe_int(v, default)
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
+    return common.safe_float(v, default)
 
 
 def _session_id(prefix: str) -> str:
-    # Correlation-friendly ID shown in dashboards/logs.
-    return _now_utc().astimezone().strftime("%Y%m%d-%H%M%S")
+    # Correlation-friendly ID shown in dashboards/logs. The prefix used to be
+    # dropped here while the API kept it, so the two modes disagreed.
+    return common.session_id(prefix)
 
 
 def _timeline_bar(count: int, max_count: int, width: int = 12) -> str:
@@ -935,6 +924,75 @@ def _adapt_gaze_interval(
     return current_interval, 0
 
 
+class GazeScheduler:
+    """Decides which processed frames run gaze inference.
+
+    Adaptation is opt-in: it is only active when ``max_interval`` exceeds
+    ``base_interval``. At the default (both 1) every frame with faces runs gaze,
+    so attention/behaviour metrics stay per-frame rather than sampled.
+
+    When enabled, the interval grows by one whenever gaze inference costs more
+    than ``target_fps_drop`` of the frame budget, and shrinks back one step at a
+    time after ``GAZE_RECOVERY_STREAK_MIN`` consecutive cheap frames. Skipped
+    frames reuse the previous estimate, so tracking stays continuous.
+    """
+
+    def __init__(
+        self,
+        base_interval: int = GAZE_INTERVAL_DEFAULT,
+        max_interval: int = GAZE_INTERVAL_DEFAULT,
+        target_fps_drop: float = GAZE_TARGET_FPS_DROP_DEFAULT,
+    ) -> None:
+        self.base_interval = max(_safe_int(base_interval, GAZE_INTERVAL_DEFAULT), 1)
+        self.max_interval = max(_safe_int(max_interval, GAZE_INTERVAL_DEFAULT), self.base_interval)
+        self.target_fps_drop = _safe_float(target_fps_drop, GAZE_TARGET_FPS_DROP_DEFAULT)
+        self.interval = self.base_interval
+        self.recovery_streak = 0
+        self.frames_seen = 0
+
+    @property
+    def adaptive(self) -> bool:
+        return self.max_interval > self.base_interval
+
+    def should_run(self) -> bool:
+        """Call once per processed frame that has faces. True => run inference."""
+        self.frames_seen += 1
+        if not self.adaptive:
+            return True
+        return (self.frames_seen - 1) % self.interval == 0
+
+    def mode_label(self) -> str:
+        if not self.adaptive:
+            return "full-rate"
+        return (
+            f"adaptive(base={self.base_interval}, max={self.max_interval}, "
+            f"target-drop={self.target_fps_drop:g})"
+        )
+
+    def metrics(self) -> dict[str, float]:
+        """The aggregate fields describing what actually ran, in one place."""
+        return {
+            "gaze_base_interval_frames": self.base_interval,
+            "gaze_interval_frames_final": self.interval,
+            "gaze_target_fps_drop": self.target_fps_drop if self.adaptive else 0.0,
+        }
+
+    def observe(self, latency_ms: float, frame_ms: float) -> None:
+        """Feed back the cost of a frame that ran inference."""
+        if not self.adaptive:
+            return
+        frame_ms = _safe_float(frame_ms, 0.0)
+        overhead_ratio = (_safe_float(latency_ms, 0.0) / frame_ms) if frame_ms > 0 else 0.0
+        self.interval, self.recovery_streak = _adapt_gaze_interval(
+            current_interval=self.interval,
+            base_interval=self.base_interval,
+            max_interval=self.max_interval,
+            overhead_ratio=overhead_ratio,
+            target_drop=self.target_fps_drop,
+            recovery_streak=self.recovery_streak,
+        )
+
+
 def _best_face(
     faces: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None]]
 ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray | None] | None:
@@ -955,29 +1013,22 @@ def _match(emb: np.ndarray, db: FaceDB) -> tuple[str, float]:
 
 
 def _append_metric(event_type: str, payload: dict[str, Any]) -> None:
-    record = {
-        "timestamp_utc": _iso(),
-        "event_type": event_type,
-        **payload,
-    }
-    with METRICS_LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=True) + "\n")
+    common.append_jsonl(
+        METRICS_LOG_PATH,
+        {
+            "timestamp_utc": _iso(),
+            "event_type": event_type,
+            **payload,
+        },
+    )
+
+
+def _metrics_parse_errors() -> int:
+    return common.metrics_parse_errors()
 
 
 def _load_metric_events() -> list[dict[str, Any]]:
-    if not METRICS_LOG_PATH.exists():
-        return []
-    events: list[dict[str, Any]] = []
-    with METRICS_LOG_PATH.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return events
+    return common.read_jsonl(METRICS_LOG_PATH)
 
 
 def _bbox_to_list(bbox: Any) -> list[float]:
@@ -1581,7 +1632,8 @@ def _answer_current_presence() -> str:
     return "No recognition session data is available yet."
 
 
-def _answer_attention_query(question: str, known_people: list[str]) -> str:
+def _answer_attention_query(question: str, known_people: list[str]) -> tuple[str, bool]:
+    """Answer an attention question, reporting whether any event backed it."""
     target_person = None
     ql = question.lower()
     for name in known_people:
@@ -1603,12 +1655,12 @@ def _answer_attention_query(question: str, known_people: list[str]) -> str:
             continue
         ts = event.get("timestamp_utc")
         if str(event.get("event")) == "end":
-            return f"{person} stopped attending {obj} around {_local_hms(ts)}."
-        return f"{person} was looking at {obj} around {_local_hms(ts)}."
+            return f"{person} stopped attending {obj} around {_local_hms(ts)}.", True
+        return f"{person} was looking at {obj} around {_local_hms(ts)}.", True
 
     if target_person:
-        return f"No recent attention events were found for {target_person}."
-    return "No recent gaze attention events were found."
+        return f"No recent attention events were found for {target_person}.", False
+    return "No recent gaze attention events were found.", False
 
 
 def _handle_chat_query(
@@ -1694,7 +1746,7 @@ def _handle_chat_query(
             answer = _answer_current_presence()
     elif "looking at" in q or "look at" in q:
         intent = "attention_lookup"
-        answer = _answer_attention_query(question, db.names)
+        answer, hit = _answer_attention_query(question, db.names)
     elif "most viewed object" in q:
         intent = "session_summary"
         summary_minutes = _parse_minutes_from_text(q, default=5)
@@ -1837,6 +1889,275 @@ def _progress_bar(frame: np.ndarray, value: int, total: int) -> None:
     cv2.rectangle(frame, (x1, y - bh), (x2, y), (130, 130, 130), 1)
 
 
+# ── Session aggregate ─────────────────────────────────────────────────────────
+# One definition of the `recognize_session.aggregate` contract, shared by the CLI
+# loop and the API worker. They used to each carry a ~70-line copy of this and had
+# already drifted apart (the API hardcoded its gaze metrics to zero).
+SESSION_AGGREGATE_KEYS: tuple[str, ...] = (
+    "session_id",
+    "frames_total",
+    "frames_with_faces",
+    "frames_empty",
+    "frames_dropped",
+    "average_faces_per_frame",
+    "detections_total",
+    "known_detections",
+    "unknown_detections",
+    "peak_simultaneous_faces",
+    "avg_fps",
+    "moving_avg_fps",
+    "min_fps",
+    "max_fps",
+    "faces_per_sec",
+    "avg_detection_latency_ms",
+    "min_detection_latency_ms",
+    "max_detection_latency_ms",
+    "detection_calls",
+    "avg_confidence",
+    "recognition_rate",
+    "unknown_rate",
+    "unknown_alert_events",
+    "unknown_alert_density_per_min",
+    "unique_individuals_seen",
+    "current_people_visible",
+    "active_subjects",
+    "active_objects",
+    "detection_timeline",
+    "object_detections_total",
+    "object_general_detections",
+    "object_custom_detections",
+    "object_avg_confidence",
+    "object_avg_confidence_general",
+    "object_avg_confidence_custom",
+    "gaze_enabled",
+    "gaze_model_loaded",
+    "gaze_base_interval_frames",
+    "gaze_interval_frames_final",
+    "gaze_target_fps_drop",
+    "gaze_inference_calls",
+    "gaze_inference_avg_ms",
+    "gaze_inference_min_ms",
+    "gaze_inference_max_ms",
+    "object_class_counts_total",
+    "object_class_counts_general",
+    "object_class_counts_custom",
+    "object_detection_timeline",
+    "yolo_state_final",
+    "yolo_model_paths",
+    "memory_snapshots_auto",
+    "memory_snapshots_manual",
+    "memory_snapshots_total_session",
+    "memory_snapshot_total_store",
+    "memory_query_counts",
+    "memory_query_hits",
+    "memory_query_misses",
+    "chat_queries_total",
+    "chat_queries_hit",
+    "chat_queries_llm",
+    "behavior_interactions_total",
+    "behavior_attention_total_sec",
+    "behavior_top_objects",
+    "behavior_attention_map",
+    "behavior_events_count",
+    "behavior_activity_patterns",
+)
+
+
+@dataclass
+class SessionAggregateInput:
+    """Counters a finished monitoring session hands to :meth:`build`.
+
+    Field defaults describe "nothing happened": unset minimums stay at infinity so
+    the builder can emit ``0.0`` for them, and gaze runs at full rate unless a
+    caller says otherwise.
+    """
+
+    session_id: str = ""
+    duration_sec: float = 0.0
+    frames_total: int = 0
+    frames_with_faces: int = 0
+    frames_empty: int = 0
+    frames_dropped: int = 0
+    detections_total: int = 0
+    known_detections: int = 0
+    unknown_detections: int = 0
+    peak_simultaneous_faces: int = 0
+    confidence_sum: float = 0.0
+    detection_calls: int = 0
+    detection_latency_sum_ms: float = 0.0
+    detection_latency_min_ms: float = float("inf")
+    detection_latency_max_ms: float = 0.0
+    fps_ema: float = 0.0
+    fps_min: float = float("inf")
+    fps_max: float = 0.0
+    object_detections_total: int = 0
+    object_general_detections: int = 0
+    object_custom_detections: int = 0
+    object_conf_sum: float = 0.0
+    object_general_conf_sum: float = 0.0
+    object_custom_conf_sum: float = 0.0
+    unknown_alert_count: int = 0
+    memory_auto_snapshots: int = 0
+    memory_manual_snapshots: int = 0
+    memory_total_store: int = 0
+    memory_query_counts: dict[str, int] = field(default_factory=dict)
+    memory_query_hits: dict[str, int] = field(default_factory=dict)
+    memory_query_misses: dict[str, int] = field(default_factory=dict)
+    chat_queries_total: int = 0
+    chat_queries_hit: int = 0
+    chat_queries_llm: int = 0
+    unique_individuals_seen: int = 0
+    current_people_visible: int = 0
+    active_subjects: list[dict[str, Any]] = field(default_factory=list)
+    active_objects: list[str] = field(default_factory=list)
+    detection_timeline: dict[str, int] = field(default_factory=dict)
+    object_detection_timeline: dict[str, int] = field(default_factory=dict)
+    object_class_counts_total: dict[str, int] = field(default_factory=dict)
+    object_class_counts_general: dict[str, int] = field(default_factory=dict)
+    object_class_counts_custom: dict[str, int] = field(default_factory=dict)
+    behavior_summary: dict[str, Any] = field(default_factory=dict)
+    gaze_enabled: bool = False
+    gaze_model_loaded: bool = False
+    gaze_base_interval_frames: int = 1
+    gaze_interval_frames_final: int = 1
+    gaze_target_fps_drop: float = 0.0
+    gaze_inference_calls: int = 0
+    gaze_inference_sum_ms: float = 0.0
+    gaze_inference_min_ms: float = float("inf")
+    gaze_inference_max_ms: float = 0.0
+    detector_state: dict[str, Any] = field(default_factory=dict)
+    model_paths: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> dict[str, Any]:
+        frames_total = _safe_int(self.frames_total)
+        detections_total = _safe_int(self.detections_total)
+        object_detections_total = _safe_int(self.object_detections_total)
+        duration = max(_safe_float(self.duration_sec), 0.0)
+        minutes = duration / 60.0
+
+        behavior = self.behavior_summary if isinstance(self.behavior_summary, dict) else {}
+        behavior_interactions = _safe_int(behavior.get("interactions_total"), 0)
+        behavior_attention_sec = _safe_float(behavior.get("attention_total_sec"), 0.0)
+        behavior_top_objects = behavior.get("top_objects", [])
+        if not isinstance(behavior_top_objects, list):
+            behavior_top_objects = []
+
+        def ratio(numerator: float, denominator: float) -> float:
+            return (numerator / denominator) if denominator else 0.0
+
+        def real_min(value: float) -> float:
+            return 0.0 if value == float("inf") else _safe_float(value)
+
+        return {
+            "session_id": str(self.session_id),
+            "frames_total": frames_total,
+            "frames_with_faces": _safe_int(self.frames_with_faces),
+            "frames_empty": _safe_int(self.frames_empty),
+            "frames_dropped": _safe_int(self.frames_dropped),
+            "average_faces_per_frame": round(ratio(detections_total, frames_total), 4),
+            "detections_total": detections_total,
+            "known_detections": _safe_int(self.known_detections),
+            "unknown_detections": _safe_int(self.unknown_detections),
+            "peak_simultaneous_faces": _safe_int(self.peak_simultaneous_faces),
+            "avg_fps": round(ratio(frames_total, duration), 3),
+            "moving_avg_fps": round(_safe_float(self.fps_ema), 3),
+            "min_fps": round(real_min(self.fps_min), 3),
+            "max_fps": round(_safe_float(self.fps_max), 3),
+            "faces_per_sec": round(ratio(detections_total, duration), 3),
+            "avg_detection_latency_ms": round(
+                ratio(_safe_float(self.detection_latency_sum_ms), _safe_int(self.detection_calls)), 2
+            ),
+            "min_detection_latency_ms": round(real_min(self.detection_latency_min_ms), 2),
+            "max_detection_latency_ms": round(_safe_float(self.detection_latency_max_ms), 2),
+            "detection_calls": _safe_int(self.detection_calls),
+            "avg_confidence": round(ratio(_safe_float(self.confidence_sum), detections_total), 4),
+            "recognition_rate": round(
+                ratio(_safe_int(self.known_detections), detections_total), 6
+            ),
+            "unknown_rate": round(
+                ratio(_safe_int(self.unknown_detections), detections_total), 6
+            ),
+            "unknown_alert_events": _safe_int(self.unknown_alert_count),
+            "unknown_alert_density_per_min": round(
+                ratio(_safe_int(self.unknown_alert_count), minutes), 3
+            ),
+            "unique_individuals_seen": _safe_int(self.unique_individuals_seen),
+            "current_people_visible": _safe_int(self.current_people_visible),
+            "active_subjects": list(self.active_subjects),
+            "active_objects": list(self.active_objects),
+            "detection_timeline": [
+                {"time_local": t, "detections": int(c)}
+                for t, c in list(self.detection_timeline.items())[-20:]
+            ],
+            "object_detections_total": object_detections_total,
+            "object_general_detections": _safe_int(self.object_general_detections),
+            "object_custom_detections": _safe_int(self.object_custom_detections),
+            "object_avg_confidence": round(
+                ratio(_safe_float(self.object_conf_sum), object_detections_total), 4
+            ),
+            "object_avg_confidence_general": round(
+                ratio(
+                    _safe_float(self.object_general_conf_sum),
+                    _safe_int(self.object_general_detections),
+                ),
+                4,
+            ),
+            "object_avg_confidence_custom": round(
+                ratio(
+                    _safe_float(self.object_custom_conf_sum),
+                    _safe_int(self.object_custom_detections),
+                ),
+                4,
+            ),
+            "gaze_enabled": bool(self.gaze_enabled),
+            "gaze_model_loaded": bool(self.gaze_model_loaded),
+            "gaze_base_interval_frames": _safe_int(self.gaze_base_interval_frames, 1),
+            "gaze_interval_frames_final": _safe_int(self.gaze_interval_frames_final, 1),
+            "gaze_target_fps_drop": _safe_float(self.gaze_target_fps_drop, 0.0),
+            "gaze_inference_calls": _safe_int(self.gaze_inference_calls),
+            "gaze_inference_avg_ms": round(
+                ratio(_safe_float(self.gaze_inference_sum_ms), _safe_int(self.gaze_inference_calls)), 2
+            ),
+            "gaze_inference_min_ms": round(real_min(self.gaze_inference_min_ms), 2),
+            "gaze_inference_max_ms": round(_safe_float(self.gaze_inference_max_ms), 2),
+            "object_class_counts_total": dict(self.object_class_counts_total),
+            "object_class_counts_general": dict(self.object_class_counts_general),
+            "object_class_counts_custom": dict(self.object_class_counts_custom),
+            "object_detection_timeline": [
+                {"time_local": t, "detections": int(c)}
+                for t, c in list(self.object_detection_timeline.items())[-20:]
+            ],
+            "yolo_state_final": dict(self.detector_state),
+            "yolo_model_paths": dict(self.model_paths),
+            "memory_snapshots_auto": _safe_int(self.memory_auto_snapshots),
+            "memory_snapshots_manual": _safe_int(self.memory_manual_snapshots),
+            "memory_snapshots_total_session": _safe_int(self.memory_auto_snapshots)
+            + _safe_int(self.memory_manual_snapshots),
+            "memory_snapshot_total_store": _safe_int(self.memory_total_store),
+            "memory_query_counts": dict(self.memory_query_counts),
+            "memory_query_hits": dict(self.memory_query_hits),
+            "memory_query_misses": dict(self.memory_query_misses),
+            "chat_queries_total": _safe_int(self.chat_queries_total),
+            "chat_queries_hit": _safe_int(self.chat_queries_hit),
+            "chat_queries_llm": _safe_int(self.chat_queries_llm),
+            "behavior_interactions_total": behavior_interactions,
+            "behavior_attention_total_sec": round(behavior_attention_sec, 3),
+            "behavior_top_objects": behavior_top_objects,
+            "behavior_attention_map": behavior.get("attention_map", {}),
+            "behavior_events_count": _safe_int(behavior.get("events_count"), 0),
+            "behavior_activity_patterns": {
+                "transitions_per_min": round(ratio(behavior_interactions, minutes), 3),
+                "unique_attended_objects": len(behavior_top_objects),
+                "focus_ratio": round(ratio(behavior_attention_sec, duration), 4),
+            },
+        }
+
+
+def build_session_aggregate(**kwargs: Any) -> dict[str, Any]:
+    """Convenience wrapper so callers can pass counters as keywords."""
+    return SessionAggregateInput(**kwargs).build()
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 def cmd_enroll(name: str, model: str) -> None:
     session_id = _session_id("enroll")
@@ -1906,7 +2227,7 @@ def cmd_enroll(name: str, model: str) -> None:
     _append_metric(
         "enroll",
         {
-            "schema_version": 2,
+            "schema_version": common.ENROLL_SCHEMA_VERSION,
             "session_id": session_id,
             "name": name,
             "model": model,
@@ -1938,6 +2259,8 @@ def cmd_recognize(
     gaze_weights: str,
     gaze_weights_source: str,
     disable_gaze_auto_download: bool,
+    gaze_max_interval: int = GAZE_INTERVAL_DEFAULT,
+    gaze_target_fps_drop: float = GAZE_TARGET_FPS_DROP_DEFAULT,
 ) -> None:
     db = FaceDB.load()
     if not db.names:
@@ -1962,10 +2285,16 @@ def cmd_recognize(
     reader = _AsyncCameraReader(cap)
     gaze_enabled = not disable_gaze
     gaze_auto_download = not disable_gaze_auto_download
+    gaze_scheduler = GazeScheduler(
+        base_interval=GAZE_INTERVAL_DEFAULT,
+        max_interval=gaze_max_interval,
+        target_fps_drop=gaze_target_fps_drop,
+    )
     gaze_inference_calls = 0
     gaze_inference_sum_ms = 0.0
     gaze_inference_min_ms = float("inf")
     gaze_inference_max_ms = 0.0
+    last_gaze_rows: list[tuple[int, int, float, float] | None] | None = None
     gaze_runtime = (
         _load_gaze_runtime(
             gaze_arch=gaze_arch,
@@ -1993,7 +2322,7 @@ def cmd_recognize(
             loaded_arch = str(gaze_runtime.get("arch", gaze_arch)) if gaze_runtime else gaze_arch
             print(
                 f"Gaze active: model=L2CS-Net {loaded_arch} weights={loaded_path} "
-                "mode=full-rate"
+                f"mode={gaze_scheduler.mode_label()}"
             )
         else:
             print("Gaze requested but unavailable. Continuing with gaze OFF.")
@@ -2202,23 +2531,31 @@ def cmd_recognize(
 
             gaze_rows: list[tuple[int, int, float, float] | None] = [None for _ in render_rows]
             ran_gaze_this_frame = False
-            if (
-                gaze_active
-                and render_rows
-            ):
-                ran_gaze_this_frame = True
-                gaze_t0 = time.perf_counter()
-                gaze_rows = _estimate_gaze_points(
-                    frame,
-                    [row[0] for row in render_rows],
-                    [row[1] for row in render_rows],
-                    gaze_runtime,
-                )
-                gaze_latency_ms = (time.perf_counter() - gaze_t0) * 1000.0
-                gaze_inference_calls += 1
-                gaze_inference_sum_ms += gaze_latency_ms
-                gaze_inference_min_ms = min(gaze_inference_min_ms, gaze_latency_ms)
-                gaze_inference_max_ms = max(gaze_inference_max_ms, gaze_latency_ms)
+            if gaze_active and render_rows:
+                if gaze_scheduler.should_run():
+                    ran_gaze_this_frame = True
+                    gaze_t0 = time.perf_counter()
+                    gaze_rows = _estimate_gaze_points(
+                        frame,
+                        [row[0] for row in render_rows],
+                        [row[1] for row in render_rows],
+                        gaze_runtime,
+                    )
+                    gaze_latency_ms = (time.perf_counter() - gaze_t0) * 1000.0
+                    gaze_inference_calls += 1
+                    gaze_inference_sum_ms += gaze_latency_ms
+                    gaze_inference_min_ms = min(gaze_inference_min_ms, gaze_latency_ms)
+                    gaze_inference_max_ms = max(gaze_inference_max_ms, gaze_latency_ms)
+                    gaze_scheduler.observe(gaze_latency_ms, dt * 1000.0)
+                    last_gaze_rows = gaze_rows
+                elif last_gaze_rows is not None:
+                    # Skipped by the adaptive schedule: reuse the last estimate so
+                    # attention tracking stays continuous between inferences.
+                    ran_gaze_this_frame = True
+                    gaze_rows = [
+                        last_gaze_rows[i] if i < len(last_gaze_rows) else None
+                        for i in range(len(render_rows))
+                    ]
 
             gaze_observations: dict[str, str | None] = {}
             attention_rows: list[dict[str, Any]] = []
@@ -2531,38 +2868,6 @@ def cmd_recognize(
             info["last_enter_ts"] = None
             info["present"] = False
 
-    current_people_visible = len(visible_prev)
-    avg_fps = (frames_total / duration_sec) if duration_sec > 0 else 0.0
-    faces_per_sec = (detections_total / duration_sec) if duration_sec > 0 else 0.0
-    avg_conf = (confidence_sum / detections_total) if detections_total > 0 else 0.0
-    avg_detection_latency_ms = (
-        detection_latency_sum_ms / detection_calls if detection_calls > 0 else 0.0
-    )
-    avg_faces_per_frame = (detections_total / frames_total) if frames_total > 0 else 0.0
-
-    recognition_rate = (known_detections / detections_total) if detections_total > 0 else 0.0
-    unknown_rate = (unknown_detections / detections_total) if detections_total > 0 else 0.0
-    unknown_alert_density_per_min = (
-        unknown_alert_count / (duration_sec / 60.0) if duration_sec > 0 else 0.0
-    )
-
-    object_avg_conf = (
-        object_conf_sum / object_detections_total if object_detections_total > 0 else 0.0
-    )
-    object_avg_conf_general = (
-        object_general_conf_sum / object_general_detections
-        if object_general_detections > 0
-        else 0.0
-    )
-    object_avg_conf_custom = (
-        object_custom_conf_sum / object_custom_detections
-        if object_custom_detections > 0
-        else 0.0
-    )
-    gaze_inference_avg_ms = (
-        gaze_inference_sum_ms / gaze_inference_calls if gaze_inference_calls > 0 else 0.0
-    )
-
     people_clean: dict[str, dict[str, Any]] = {}
     for name, info in people.items():
         detections = _safe_int(info.get("detections"))
@@ -2576,108 +2881,68 @@ def cmd_recognize(
         }
 
     behavior_summary = behavior_tracker.summary()
-    behavior_interactions_total = _safe_int(behavior_summary.get("interactions_total"), 0)
-    behavior_attention_total_sec = _safe_float(behavior_summary.get("attention_total_sec"), 0.0)
-    transitions_per_min = (
-        behavior_interactions_total / (duration_sec / 60.0) if duration_sec > 0 else 0.0
-    )
-    unique_attended_objects = len(behavior_summary.get("top_objects", []))
-    focus_ratio = (
-        behavior_attention_total_sec / duration_sec if duration_sec > 0 else 0.0
-    )
 
     memory_stats = memory.get_memory_stats()
-    aggregate = {
-        "session_id": session_id,
-        "frames_total": frames_total,
-        "frames_with_faces": frames_with_faces,
-        "frames_empty": frames_empty,
-        "frames_dropped": frames_dropped,
-        "average_faces_per_frame": round(avg_faces_per_frame, 4),
-        "detections_total": detections_total,
-        "known_detections": known_detections,
-        "unknown_detections": unknown_detections,
-        "peak_simultaneous_faces": peak_simultaneous_faces,
-        "avg_fps": round(avg_fps, 3),
-        "moving_avg_fps": round(fps_ema, 3),
-        "min_fps": round(0.0 if fps_min == float("inf") else fps_min, 3),
-        "max_fps": round(fps_max, 3),
-        "faces_per_sec": round(faces_per_sec, 3),
-        "avg_detection_latency_ms": round(avg_detection_latency_ms, 2),
-        "min_detection_latency_ms": round(
-            0.0 if detection_latency_min_ms == float("inf") else detection_latency_min_ms, 2
-        ),
-        "max_detection_latency_ms": round(detection_latency_max_ms, 2),
-        "detection_calls": detection_calls,
-        "avg_confidence": round(avg_conf, 4),
-        "recognition_rate": round(recognition_rate, 6),
-        "unknown_rate": round(unknown_rate, 6),
-        "unknown_alert_events": unknown_alert_count,
-        "unknown_alert_density_per_min": round(unknown_alert_density_per_min, 3),
-        "unique_individuals_seen": len(people_clean),
-        "current_people_visible": current_people_visible,
-        "active_subjects": latest_active_subjects,
-        "active_objects": latest_object_labels,
-        "detection_timeline": [
-            {"time_local": t, "detections": int(c)}
-            for t, c in list(detection_timeline.items())[-20:]
-        ],
-        "object_detections_total": object_detections_total,
-        "object_general_detections": object_general_detections,
-        "object_custom_detections": object_custom_detections,
-        "object_avg_confidence": round(object_avg_conf, 4),
-        "object_avg_confidence_general": round(object_avg_conf_general, 4),
-        "object_avg_confidence_custom": round(object_avg_conf_custom, 4),
-        "gaze_enabled": gaze_enabled,
-        "gaze_model_loaded": gaze_model_loaded,
-        "gaze_base_interval_frames": 1,
-        "gaze_interval_frames_final": 1,
-        "gaze_target_fps_drop": 0.0,
-        "gaze_inference_calls": gaze_inference_calls,
-        "gaze_inference_avg_ms": round(gaze_inference_avg_ms, 2),
-        "gaze_inference_min_ms": round(
-            0.0 if gaze_inference_min_ms == float("inf") else gaze_inference_min_ms,
-            2,
-        ),
-        "gaze_inference_max_ms": round(gaze_inference_max_ms, 2),
-        "object_class_counts_total": dict(object_class_counts_total),
-        "object_class_counts_general": dict(object_class_counts_general),
-        "object_class_counts_custom": dict(object_class_counts_custom),
-        "object_detection_timeline": [
-            {"time_local": t, "detections": int(c)}
-            for t, c in list(object_detection_timeline.items())[-20:]
-        ],
-        "yolo_state_final": detector.get_state(),
-        "yolo_model_paths": {
-            "general": general_model_path,
-            "custom": custom_model_path,
-        },
-        "memory_snapshots_auto": memory_auto_snapshots,
-        "memory_snapshots_manual": memory_manual_snapshots,
-        "memory_snapshots_total_session": memory_auto_snapshots + memory_manual_snapshots,
-        "memory_snapshot_total_store": _safe_int(memory_stats.get("total_snapshots"), 0),
-        "memory_query_counts": dict(memory_query_counts),
-        "memory_query_hits": dict(memory_query_hits),
-        "memory_query_misses": dict(memory_query_misses),
-        "chat_queries_total": chat_queries_total,
-        "chat_queries_hit": chat_queries_hit,
-        "chat_queries_llm": chat_queries_llm,
-        "behavior_interactions_total": behavior_interactions_total,
-        "behavior_attention_total_sec": round(behavior_attention_total_sec, 3),
-        "behavior_top_objects": behavior_summary.get("top_objects", []),
-        "behavior_attention_map": behavior_summary.get("attention_map", {}),
-        "behavior_events_count": _safe_int(behavior_summary.get("events_count"), 0),
-        "behavior_activity_patterns": {
-            "transitions_per_min": round(transitions_per_min, 3),
-            "unique_attended_objects": unique_attended_objects,
-            "focus_ratio": round(focus_ratio, 4),
-        },
-    }
+    aggregate = build_session_aggregate(
+        session_id=session_id,
+        duration_sec=duration_sec,
+        frames_total=frames_total,
+        frames_with_faces=frames_with_faces,
+        frames_empty=frames_empty,
+        frames_dropped=frames_dropped,
+        detections_total=detections_total,
+        known_detections=known_detections,
+        unknown_detections=unknown_detections,
+        peak_simultaneous_faces=peak_simultaneous_faces,
+        confidence_sum=confidence_sum,
+        detection_calls=detection_calls,
+        detection_latency_sum_ms=detection_latency_sum_ms,
+        detection_latency_min_ms=detection_latency_min_ms,
+        detection_latency_max_ms=detection_latency_max_ms,
+        fps_ema=fps_ema,
+        fps_min=fps_min,
+        fps_max=fps_max,
+        object_detections_total=object_detections_total,
+        object_general_detections=object_general_detections,
+        object_custom_detections=object_custom_detections,
+        object_conf_sum=object_conf_sum,
+        object_general_conf_sum=object_general_conf_sum,
+        object_custom_conf_sum=object_custom_conf_sum,
+        unknown_alert_count=unknown_alert_count,
+        memory_auto_snapshots=memory_auto_snapshots,
+        memory_manual_snapshots=memory_manual_snapshots,
+        memory_total_store=_safe_int(memory_stats.get("total_snapshots"), 0),
+        memory_query_counts=memory_query_counts,
+        memory_query_hits=memory_query_hits,
+        memory_query_misses=memory_query_misses,
+        chat_queries_total=chat_queries_total,
+        chat_queries_hit=chat_queries_hit,
+        chat_queries_llm=chat_queries_llm,
+        unique_individuals_seen=len(people_clean),
+        current_people_visible=len(visible_prev),
+        active_subjects=latest_active_subjects,
+        active_objects=latest_object_labels,
+        detection_timeline=detection_timeline,
+        object_detection_timeline=object_detection_timeline,
+        object_class_counts_total=object_class_counts_total,
+        object_class_counts_general=object_class_counts_general,
+        object_class_counts_custom=object_class_counts_custom,
+        behavior_summary=behavior_summary,
+        gaze_enabled=gaze_enabled,
+        gaze_model_loaded=gaze_model_loaded,
+        **gaze_scheduler.metrics(),
+        gaze_inference_calls=gaze_inference_calls,
+        gaze_inference_sum_ms=gaze_inference_sum_ms,
+        gaze_inference_min_ms=gaze_inference_min_ms,
+        gaze_inference_max_ms=gaze_inference_max_ms,
+        detector_state=detector.get_state(),
+        model_paths={"general": general_model_path, "custom": custom_model_path},
+    )
 
     _append_metric(
         "recognize_session",
         {
-            "schema_version": 4,
+            "schema_version": common.SESSION_SCHEMA_VERSION,
             "session_id": session_id,
             "model": model,
             "camera_source": CAMERA_SOURCE,
@@ -2693,7 +2958,7 @@ def cmd_recognize(
     )
 
     print(
-        f"Session summary | frames={frames_total} avg_fps={avg_fps:.2f} "
+        f"Session summary | frames={frames_total} avg_fps={aggregate['avg_fps']:.2f} "
         f"faces={detections_total} objects={object_detections_total} "
         f"known={known_detections} unknown={unknown_detections}"
     )
@@ -2770,7 +3035,7 @@ def cmd_train_objects(
     _append_metric(
         "object_train",
         {
-            "schema_version": 1,
+            "schema_version": common.OBJECT_TRAIN_SCHEMA_VERSION,
             "start_utc": _iso(start_dt),
             "end_utc": _iso(end_dt),
             "duration_sec": round(duration_sec, 3),
@@ -3432,6 +3697,7 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
         "metrics": {
             "path": str(METRICS_LOG_PATH),
             "events_total": len(events),
+            "parse_errors": _metrics_parse_errors(),
             "enroll_events": len(enroll_events),
             "recognize_sessions": len(recognize_events),
             "chat_queries": len(chat_query_events),
@@ -3738,6 +4004,7 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
             f"Behavior Attention (s)  : {_safe_float(hist.get('behavior_attention_total_sec'), 0.0):.1f}",
             f"Behavior Events         : {_safe_int(hist.get('behavior_events_count'), 0)}",
             f"Alert Density           : {_safe_float(hist.get('alert_density_per_min'), 0.0):.2f} alerts/min",
+            f"Metrics Parse Errors    : {_metrics_parse_errors()}",
             f"Average Confidence      : {_safe_float(hist.get('avg_confidence'), 0.0):.4f}",
             "",
             "╔════════════════════════════════════════════════════╗",
@@ -3816,6 +4083,26 @@ def main() -> None:
         help="Source URL used for auto-downloading gaze weights when local file is missing",
     )
     p_r.add_argument(
+        "--gaze-max-interval",
+        type=int,
+        default=GAZE_INTERVAL_DEFAULT,
+        help=(
+            "Maximum frames between gaze inferences. 1 (default) keeps gaze at "
+            "full rate so attention metrics stay per-frame; above 1 lets the "
+            f"interval adapt to its own cost (recommended: {GAZE_MAX_INTERVAL_DEFAULT})"
+        ),
+    )
+    p_r.add_argument(
+        "--gaze-target-fps-drop",
+        type=float,
+        default=GAZE_TARGET_FPS_DROP_DEFAULT,
+        help=(
+            "Gaze cost as a fraction of the frame budget above which the adaptive "
+            f"interval grows (default: {GAZE_TARGET_FPS_DROP_DEFAULT}; only used when "
+            "--gaze-max-interval > 1)"
+        ),
+    )
+    p_r.add_argument(
         "--disable-gaze-auto-download",
         action="store_true",
         help="Disable automatic gaze weight download fallback",
@@ -3868,6 +4155,8 @@ def main() -> None:
             args.gaze_weights,
             args.gaze_weights_source,
             args.disable_gaze_auto_download,
+            args.gaze_max_interval,
+            args.gaze_target_fps_drop,
         ),
         "train-objects": lambda: cmd_train_objects(
             args.data,

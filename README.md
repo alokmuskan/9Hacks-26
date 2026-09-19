@@ -386,7 +386,21 @@ pixi run python main.py report
 
 Global flag: `--model {buffalo_l,buffalo_m,buffalo_s,buffalo_sc,antelopev2}` (default `buffalo_sc`).
 
-`recognize` options: `--general-model`, `--custom-model`, `--disable-general`, `--disable-custom`, `--disable-gaze`, `--snapshot-interval`, `--gaze-arch`, `--gaze-weights`, `--gaze-weights-source`, `--disable-gaze-auto-download`.
+`recognize` options: `--general-model`, `--custom-model`, `--disable-general`, `--disable-custom`, `--disable-gaze`, `--snapshot-interval`, `--gaze-arch`, `--gaze-weights`, `--gaze-weights-source`, `--disable-gaze-auto-download`, `--gaze-max-interval`, `--gaze-target-fps-drop`.
+
+### Gaze Scheduling
+
+By default gaze runs on **every** processed frame that contains faces, and the session metrics report an interval of 1. This keeps attention and behavior data per-frame rather than sampled.
+
+Gaze can instead throttle itself when inference is expensive. Pass `--gaze-max-interval N` (`N > 1`) to enable it:
+
+```bash
+pixi run python main.py recognize --gaze-max-interval 4
+```
+
+The interval grows by one whenever gaze inference costs more than `--gaze-target-fps-drop` (default `0.25`) of the frame budget, and steps back down after a run of cheap frames. Frames skipped this way reuse the previous gaze estimate, so attention tracking stays continuous; only genuine inferences are counted in `gaze_inference_calls`. The effective values are written to the session aggregate (`gaze_base_interval_frames`, `gaze_interval_frames_final`, `gaze_target_fps_drop`) and the CLI prints the active mode at startup.
+
+The API exposes the same two controls as `gaze_max_interval` and `gaze_target_fps_drop` on `POST /api/v1/monitor/start`.
 
 ### Runtime Keyboard Controls
 
@@ -517,7 +531,7 @@ All runtime artifacts are written relative to the working directory and are git-
 pixi run python -m unittest discover -s tests -q
 ```
 
-44 tests across seven modules cover the detection schema and toggles, gaze L2CS helpers and interval adaptation, behavior tracking and summaries, chat and snapshot actions, metrics schema normalisation, scene memory, and the FastAPI surface (status schema, monitor lifecycle, camera recovery, stream generator, WebSocket envelope, chat sessions, and two-step action confirmation).
+85 tests cover the detection schema and toggles, gaze L2CS helpers and interval scheduling, the shared session aggregate contract, persistence integrity (including concurrent snapshot and metrics writers), behavior tracking and summaries, chat and snapshot actions, metrics schema normalisation, scene memory, the CLI `recognize` loop end-to-end, and the FastAPI surface (status schema, monitor lifecycle, camera recovery, stream generator, WebSocket envelope, chat sessions, and two-step action confirmation).
 
 > The server tests import `server.py` at module scope, which creates `memory/snapshots/` and `unknown_incidents/`. Chat tests append to `metrics_log.jsonl`. These paths are git-ignored.
 
@@ -568,8 +582,8 @@ Verified against the current code:
 - **Linux-targeted environment.** The pixi workspace and lock file resolve `linux-64` only.
 - **One active worker.** A single global `PipelineManager` runs either monitor or enroll, never both.
 - **Vector search is not wired in.** `scene_memory.py` supports CLIP + FAISS semantic search, but the monitor and enroll pipelines construct the memory manager with `enable_vectors=False`, so the index is never populated during normal operation. `memory-search` falls back to lexical matching.
-- **Gaze runs every processed frame.** Interval-adaptation helpers exist and are unit-tested, but the runtime pipelines do not call them; the reported gaze interval metrics are fixed at 1 frame.
-- **Duplicated pipeline logic.** The CLI loop (`cmd_recognize`) and the API worker (`_run_monitor_worker`) reimplement the same flow and already differ in places (for example, gaze latency metrics are collected only in the CLI path).
+- **Gaze runs every processed frame by default.** Adaptive throttling is implemented and test-covered but opt-in (`--gaze-max-interval N`, or `gaze_max_interval` on the API). Enabling it trades attention-data fidelity for speed, since skipped frames reuse the previous gaze estimate.
+- **Some pipeline logic is still duplicated.** The session aggregate, metrics-log helpers and gaze scheduler are shared, but the CLI loop (`cmd_recognize`) and the API worker (`_run_monitor_worker`) still reimplement the surrounding per-frame flow.
 - **Custom object detection needs your own data.** `train-objects` requires a YOLO dataset YAML; no dataset ships with the repository.
 - **Metrics log has no rotation.** `metrics_log.jsonl` grows without bound.
 - **No authentication and no rate limiting.** See the security note below.
