@@ -4,7 +4,6 @@ import sys
 import tempfile
 import threading
 import time
-import types
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,93 +11,35 @@ from unittest import mock
 
 import numpy as np
 
+from _stubs import CV2_CONSTANTS, CV2_FUNCTIONS
+from _stubs import install as _install_stubs
+
 # NOTE: stub installation and the `main` import happen in setUp, not at module
 # import time. Discovery imports every test module before running any test, so a
-# module-level `_install_stubs()` would claim `sys.modules["cv2"]` first and the
-# partial stub would then be used by every other test in the suite.
-
-
-def _install_stubs():
-    if "cv2" not in sys.modules:
-        stub = types.ModuleType("cv2")
-        stub.CAP_V4L2 = 200
-        stub.CAP_ANY = 0
-        stub.CAP_PROP_BUFFERSIZE = 38
-        stub.CAP_PROP_FRAME_WIDTH = 3
-        stub.CAP_PROP_FRAME_HEIGHT = 4
-        stub.FONT_HERSHEY_SIMPLEX = 0
-        stub.LINE_AA = 16
-        stub.WINDOW_NORMAL = 0
-        stub.INTER_LINEAR = 1
-        stub.INTER_AREA = 3
-        stub.COLOR_BGR2RGB = 4
-        stub.IMWRITE_JPEG_QUALITY = 1
-        stub.cvtColor = lambda frame, _mode: frame
-        stub.resize = lambda frame, *_a, **_k: frame
-        stub.rectangle = lambda *_a, **_k: None
-        stub.addWeighted = lambda *_a, **_k: None
-        stub.putText = lambda *_a, **_k: None
-        stub.polylines = lambda *_a, **_k: None
-        stub.line = lambda *_a, **_k: None
-        stub.circle = lambda *_a, **_k: None
-        stub.getTextSize = lambda text, *_a, **_k: ((len(text) * 8, 12), 2)
-        # Any module's stub can end up being the one every other test sees, so this
-        # must cover everything the pipeline calls. The real fix is one shared
-        # helper module; this keeps the suite honest until then.
-        stub.imwrite = lambda path, _image, *_a, **_k: True
-        stub.imencode = lambda *_a, **_k: (True, np.zeros(4, dtype=np.uint8))
-        stub.imshow = lambda *_a, **_k: None
-        stub.waitKey = lambda *_a, **_k: -1
-        stub.namedWindow = lambda *_a, **_k: None
-        stub.destroyAllWindows = lambda: None
-        stub.setLogLevel = lambda *_a, **_k: None
-        stub.VideoCapture = lambda *_a, **_k: None
-        stub.CAP_FFMPEG = 1900
-        sys.modules["cv2"] = stub
-
-    if "insightface" not in sys.modules:
-        insightface_stub = types.ModuleType("insightface")
-        app_stub = types.ModuleType("insightface.app")
-
-        class _FaceAnalysis:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def prepare(self, *args, **kwargs):
-                pass
-
-            def get(self, *args, **kwargs):
-                return []
-
-        app_stub.FaceAnalysis = _FaceAnalysis
-        insightface_stub.app = app_stub
-        sys.modules["insightface"] = insightface_stub
-        sys.modules["insightface.app"] = app_stub
+# module-level `_install_stubs()` would claim `sys.modules["cv2"]` first, outside
+# any test. See `_stubs` for the shared implementation.
 
 
 class SharedStubGuardTests(unittest.TestCase):
-    """Discovery order decides which cv2 stub wins; it must be complete."""
+    """The shared stub is a superset of what the pipeline calls.
+
+    `cv2` is cached in `sys.modules` on first insert, so whichever module installs
+    it first is what every later test sees. The stub must therefore be complete,
+    not merely complete-enough for the module that happened to run first.
+    """
 
     def test_shared_cv2_stub_provides_what_the_pipeline_calls(self):
         _install_stubs()
         cv2_stub = sys.modules["cv2"]
-        for name in (
-            "putText",
-            "rectangle",
-            "polylines",
-            "line",
-            "circle",
-            "getTextSize",
-            "addWeighted",
-            "resize",
-            "cvtColor",
-            "imwrite",
-            "imencode",
-        ):
+        for name in CV2_FUNCTIONS:
             self.assertTrue(
                 hasattr(cv2_stub, name),
-                f"the first cv2 stub installed is missing {name}; a module-level "
-                "_install_stubs() in another test file may have claimed sys.modules['cv2']",
+                f"the cv2 stub is missing {name}, which the pipeline calls",
+            )
+        for name in CV2_CONSTANTS:
+            self.assertTrue(
+                hasattr(cv2_stub, name),
+                f"the cv2 stub is missing the constant {name}",
             )
 
 

@@ -823,7 +823,10 @@ class PipelineManager:
                 enable_vectors=False,
             )
 
-            app = core._build_app(model)
+            # Face recognition is degradable: object detection, gaze, memory and the
+            # dashboard all keep working without it, so a failure here becomes a
+            # reported reason rather than a dead monitor.
+            app, face_reason = core._try_build_face_app(model)
             gaze_enabled = not disable_gaze
             gaze_runtime = (
                 core._load_gaze_runtime(
@@ -973,6 +976,18 @@ class PipelineManager:
                 if not startup_ready:
                     startup_ready = True
                     self._set_startup_phase("ready")
+                    if face_reason is not None:
+                        # Marked once the camera is up, so camera recovery cannot
+                        # clear the flag by setting degraded=False on its success path.
+                        self._set_pipeline_state(
+                            degraded=True,
+                            reason=f"face_recognition_unavailable:{face_reason}",
+                        )
+                        add_event(
+                            "face_recognition_unavailable",
+                            str(face_reason),
+                            severity="alert",
+                        )
                 frames_total += 1
                 now_ts = time.time()
 
@@ -1412,6 +1427,7 @@ class PipelineManager:
                     "general": core._resolve_general_model_path(general_model),
                     "custom": custom_model or core._load_default_custom_model_path(),
                 },
+                face_recognition_enabled=app is not None,
             )
 
             core._append_metric(

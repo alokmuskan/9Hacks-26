@@ -18,11 +18,18 @@ from typing import Any
 
 import cv2
 import numpy as np
-from insightface.app import FaceAnalysis
 
 import common
 from object_detection import DualYoloDetector, find_latest_custom_model
 from scene_memory import SceneMemoryManager
+
+# Face recognition is a degradable capability, so its import must not be fatal: a
+# machine without a usable insightface still runs object detection, gaze, memory
+# and the dashboard. `_try_build_face_app` turns a failure into a reason.
+try:
+    from insightface.app import FaceAnalysis
+except Exception:  # pragma: no cover - depends on the environment
+    FaceAnalysis = None  # type: ignore[assignment,misc]
 
 
 def _load_env_file() -> None:
@@ -329,7 +336,19 @@ def _insightface_version() -> str:
         return ""
 
 
+def _insightface_unavailable_message(installed: str | None = None) -> str:
+    required = ".".join(str(part) for part in INSIGHTFACE_MIN_VERSION)
+    version = installed if installed is not None else (_insightface_version() or "not installed")
+    return (
+        f"insightface {version} cannot be used: FaceAnalysis(providers=...) requires "
+        f"insightface >= {required}. Install it with `pixi install` (pixi.toml pins "
+        f"insightface>=0.7.3,<0.8) or `pip install -U insightface`."
+    )
+
+
 def _make_face_analysis(model: str, providers: list[str]) -> FaceAnalysis:
+    if FaceAnalysis is None:
+        raise RuntimeError(_insightface_unavailable_message())
     try:
         return FaceAnalysis(
             name=model,
@@ -344,13 +363,7 @@ def _make_face_analysis(model: str, providers: list[str]) -> FaceAnalysis:
         # InsightFace 0.2.x had `FaceAnalysis(name, root=...)` and no `providers`
         # argument, so both attempts above fail. Without this the user sees a bare
         # TypeError from deep inside the stack and has nothing to act on.
-        installed = _insightface_version() or "unknown"
-        required = ".".join(str(part) for part in INSIGHTFACE_MIN_VERSION)
-        raise RuntimeError(
-            f"insightface {installed} is too old: FaceAnalysis(providers=...) "
-            f"requires insightface >= {required}. Run `pixi install` (pixi.toml pins "
-            f"insightface>=0.7.3,<0.8) or `pip install -U insightface`."
-        ) from exc
+        raise RuntimeError(_insightface_unavailable_message()) from exc
 
 
 def _repair_insightface_model_layout(model: str) -> bool:
@@ -414,6 +427,20 @@ def _build_app(model: str) -> FaceAnalysis:
     app.prepare(ctx_id=ctx_id, det_size=(DET_SIZE, DET_SIZE))
     print(f"Model: {model}  |  Providers: {providers}")
     return app
+
+
+def _try_build_face_app(model: str) -> tuple[FaceAnalysis | None, str | None]:
+    """Build the InsightFace app, or explain why face recognition is unavailable.
+
+    Returning a reason instead of raising lets both entry points keep running and
+    report *why* the capability is off, through `degraded_reason`, `doctor`, and the
+    `face_recognition_enabled` session metric. A session that silently reported zero
+    faces would be indistinguishable from one where nobody was in frame.
+    """
+    try:
+        return _build_app(model), None
+    except Exception as exc:
+        return None, (str(exc).strip() or type(exc).__name__)
 
 
 def _open_camera() -> cv2.VideoCapture:
@@ -556,8 +583,12 @@ class _AsyncCameraReader:
 
 
 def _detect(
-    app: FaceAnalysis, frame: np.ndarray
+    app: FaceAnalysis | None, frame: np.ndarray
 ) -> list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None]]:
+    if app is None:
+        # Face recognition is a degradable capability: without it the frame simply
+        # contributes no face rows and the session keeps running.
+        return []
     h, w = frame.shape[:2]
     scale = INFER_MAX_SIDE / max(h, w)
     inp = (
@@ -1995,6 +2026,7 @@ SESSION_AGGREGATE_KEYS: tuple[str, ...] = (
     "known_detections",
     "unknown_detections",
     "peak_simultaneous_faces",
+    "face_recognition_enabled",
     "avg_fps",
     "moving_avg_fps",
     "min_fps",
@@ -2073,6 +2105,7 @@ class SessionAggregateInput:
     known_detections: int = 0
     unknown_detections: int = 0
     peak_simultaneous_faces: int = 0
+    face_recognition_enabled: bool = True
     confidence_sum: float = 0.0
     detection_calls: int = 0
     detection_latency_sum_ms: float = 0.0
@@ -2150,6 +2183,7 @@ class SessionAggregateInput:
             "known_detections": _safe_int(self.known_detections),
             "unknown_detections": _safe_int(self.unknown_detections),
             "peak_simultaneous_faces": _safe_int(self.peak_simultaneous_faces),
+            "face_recognition_enabled": bool(self.face_recognition_enabled),
             "avg_fps": round(ratio(frames_total, duration), 3),
             "moving_avg_fps": round(_safe_float(self.fps_ema), 3),
             "min_fps": round(real_min(self.fps_min), 3),
@@ -2353,15 +2387,31 @@ def cmd_recognize(
     gaze_max_interval: int = GAZE_INTERVAL_DEFAULT,
     gaze_target_fps_drop: float = GAZE_TARGET_FPS_DROP_DEFAULT,
 ) -> None:
+    app, face_reason = _try_build_face_app(model)
+    if app is None:
+        # Degrade loudly: a session without faces is still useful (objects, gaze,
+        # memory), but the operator must be told why identities are not matched.
+        print(f"Face recognition DISABLED: {face_reason}")
+        print("Continuing with object detection only; no identities will be matched.")
+
     db = FaceDB.load()
     if not db.names:
-        # Fail fast in the CLI: an interactive session with no identities would only
-        # ever report Unknown, so this is a setup error, not a runtime condition.
-        # The API deliberately degrades instead (a service should still serve frames).
-        raise RuntimeError(
-            "No enrolled identities. Run `pixi run python main.py enroll --name <name>` "
-            "first, then start monitoring again."
-        )
+        if app is None:
+            # The "no identities" setup error only applies when matching is possible.
+            # With face recognition off, every detection is an object anyway, and
+            # `enroll` cannot even run, so refusing to start would be a dead end.
+            print(
+                "No enrolled identities and face recognition is unavailable; "
+                "continuing with object detection only."
+            )
+        else:
+            # Fail fast in the CLI: an interactive session with no identities would only
+            # ever report Unknown, so this is a setup error, not a runtime condition.
+            # The API deliberately degrades instead (a service should still serve frames).
+            raise RuntimeError(
+                "No enrolled identities. Run `pixi run python main.py enroll --name <name>` "
+                "first, then start monitoring again."
+            )
 
     session_id = _session_id("recognize")
     start_dt = _now_utc()
@@ -2378,7 +2428,7 @@ def cmd_recognize(
     )
     memory = SceneMemoryManager(snapshot_interval_sec=snapshot_interval, base_dir=MEMORY_DIR)
 
-    app, cap = _build_app(model), _open_camera()
+    cap = _open_camera()
     reader = _AsyncCameraReader(cap)
     gaze_enabled = not disable_gaze
     gaze_auto_download = not disable_gaze_auto_download
@@ -2407,7 +2457,10 @@ def cmd_recognize(
 
     cv2.namedWindow(win := "Recognize", cv2.WINDOW_NORMAL)
 
-    print("Running unified stream: InsightFace + YOLO + memory.")
+    print(
+        "Running unified stream: "
+        + ("InsightFace + YOLO + memory." if app is not None else "YOLO + memory (faces disabled).")
+    )
     _print_runtime_help()
     if custom_model_path:
         print(f"Custom YOLO model: {custom_model_path}")
@@ -3038,6 +3091,7 @@ def cmd_recognize(
         gaze_inference_max_ms=gaze_inference_max_ms,
         detector_state=detector.get_state(),
         model_paths={"general": general_model_path, "custom": custom_model_path},
+        face_recognition_enabled=app is not None,
     )
 
     _append_metric(
@@ -4140,7 +4194,12 @@ def cmd_report() -> None:
 # ── Environment readiness ─────────────────────────────────────────────────────
 # (status, name, detail) rows. "fail" items block a monitoring session; "warn"
 # items disable one feature but let the pipeline run.
-_REQUIRED_MODULES = ("numpy", "cv2", "PIL", "onnxruntime", "insightface", "ultralytics", "torch")
+_REQUIRED_MODULES = ("numpy", "cv2", "PIL", "onnxruntime", "ultralytics", "torch")
+
+# Modules whose absence disables exactly one capability rather than blocking a
+# session. A missing or too-old entry here is reported as `warn`, never `fail`:
+# the pipeline still runs, and `degraded_reason` names what is switched off.
+_DEGRADABLE_MODULES = {"insightface": "face recognition"}
 
 # Importable is not the same as usable: the pipeline calls APIs that only exist in
 # recent releases, so a module can import cleanly and still break the first session.
@@ -4209,16 +4268,20 @@ def collect_environment_report(check_camera: bool = False) -> list[tuple[str, st
         )
     )
 
-    for name in _REQUIRED_MODULES:
+    for name in (*_REQUIRED_MODULES, *_DEGRADABLE_MODULES):
         available, detail = _check_import(name)
-        status = "ok" if available else "fail"
+        degradable = name in _DEGRADABLE_MODULES
+        unavailable_status = "warn" if degradable else "fail"
+        status = "ok" if available else unavailable_status
         minimum = _MIN_MODULE_VERSIONS.get(name)
         if available and minimum:
             parsed = _parse_version(detail)
             if parsed and parsed < minimum[0]:
-                status = "fail"
+                status = unavailable_status
                 want = ".".join(str(part) for part in minimum[0])
                 detail = f"{detail} is too old (need >= {want}: {minimum[1]})"
+        if degradable:
+            detail = f"{detail} - {_DEGRADABLE_MODULES[name]} disabled without it"
         rows.append((status, f"module:{name}", detail))
 
     for name, purpose in _OPTIONAL_MODULES.items():

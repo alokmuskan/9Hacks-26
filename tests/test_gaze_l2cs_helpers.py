@@ -1,10 +1,11 @@
 import importlib
 import tempfile
-import types
 import unittest
 from pathlib import Path
 
 import numpy as np
+
+from _stubs import install as _install_stubs
 
 # torch is a real (un-stubbed) dependency of the L2CS decoding path. Probe once so
 # the one test that needs it can skip instead of failing on a machine without it
@@ -16,46 +17,6 @@ try:
 except ImportError:  # pragma: no cover - depends on the environment
     torch = None  # type: ignore[assignment]
     _TORCH_AVAILABLE = False
-
-
-def _install_stubs():
-    import sys
-
-    if "cv2" not in sys.modules:
-        cv2_stub = types.ModuleType("cv2")
-        cv2_stub.CAP_V4L2 = 200
-        cv2_stub.CAP_ANY = 0
-        cv2_stub.CAP_PROP_BUFFERSIZE = 38
-        cv2_stub.CAP_PROP_FRAME_WIDTH = 3
-        cv2_stub.CAP_PROP_FRAME_HEIGHT = 4
-        cv2_stub.FONT_HERSHEY_SIMPLEX = 0
-        cv2_stub.LINE_AA = 16
-        cv2_stub.WINDOW_NORMAL = 0
-        cv2_stub.INTER_LINEAR = 1
-        cv2_stub.INTER_AREA = 3
-        cv2_stub.COLOR_BGR2RGB = 4
-        cv2_stub.cvtColor = lambda frame, _: frame
-        cv2_stub.resize = lambda frame, *_args, **_kwargs: frame
-        sys.modules["cv2"] = cv2_stub
-
-    if "insightface" not in sys.modules:
-        insightface_stub = types.ModuleType("insightface")
-        app_stub = types.ModuleType("insightface.app")
-
-        class _FaceAnalysis:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def prepare(self, *args, **kwargs):
-                pass
-
-            def get(self, *args, **kwargs):
-                return []
-
-        app_stub.FaceAnalysis = _FaceAnalysis
-        insightface_stub.app = app_stub
-        sys.modules["insightface"] = insightface_stub
-        sys.modules["insightface.app"] = app_stub
 
 
 class _FakeGDown:

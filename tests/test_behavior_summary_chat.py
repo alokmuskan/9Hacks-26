@@ -1,70 +1,12 @@
 import importlib
 import json
 import tempfile
-import types
 import unittest
 from pathlib import Path
 
 import numpy as np
 
-
-def _install_stubs():
-    import sys
-
-    if "cv2" not in sys.modules:
-        cv2_stub = types.ModuleType("cv2")
-        cv2_stub.CAP_V4L2 = 200
-        cv2_stub.CAP_ANY = 0
-        cv2_stub.CAP_PROP_BUFFERSIZE = 38
-        cv2_stub.CAP_PROP_FRAME_WIDTH = 3
-        cv2_stub.CAP_PROP_FRAME_HEIGHT = 4
-        cv2_stub.FONT_HERSHEY_SIMPLEX = 0
-        cv2_stub.LINE_AA = 16
-        cv2_stub.WINDOW_NORMAL = 0
-        cv2_stub.INTER_LINEAR = 1
-        cv2_stub.INTER_AREA = 3
-        cv2_stub.COLOR_BGR2RGB = 4
-        cv2_stub.cvtColor = lambda frame, _mode: frame
-        cv2_stub.resize = lambda frame, *_args, **_kwargs: frame
-        cv2_stub.rectangle = lambda *_args, **_kwargs: None
-        cv2_stub.addWeighted = lambda *_args, **_kwargs: None
-        cv2_stub.putText = lambda *_args, **_kwargs: None
-        cv2_stub.polylines = lambda *_args, **_kwargs: None
-        cv2_stub.line = lambda *_args, **_kwargs: None
-        cv2_stub.circle = lambda *_args, **_kwargs: None
-        cv2_stub.getTextSize = lambda text, *_args, **_kwargs: ((len(text) * 8, 12), 2)
-        # This is the FIRST stub installed when the suite runs, so it must cover
-        # everything the pipeline calls -- otherwise any later test that imports
-        # `server` or `main` trips over the gap. Keep it a superset.
-        cv2_stub.imwrite = lambda *_args, **_kwargs: True
-        cv2_stub.imencode = lambda *_args, **_kwargs: (True, np.zeros(4, dtype=np.uint8))
-        cv2_stub.imshow = lambda *_args, **_kwargs: None
-        cv2_stub.waitKey = lambda *_args, **_kwargs: -1
-        cv2_stub.namedWindow = lambda *_args, **_kwargs: None
-        cv2_stub.destroyAllWindows = lambda: None
-        cv2_stub.setLogLevel = lambda *_args, **_kwargs: None
-        cv2_stub.VideoCapture = lambda *_args, **_kwargs: None
-        cv2_stub.CAP_FFMPEG = 1900
-        sys.modules["cv2"] = cv2_stub
-
-    if "insightface" not in sys.modules:
-        insightface_stub = types.ModuleType("insightface")
-        app_stub = types.ModuleType("insightface.app")
-
-        class _FaceAnalysis:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def prepare(self, *args, **kwargs):
-                pass
-
-            def get(self, *args, **kwargs):
-                return []
-
-        app_stub.FaceAnalysis = _FaceAnalysis
-        insightface_stub.app = app_stub
-        sys.modules["insightface"] = insightface_stub
-        sys.modules["insightface.app"] = app_stub
+from _stubs import install as _install_stubs
 
 
 class BehaviorSummaryChatTests(unittest.TestCase):

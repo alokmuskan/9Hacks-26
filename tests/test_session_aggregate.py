@@ -1,63 +1,8 @@
 import importlib
-import sys
-import types
 import unittest
 
-import numpy as np
-
-
-def _install_stubs():
-    if "cv2" not in sys.modules:
-        stub = types.ModuleType("cv2")
-        stub.CAP_V4L2 = 200
-        stub.CAP_ANY = 0
-        stub.CAP_FFMPEG = 1900
-        stub.CAP_PROP_BUFFERSIZE = 38
-        stub.CAP_PROP_FRAME_WIDTH = 3
-        stub.CAP_PROP_FRAME_HEIGHT = 4
-        stub.FONT_HERSHEY_SIMPLEX = 0
-        stub.LINE_AA = 16
-        stub.WINDOW_NORMAL = 0
-        stub.INTER_LINEAR = 1
-        stub.INTER_AREA = 3
-        stub.COLOR_BGR2RGB = 4
-        stub.IMWRITE_JPEG_QUALITY = 1
-        stub.cvtColor = lambda frame, _mode: frame
-        stub.resize = lambda frame, *_args, **_kwargs: frame
-        stub.rectangle = lambda *_args, **_kwargs: None
-        stub.addWeighted = lambda *_args, **_kwargs: None
-        stub.putText = lambda *_args, **_kwargs: None
-        stub.polylines = lambda *_args, **_kwargs: None
-        stub.line = lambda *_args, **_kwargs: None
-        stub.circle = lambda *_args, **_kwargs: None
-        stub.getTextSize = lambda text, *_args, **_kwargs: ((len(text) * 8, 12), 2)
-        stub.imencode = lambda _ext, _frame, _params=None: (True, np.zeros(4, dtype=np.uint8))
-        stub.imshow = lambda *_args, **_kwargs: None
-        stub.waitKey = lambda *_args, **_kwargs: -1
-        stub.namedWindow = lambda *_args, **_kwargs: None
-        stub.destroyAllWindows = lambda: None
-        stub.setLogLevel = lambda *_args, **_kwargs: None
-        stub.VideoCapture = lambda *_args, **_kwargs: None
-        sys.modules["cv2"] = stub
-
-    if "insightface" not in sys.modules:
-        insightface_stub = types.ModuleType("insightface")
-        app_stub = types.ModuleType("insightface.app")
-
-        class _FaceAnalysis:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def prepare(self, *args, **kwargs):
-                pass
-
-            def get(self, *args, **kwargs):
-                return []
-
-        app_stub.FaceAnalysis = _FaceAnalysis
-        insightface_stub.app = app_stub
-        sys.modules["insightface"] = insightface_stub
-        sys.modules["insightface.app"] = app_stub
+import common
+from _stubs import install as _install_stubs
 
 
 class SessionAggregateContractTests(unittest.TestCase):
@@ -68,7 +13,10 @@ class SessionAggregateContractTests(unittest.TestCase):
     def test_declared_key_set_is_unique_and_stable(self):
         keys = self.main.SESSION_AGGREGATE_KEYS
         self.assertEqual(len(keys), len(set(keys)), "duplicate keys in the declared contract")
-        self.assertEqual(len(keys), 66, "the aggregate contract changed size without a schema bump")
+        # The key count and the schema version move together: changing one without the
+        # other would alter the contract under downstream consumers (reports, the HUD).
+        self.assertEqual(common.SESSION_SCHEMA_VERSION, 7)
+        self.assertEqual(len(keys), 67, "the aggregate contract changed size without a schema bump")
         self.assertIn("gaze_interval_frames_final", keys)
         self.assertIn("behavior_activity_patterns", keys)
 

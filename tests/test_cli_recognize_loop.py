@@ -1,49 +1,12 @@
 import importlib
-import sys
 import time
-import types
 import unittest
 from typing import ClassVar
 from unittest import mock
 
 import numpy as np
 
-
-def _install_stubs():
-    if "cv2" not in sys.modules:
-        stub = types.ModuleType("cv2")
-        stub.CAP_V4L2 = 200
-        stub.CAP_ANY = 0
-        stub.CAP_PROP_BUFFERSIZE = 38
-        stub.CAP_PROP_FRAME_WIDTH = 3
-        stub.CAP_PROP_FRAME_HEIGHT = 4
-        stub.FONT_HERSHEY_SIMPLEX = 0
-        stub.LINE_AA = 16
-        stub.WINDOW_NORMAL = 0
-        stub.INTER_LINEAR = 1
-        stub.INTER_AREA = 3
-        stub.COLOR_BGR2RGB = 4
-        stub.IMWRITE_JPEG_QUALITY = 1
-        sys.modules["cv2"] = stub
-
-    if "insightface" not in sys.modules:
-        insightface_stub = types.ModuleType("insightface")
-        app_stub = types.ModuleType("insightface.app")
-
-        class _FaceAnalysis:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def prepare(self, *args, **kwargs):
-                pass
-
-            def get(self, *args, **kwargs):
-                return []
-
-        app_stub.FaceAnalysis = _FaceAnalysis
-        insightface_stub.app = app_stub
-        sys.modules["insightface"] = insightface_stub
-        sys.modules["insightface.app"] = app_stub
+from _stubs import install as _install_stubs
 
 
 class _FakeDB:
@@ -56,6 +19,18 @@ class _FakeFaceDB:
     @staticmethod
     def load():
         return _FakeDB()
+
+
+class _FakeEmptyDB:
+    names: ClassVar[list[str]] = []
+    counts: ClassVar[list[int]] = []
+    centroids: ClassVar[np.ndarray] = np.zeros((0, 3), dtype=np.float32)
+
+
+class _FakeEmptyFaceDB:
+    @staticmethod
+    def load():
+        return _FakeEmptyDB()
 
 
 class _FakeDetector:
@@ -153,7 +128,15 @@ class CliRecognizeLoopTests(unittest.TestCase):
         fake.WINDOW_NORMAL = 0
         return fake
 
-    def _run(self, frames=3, gaze_side_effect=None, detector_raises=False, **overrides):
+    def _run(
+        self,
+        frames=3,
+        gaze_side_effect=None,
+        detector_raises=False,
+        face_unavailable_reason=None,
+        empty_db=False,
+        **overrides,
+    ):
         """Run cmd_recognize against fakes; returns (appended, fake_gaze, detector)."""
         appended = []
         gaze_result = [(0, 0, 0.0, 0.0)]
@@ -189,9 +172,17 @@ class CliRecognizeLoopTests(unittest.TestCase):
         gaze_runtime = {"arch": "ResNet50", "weights_path": "models/L2CSNet_gaze360.pkl"}
         gaze_return = None if kwargs["disable_gaze"] else gaze_runtime
 
+        face_app = (
+            (None, face_unavailable_reason)
+            if face_unavailable_reason is not None
+            else (object(), None)
+        )
         patches = [
             mock.patch.object(self.main, "cv2", self._fake_cv2(frames)),
-            mock.patch.object(self.main, "FaceDB", _FakeFaceDB),
+            mock.patch.object(
+                self.main, "FaceDB", _FakeEmptyFaceDB if empty_db else _FakeFaceDB
+            ),
+            mock.patch.object(self.main, "_try_build_face_app", return_value=face_app),
             mock.patch.object(self.main, "DualYoloDetector", return_value=fake_detector),
             mock.patch.object(self.main, "SceneMemoryManager", _FakeMemory),
             mock.patch.object(self.main, "_build_app", return_value=object()),
@@ -295,6 +286,34 @@ class CliRecognizeLoopTests(unittest.TestCase):
             [row.get("type") for row in payload["events"]],
             "the detector failure was not recorded as an event",
         )
+
+    def test_no_identities_is_not_fatal_when_face_recognition_is_unavailable(self):
+        """`enroll` needs face recognition, so refusing to start would be a dead end.
+
+        Previously an empty identity database raised unconditionally, which made the
+        CLI unrunnable on a machine that cannot run `enroll` at all.
+        """
+        appended, _gaze, _detector = self._run(
+            frames=3,
+            empty_db=True,
+            face_unavailable_reason="insightface not usable",
+        )
+
+        payload = self._session(appended)
+        self.assertIsNotNone(payload, "the CLI refused to start without identities")
+        self.assertFalse(payload["aggregate"]["face_recognition_enabled"])
+
+    def test_face_recognition_unavailable_degrades_instead_of_aborting(self):
+        """Was: an unusable insightface aborted the CLI session before the loop."""
+        appended, _gaze, _detector = self._run(
+            frames=3,
+            face_unavailable_reason="insightface 0.2.1 cannot be used",
+        )
+
+        payload = self._session(appended)
+        self.assertIsNotNone(payload, "a missing face recogniser aborted the CLI session")
+        self.assertFalse(payload["aggregate"]["face_recognition_enabled"])
+        self.assertGreaterEqual(payload["aggregate"]["frames_total"], 3)
 
     def test_gaze_metrics_are_reported_by_the_cli(self):
         appended, _gaze, _detector = self._run(frames=2)

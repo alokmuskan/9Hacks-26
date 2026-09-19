@@ -1,48 +1,14 @@
 import importlib
 import json
-import sys
 import tempfile
 import threading
-import types
 import unittest
 from pathlib import Path
 
 import numpy as np
 
+from _stubs import install as _install_stubs
 from scene_memory import SceneMemoryManager
-
-
-def _install_stubs():
-    if "cv2" not in sys.modules:
-        cv2_stub = types.ModuleType("cv2")
-        cv2_stub.CAP_V4L2 = 200
-        cv2_stub.CAP_ANY = 0
-        cv2_stub.CAP_PROP_BUFFERSIZE = 38
-        cv2_stub.CAP_PROP_FRAME_WIDTH = 3
-        cv2_stub.CAP_PROP_FRAME_HEIGHT = 4
-        cv2_stub.FONT_HERSHEY_SIMPLEX = 0
-        cv2_stub.LINE_AA = 16
-        cv2_stub.WINDOW_NORMAL = 0
-        sys.modules["cv2"] = cv2_stub
-
-    if "insightface" not in sys.modules:
-        insightface_stub = types.ModuleType("insightface")
-        app_stub = types.ModuleType("insightface.app")
-
-        class _FaceAnalysis:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def prepare(self, *args, **kwargs):
-                pass
-
-            def get(self, *args, **kwargs):
-                return []
-
-        app_stub.FaceAnalysis = _FaceAnalysis
-        insightface_stub.app = app_stub
-        sys.modules["insightface"] = insightface_stub
-        sys.modules["insightface.app"] = app_stub
 
 
 class SceneMemoryWriteIntegrityTests(unittest.TestCase):

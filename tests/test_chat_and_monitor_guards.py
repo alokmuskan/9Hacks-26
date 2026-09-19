@@ -1,8 +1,6 @@
 import importlib
 import json
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from typing import ClassVar
@@ -12,64 +10,7 @@ import numpy as np
 from fastapi.testclient import TestClient
 
 import common
-
-
-def _make_cv2_stub():
-    stub = types.ModuleType("cv2")
-    stub.CAP_V4L2 = 200
-    stub.CAP_ANY = 0
-    stub.CAP_FFMPEG = 1900
-    stub.CAP_PROP_BUFFERSIZE = 38
-    stub.CAP_PROP_FRAME_WIDTH = 3
-    stub.CAP_PROP_FRAME_HEIGHT = 4
-    stub.FONT_HERSHEY_SIMPLEX = 0
-    stub.LINE_AA = 16
-    stub.WINDOW_NORMAL = 0
-    stub.INTER_LINEAR = 1
-    stub.INTER_AREA = 3
-    stub.COLOR_BGR2RGB = 4
-    stub.IMWRITE_JPEG_QUALITY = 1
-    stub.cvtColor = lambda frame, _mode: frame
-    stub.resize = lambda frame, *_args, **_kwargs: frame
-    stub.rectangle = lambda *_args, **_kwargs: None
-    stub.addWeighted = lambda *_args, **_kwargs: None
-    stub.putText = lambda *_args, **_kwargs: None
-    stub.polylines = lambda *_args, **_kwargs: None
-    stub.line = lambda *_args, **_kwargs: None
-    stub.circle = lambda *_args, **_kwargs: None
-    stub.getTextSize = lambda text, *_args, **_kwargs: ((len(text) * 8, 12), 2)
-    stub.imencode = lambda _ext, _frame, _params=None: (True, np.zeros(4, dtype=np.uint8))
-    stub.imshow = lambda *_args, **_kwargs: None
-    stub.waitKey = lambda *_args, **_kwargs: -1
-    stub.namedWindow = lambda *_args, **_kwargs: None
-    stub.destroyAllWindows = lambda: None
-    stub.setLogLevel = lambda *_args, **_kwargs: None
-    stub.VideoCapture = lambda *_args, **_kwargs: None
-    return stub
-
-
-def _install_stubs():
-    if "cv2" not in sys.modules:
-        sys.modules["cv2"] = _make_cv2_stub()
-
-    if "insightface" not in sys.modules:
-        insightface_stub = types.ModuleType("insightface")
-        app_stub = types.ModuleType("insightface.app")
-
-        class _FaceAnalysis:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def prepare(self, *args, **kwargs):
-                pass
-
-            def get(self, *args, **kwargs):
-                return []
-
-        app_stub.FaceAnalysis = _FaceAnalysis
-        insightface_stub.app = app_stub
-        sys.modules["insightface"] = insightface_stub
-        sys.modules["insightface.app"] = app_stub
+from _stubs import install as _install_stubs
 
 
 class _FakeReader:
@@ -281,7 +222,7 @@ class MonitorWorkerResilienceTests(unittest.TestCase):
         except Exception:
             pass
 
-    def _fake_core(self, appended):
+    def _fake_core(self, appended, face_reason=None):
         main = self.main
 
         class _FakeDB:
@@ -347,6 +288,10 @@ class MonitorWorkerResilienceTests(unittest.TestCase):
             @staticmethod
             def _build_app(_model):
                 return object()
+
+            @staticmethod
+            def _try_build_face_app(_model):
+                return (object(), None) if face_reason is None else (None, face_reason)
 
             @staticmethod
             def _load_gaze_runtime(**_kwargs):
@@ -449,6 +394,56 @@ class MonitorWorkerResilienceTests(unittest.TestCase):
             "object_detect_error",
             [row.get("type") for row in payload["events"]],
             "the detector failure was not recorded as an event",
+        )
+
+    def test_face_recognition_unavailable_degrades_without_aborting(self):
+        """An unusable insightface used to kill the monitor before the frame loop."""
+        manager = self.server.PipelineManager()
+        appended = []
+        reason = "insightface 0.2.1 cannot be used: FaceAnalysis(providers=...) requires >= 0.7.3"
+        fake_core = self._fake_core(appended, face_reason=reason)
+        reader = _FakeReader(manager, frames=3)
+
+        with mock.patch.object(self.server, "_core", return_value=fake_core), mock.patch.object(
+            self.server.PipelineManager,
+            "_attempt_camera_recovery",
+            lambda _self, **_kwargs: (object(), reader),
+        ):
+            manager._run_monitor_worker(
+                model="buffalo_sc",
+                general_model=None,
+                custom_model=None,
+                disable_general=False,
+                disable_custom=True,
+                snapshot_interval=15.0,
+                disable_gaze=True,
+                gaze_arch="ResNet50",
+                gaze_weights="models/L2CSNet_gaze360.pkl",
+                gaze_weights_source="https://example.com",
+                disable_gaze_auto_download=True,
+                fps_cap=20,
+            )
+
+        sessions = [payload for event_type, payload in appended if event_type == "recognize_session"]
+        self.assertEqual(len(sessions), 1, "the worker did not reach its session summary")
+        aggregate = sessions[0]["aggregate"]
+        self.assertFalse(aggregate["face_recognition_enabled"])
+
+        self.assertIn(
+            "face_recognition_unavailable",
+            [row.get("type") for row in sessions[0]["events"]],
+            "the reason was not recorded as a session event",
+        )
+        # `degraded` is a runtime flag the worker clears when the session ends, so the
+        # durable proof is the published pipeline_state it emitted while running.
+        degraded_states = [
+            event["payload"]
+            for event in manager.recent_events(limit=200)
+            if event.get("type") == "pipeline_state" and event["payload"].get("degraded")
+        ]
+        self.assertTrue(
+            any("face_recognition_unavailable" in str(s.get("degraded_reason")) for s in degraded_states),
+            "no pipeline_state event reported the missing face recogniser",
         )
 
 

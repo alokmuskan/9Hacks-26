@@ -1,76 +1,15 @@
 import importlib
 import json
 import re
-import sys
 import tempfile
 import threading
-import types
 import unittest
 from datetime import UTC
 from pathlib import Path
 from unittest import mock
 
-import numpy as np
-
 import common
-
-
-def _make_cv2_stub():
-    stub = types.ModuleType("cv2")
-    stub.CAP_V4L2 = 200
-    stub.CAP_ANY = 0
-    stub.CAP_FFMPEG = 1900
-    stub.CAP_PROP_BUFFERSIZE = 38
-    stub.CAP_PROP_FRAME_WIDTH = 3
-    stub.CAP_PROP_FRAME_HEIGHT = 4
-    stub.FONT_HERSHEY_SIMPLEX = 0
-    stub.LINE_AA = 16
-    stub.WINDOW_NORMAL = 0
-    stub.INTER_LINEAR = 1
-    stub.INTER_AREA = 3
-    stub.COLOR_BGR2RGB = 4
-    stub.IMWRITE_JPEG_QUALITY = 1
-    stub.cvtColor = lambda frame, _mode: frame
-    stub.resize = lambda frame, *_args, **_kwargs: frame
-    stub.rectangle = lambda *_args, **_kwargs: None
-    stub.addWeighted = lambda *_args, **_kwargs: None
-    stub.putText = lambda *_args, **_kwargs: None
-    stub.polylines = lambda *_args, **_kwargs: None
-    stub.line = lambda *_args, **_kwargs: None
-    stub.circle = lambda *_args, **_kwargs: None
-    stub.getTextSize = lambda text, *_args, **_kwargs: ((len(text) * 8, 12), 2)
-    stub.imencode = lambda _ext, _frame, _params=None: (True, np.zeros(4, dtype=np.uint8))
-    stub.imshow = lambda *_args, **_kwargs: None
-    stub.waitKey = lambda *_args, **_kwargs: -1
-    stub.namedWindow = lambda *_args, **_kwargs: None
-    stub.destroyAllWindows = lambda: None
-    stub.setLogLevel = lambda *_args, **_kwargs: None
-    stub.VideoCapture = lambda *_args, **_kwargs: None
-    return stub
-
-
-def _install_stubs():
-    if "cv2" not in sys.modules:
-        sys.modules["cv2"] = _make_cv2_stub()
-
-    if "insightface" not in sys.modules:
-        insightface_stub = types.ModuleType("insightface")
-        app_stub = types.ModuleType("insightface.app")
-
-        class _FaceAnalysis:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def prepare(self, *args, **kwargs):
-                pass
-
-            def get(self, *args, **kwargs):
-                return []
-
-        app_stub.FaceAnalysis = _FaceAnalysis
-        insightface_stub.app = app_stub
-        sys.modules["insightface"] = insightface_stub
-        sys.modules["insightface.app"] = app_stub
+from _stubs import install as _install_stubs
 
 
 class SharedHelperTests(unittest.TestCase):

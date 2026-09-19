@@ -54,7 +54,7 @@ ignore = [
 "ai-surveillance/*" = ["INP001"]
 
 [lint.isort]
-known-first-party = ["common", "main", "server", "object_detection", "scene_memory"]
+known-first-party = ["common", "main", "server", "object_detection", "scene_memory", "_stubs"]
 
 [format]
 quote-style = "double"
