@@ -157,3 +157,25 @@
     grid-template-columns: 1fr;
   }
 }
+
+@media (max-width: 640px) {
+  .live-viewport {
+    min-height: 0;
+    height: 56vw;
+    max-height: 420px;
+  }
+
+  .controls-row .btn-primary,
+  .controls-row .btn-secondary,
+  .controls-row .btn-danger {
+    flex: 1 1 140px;
+  }
+
+  .counts-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .count-box strong {
+    font-size: 1.05rem;
+  }
+}

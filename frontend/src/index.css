@@ -185,9 +185,43 @@ textarea {
   font-size: 0.8rem;
 }
 
+/* Mobile: turn the touch targets up so tap accuracy stays comfortable. */
+@media (max-width: 640px) {
+  .btn-primary,
+  .btn-secondary,
+  .btn-danger {
+    min-height: 44px;
+  }
+}
+
 @media (max-width: 1100px) {
+  /* The fixed sidebar becomes a full-width top bar; the shell must stack
+     vertically or the 100%-wide sidebar pushes the page off-screen. */
+  .app-container {
+    flex-direction: column;
+  }
+
   .page-content {
     margin-left: 0;
     padding: 20px;
+  }
+}
+
+@media (max-width: 640px) {
+  .page-content {
+    padding: 14px 12px;
+  }
+
+  .page-title {
+    font-size: 1.45rem;
+  }
+
+  .page-subtitle {
+    font-size: 0.9rem;
+  }
+
+  .glass-panel {
+    padding: 14px;
+    border-radius: 12px;
   }
 }

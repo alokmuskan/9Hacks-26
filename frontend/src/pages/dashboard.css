@@ -82,3 +82,36 @@
   color: var(--text-muted);
   padding: 18px;
 }
+
+@media (max-width: 640px) {
+  .metric-card {
+    padding: 14px;
+  }
+
+  .metric-copy div {
+    font-size: 1.5rem;
+  }
+
+  /* Card-style event log: columns become stacked rows so nothing is clipped. */
+  .log-table thead {
+    display: none;
+  }
+
+  .log-table,
+  .log-table tbody,
+  .log-table tr,
+  .log-table td {
+    display: block;
+  }
+
+  .log-table tr {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    padding: 10px 2px;
+  }
+
+  .log-table td {
+    padding: 3px 0;
+    border-bottom: 0;
+    overflow-wrap: anywhere;
+  }
+}

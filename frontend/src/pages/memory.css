@@ -42,3 +42,14 @@
     grid-template-columns: 1fr;
   }
 }
+
+@media (max-width: 640px) {
+  .lookup-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .lookup-row .field {
+    width: 100%;
+  }
+}
