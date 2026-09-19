@@ -199,7 +199,7 @@ class MetricsLogWriteIntegrityTests(unittest.TestCase):
             self.main.METRICS_LOG_PATH = path
             try:
                 good = json.dumps({"timestamp_utc": self.main._iso(), "event_type": "ok"})
-                path.write_text(f"{good}\n" '{"broken": \n' f"{good}\n", encoding="utf-8")
+                path.write_text(f"{good}\n" + '{"broken": \n' + f"{good}\n", encoding="utf-8")
 
                 before = self.main._metrics_parse_errors()
                 rows = self.main._load_metric_events()

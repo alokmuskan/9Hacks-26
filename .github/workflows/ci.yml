@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The backend suite deliberately stubs cv2 and insightface, so CI does not need the
+# full computer-vision stack (insightface, ultralytics, onnxruntime, faiss). numpy,
+# pillow, fastapi and httpx are the only real imports; torch is used by one L2CS
+# decoding test, which skips itself when torch is absent.
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "22"
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "numpy>=1.26,<3" "pillow>=11,<12" fastapi httpx
+
+      # CPU-only wheel, so the full suite runs rather than skipping the L2CS test.
+      # Drop this step to make the job lighter; that test will report as skipped.
+      - name: Install torch (CPU)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run backend tests
+        run: python -m unittest discover -s tests -q
+
+      - name: Byte-compile every module
+        run: python -m compileall -q main.py server.py common.py scene_memory.py object_detection.py tests/ ai-surveillance/
+
+  lint:
+    name: Lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install linters
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy
+
+      - name: Ruff
+        run: ruff check .
+
+      # Configuration lives in mypy.ini. main.py is currently opted out there, with
+      # the reason and the remaining finding count documented in that file.
+      - name: Mypy
+        run: mypy
+
+  frontend:
+    name: Frontend tests and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build

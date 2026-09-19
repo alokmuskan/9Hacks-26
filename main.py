@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
+import platform
 import re
 import sys
 import threading
 import time
 from collections import Counter, defaultdict, deque
+from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
+
 import common
 from object_detection import DualYoloDetector, find_latest_custom_model
 from scene_memory import SceneMemoryManager
@@ -32,7 +36,15 @@ def _load_env_file() -> None:
 _load_env_file()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-_DEFAULT_CAMERA_SOURCE = "/dev/video42" if sys.platform.startswith("linux") else "0"
+# /dev/video42 is a v4l2loopback virtual device: it only exists when something
+# (OBS, ffmpeg) is feeding it. Prefer it when present so an existing virtual-camera
+# setup keeps working, otherwise fall back to the first real device.
+_LINUX_VIRTUAL_CAMERA = "/dev/video42"
+_DEFAULT_CAMERA_SOURCE = (
+    _LINUX_VIRTUAL_CAMERA
+    if sys.platform.startswith("linux") and Path(_LINUX_VIRTUAL_CAMERA).exists()
+    else "0"
+)
 CAMERA_SOURCE = os.getenv("AI_STUDIO_CAM_CAMERA_INDEX", _DEFAULT_CAMERA_SOURCE).strip()
 DB_PATH = Path("face_db.npz")
 METRICS_LOG_PATH = Path(common.METRICS_FILENAME)
@@ -40,10 +52,10 @@ REPORT_TXT_PATH = Path("report.txt")
 UNKNOWN_INCIDENTS_DIR = Path("unknown_incidents")
 MEMORY_DIR = Path("memory")
 CUSTOM_MODEL_POINTER_PATH = Path("custom_model_path.txt")
-DEFAULT_GENERAL_MODEL = os.getenv(
-    "AI_STUDIO_GENERAL_YOLO_MODEL",
-    ".references/AI-Studio-Cam-(On-Hold)/models/yolov8n.pt",
-)
+# Ultralytics downloads `yolov8n.pt` on first use, so this default works on a clean
+# checkout. The previous default pointed into `.references/`, a git-ignored path
+# belonging to an older project, which made it a dead reference for every user.
+DEFAULT_GENERAL_MODEL = os.getenv("AI_STUDIO_GENERAL_YOLO_MODEL", "yolov8n.pt")
 
 ENROLL_SAMPLES = 25
 ENROLL_CAPTURE_INTERVAL_SEC = 0.25
@@ -94,11 +106,11 @@ class FaceDB:
     counts: np.ndarray
 
     @classmethod
-    def empty(cls) -> "FaceDB":
+    def empty(cls) -> FaceDB:
         return cls([], np.empty((0, 0), np.float32), np.empty((0,), np.int32))
 
     @classmethod
-    def load(cls) -> "FaceDB":
+    def load(cls) -> FaceDB:
         if not DB_PATH.exists():
             return cls.empty()
         d = np.load(DB_PATH, allow_pickle=False)
@@ -186,7 +198,7 @@ def _session_id(prefix: str) -> str:
 def _timeline_bar(count: int, max_count: int, width: int = 12) -> str:
     if count <= 0 or max_count <= 0:
         return ""
-    n = max(1, int(round((count / max_count) * width)))
+    n = max(1, round((count / max_count) * width))
     return "█" * n
 
 
@@ -197,16 +209,32 @@ def _save_unknown_snapshot(
     ts_local = ts_utc.astimezone()
     base = ts_local.strftime("unknown_%Y-%m-%d_%H-%M-%S")
 
-    candidate = UNKNOWN_INCIDENTS_DIR / f"{base}.jpg"
-    suffix = 1
-    while candidate.exists():
-        candidate = UNKNOWN_INCIDENTS_DIR / f"{base}_{suffix:02d}.jpg"
-        suffix += 1
-
     snap = frame.copy()
     for bbox in unknown_bboxes:
         _bracket_box(snap, bbox, AMBER, thickness=2)
-    cv2.imwrite(str(candidate), snap)
+
+    # Reserving the name and writing the image must be one step. Checking
+    # `exists()` and writing afterwards let two concurrent writers pick the same
+    # filename, so one capture silently overwrote the other.
+    with common.process_lock(UNKNOWN_INCIDENTS_DIR / "incidents"):
+        candidate: Path | None = None
+        for suffix in range(1000):
+            name = f"{base}.jpg" if suffix == 0 else f"{base}_{suffix:02d}.jpg"
+            path = UNKNOWN_INCIDENTS_DIR / name
+            try:
+                handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                continue
+            except OSError:
+                break
+            os.close(handle)
+            candidate = path
+            break
+
+        if candidate is None:
+            candidate = UNKNOWN_INCIDENTS_DIR / f"{base}_overflow.jpg"
+
+        cv2.imwrite(str(candidate), snap)
 
     pruned = _prune_unknown_incidents()
     if pruned:
@@ -289,6 +317,18 @@ def _print_runtime_help() -> None:
     print("  h  print this help")
 
 
+INSIGHTFACE_MIN_VERSION = (0, 7, 3)
+
+
+def _insightface_version() -> str:
+    try:
+        import insightface
+
+        return str(getattr(insightface, "__version__", "") or "").strip()
+    except Exception:
+        return ""
+
+
 def _make_face_analysis(model: str, providers: list[str]) -> FaceAnalysis:
     try:
         return FaceAnalysis(
@@ -297,7 +337,20 @@ def _make_face_analysis(model: str, providers: list[str]) -> FaceAnalysis:
             allowed_modules=["detection", "recognition"],
         )
     except TypeError:
+        pass
+    try:
         return FaceAnalysis(name=model, providers=providers)
+    except TypeError as exc:
+        # InsightFace 0.2.x had `FaceAnalysis(name, root=...)` and no `providers`
+        # argument, so both attempts above fail. Without this the user sees a bare
+        # TypeError from deep inside the stack and has nothing to act on.
+        installed = _insightface_version() or "unknown"
+        required = ".".join(str(part) for part in INSIGHTFACE_MIN_VERSION)
+        raise RuntimeError(
+            f"insightface {installed} is too old: FaceAnalysis(providers=...) "
+            f"requires insightface >= {required}. Run `pixi install` (pixi.toml pins "
+            f"insightface>=0.7.3,<0.8) or `pip install -U insightface`."
+        ) from exc
 
 
 def _repair_insightface_model_layout(model: str) -> bool:
@@ -323,10 +376,8 @@ def _repair_insightface_model_layout(model: str) -> bool:
         item.replace(target)
         moved_any = True
 
-    try:
+    with suppress(OSError):
         nested_dir.rmdir()
-    except OSError:
-        pass
 
     if moved_any:
         print(f"Repaired InsightFace model layout for '{model}' in {model_dir}")
@@ -525,10 +576,10 @@ def _detect(
             _l2(np.asarray(f.normed_embedding, np.float32)),
             float(getattr(f, "det_score", 1.0)),
             (
-                np.asarray(getattr(f, "kps"), np.float32) * inv
+                np.asarray(f.kps, np.float32) * inv
                 if getattr(f, "kps", None) is not None
                 else (
-                    np.asarray(getattr(f, "landmark"), np.float32) * inv
+                    np.asarray(f.landmark, np.float32) * inv
                     if getattr(f, "landmark", None) is not None
                     else None
                 )
@@ -573,9 +624,9 @@ def _select_gaze360_weight_path(
             if any(tok in name for tok in tokens):
                 arch_filtered.append(path)
         if arch_filtered:
-            return sorted(arch_filtered, key=lambda p: p.name.lower())[0]
+            return min(arch_filtered, key=lambda p: p.name.lower())
 
-    return sorted(filtered, key=lambda p: p.name.lower())[0]
+    return min(filtered, key=lambda p: p.name.lower())
 
 
 def _resolve_l2cs_weights_path(
@@ -643,10 +694,10 @@ def _expand_bbox_by_ratio(
     bh = max(y2 - y1, 1.0)
     pad_x = bw * ratio
     pad_y = bh * ratio
-    ex1 = max(0, int(round(x1 - pad_x)))
-    ey1 = max(0, int(round(y1 - pad_y)))
-    ex2 = min(max(frame_w - 1, 0), int(round(x2 + pad_x)))
-    ey2 = min(max(frame_h - 1, 0), int(round(y2 + pad_y)))
+    ex1 = max(0, round(x1 - pad_x))
+    ey1 = max(0, round(y1 - pad_y))
+    ex2 = min(max(frame_w - 1, 0), round(x2 + pad_x))
+    ey2 = min(max(frame_h - 1, 0), round(y2 + pad_y))
     return ex1, ey1, ex2, ey2
 
 
@@ -705,8 +756,7 @@ def _normalize_l2cs_state_dict(payload: Any) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
     for key, value in state_dict.items():
         k = str(key)
-        if k.startswith("module."):
-            k = k[len("module.") :]
+        k = k.removeprefix("module.")
         normalized[k] = value
     return normalized
 
@@ -718,10 +768,10 @@ def _infer_l2cs_arch_from_state_dict(state_dict: dict[str, Any]) -> str | None:
         return None
 
     width = int(fc_shape[1])
-    keyset = {str(k) for k in state_dict.keys()}
+    keyset = {str(k) for k in state_dict}
     if width == 512:
         # Distinguish 18 vs 34 by existence of deeper stage block indexes.
-        if any(k.startswith("layer1.2.") or k.startswith("layer2.3.") or k.startswith("layer3.5.") for k in keyset):
+        if any(k.startswith(("layer1.2.", "layer2.3.", "layer3.5.")) for k in keyset):
             return "ResNet34"
         return "ResNet18"
 
@@ -748,8 +798,8 @@ def _gaze_endpoint_from_pitch_yaw(
     # Match L2CS draw math: dx uses pitch, dy uses yaw.
     dx = -length * float(np.sin(pitch) * np.cos(yaw))
     dy = -length * float(np.sin(yaw))
-    gx = int(round(cx + dx))
-    gy = int(round(cy + dy))
+    gx = round(cx + dx)
+    gy = round(cy + dy)
     gx = int(np.clip(gx, 0, max(frame_w - 1, 0)))
     gy = int(np.clip(gy, 0, max(frame_h - 1, 0)))
     return gx, gy
@@ -1246,7 +1296,7 @@ class _BehaviorTracker:
             "target_object": target_object,
             "previous_target": previous_target,
             "duration_sec": round(max(duration_sec, 0.0), 3),
-            "event_time_utc": _iso(datetime.fromtimestamp(now_ts, tz=timezone.utc)),
+            "event_time_utc": _iso(datetime.fromtimestamp(now_ts, tz=UTC)),
         }
         self.events_count += 1
         return payload
@@ -1290,7 +1340,7 @@ class _BehaviorTracker:
             self._accumulate(person, state, now_ts)
 
             target = observations.get(person)
-            state.history.append(target if target else None)
+            state.history.append(target or None)
             state.present = True
             state.last_seen_ts = now_ts
             state.last_update_ts = now_ts
@@ -1422,8 +1472,8 @@ def _phrase_for_attention(person: str, obj: str, seconds: float) -> str:
     if seconds < 30.0:
         return f"{person} briefly checked a {obj}."
     if seconds < 120.0:
-        return f"{person} looked at a {obj} for about {int(round(seconds))} seconds."
-    minutes = max(int(round(seconds / 60.0)), 1)
+        return f"{person} looked at a {obj} for about {round(seconds)} seconds."
+    minutes = max(round(seconds / 60.0), 1)
     return f"{person} looked at a {obj} for {minutes} minutes."
 
 
@@ -1601,7 +1651,9 @@ def _build_llm_context(question: str, lookback_minutes: int = 30) -> dict[str, A
 
 
 def _query_groq(question: str, context: dict[str, Any]) -> str | None:
-    api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq_api_key")
+    # Both spellings are supported on purpose: `.env.example` documents the lowercase
+    # form, so dropping it would break existing setups.
+    api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq_api_key")  # noqa: SIM112
     if not api_key:
         return None
     try:
@@ -2303,7 +2355,13 @@ def cmd_recognize(
 ) -> None:
     db = FaceDB.load()
     if not db.names:
-        raise RuntimeError("No enrolled identities. Run:  enroll --name <n>")
+        # Fail fast in the CLI: an interactive session with no identities would only
+        # ever report Unknown, so this is a setup error, not a runtime condition.
+        # The API deliberately degrades instead (a service should still serve frames).
+        raise RuntimeError(
+            "No enrolled identities. Run `pixi run python main.py enroll --name <name>` "
+            "first, then start monitoring again."
+        )
 
     session_id = _session_id("recognize")
     start_dt = _now_utc()
@@ -2746,14 +2804,18 @@ def cmd_recognize(
                         WHITE,
                     ),
                     (
-                        f"Known:{known_detections} Unknown:{unknown_detections} "
-                        f"G:{'ON' if state['general']['enabled'] else 'OFF'} "
-                        f"C:{'ON' if state['custom']['enabled'] else 'OFF'}",
+                        (
+                            f"Known:{known_detections} Unknown:{unknown_detections} "
+                            f"G:{'ON' if state['general']['enabled'] else 'OFF'} "
+                            f"C:{'ON' if state['custom']['enabled'] else 'OFF'}"
+                        ),
                         (180, 180, 180),
                     ),
                     (
-                        f"Gaze:{gaze_status} L:{'Y' if gaze_model_loaded else 'N'} "
-                        f"Calls:{gaze_inference_calls}",
+                        (
+                            f"Gaze:{gaze_status} L:{'Y' if gaze_model_loaded else 'N'} "
+                            f"Calls:{gaze_inference_calls}"
+                        ),
                         (170, 170, 170),
                     ),
                     (
@@ -3009,7 +3071,9 @@ def cmd_list() -> None:
         print("No enrolled identities found.")
         return
     print(f"Database: {DB_PATH}")
-    for name, count in zip(db.names, db.counts):
+    # strict=False: a hand-edited or truncated face_db.npz should list what it has
+    # rather than crash a diagnostic command.
+    for name, count in zip(db.names, db.counts, strict=False):
         print(f"  {name}: {int(count)} samples")
 
 
@@ -3055,7 +3119,7 @@ def cmd_train_objects(
     )
 
     save_dir = (
-        Path(getattr(train_result, "save_dir"))
+        Path(train_result.save_dir)
         if getattr(train_result, "save_dir", None)
         else Path(getattr(getattr(yolo, "trainer", None), "save_dir", project))
     )
@@ -3643,7 +3707,7 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
                 weight = _safe_float(row[1], 0.0)
                 if weight <= 0.0:
                     continue
-                behavior_object_counter[str(row[0])] += max(1, int(round(weight)))
+                behavior_object_counter[str(row[0])] += max(1, round(weight))
 
         hist_event_count += _safe_int(r.get("events_total_count"), len(r.get("events", [])))
         label_counter.update(r.get("label_counts", {}))
@@ -3730,7 +3794,7 @@ def _aggregate_report_data(events: list[dict[str, Any]], db: FaceDB) -> dict[str
             "total_samples": int(np.sum(db.counts)) if len(db.counts) else 0,
             "identities": [
                 {"name": name, "samples": int(count)}
-                for name, count in zip(db.names, db.counts)
+                for name, count in zip(db.names, db.counts, strict=False)
             ],
         },
         "metrics": {
@@ -3814,9 +3878,7 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
         or (latest_agg.get("session_id") if isinstance(latest_agg, dict) else None)
         or "N/A"
     )
-    if isinstance(session_id, str) and (
-        session_id.startswith("legacy-") or session_id.startswith("recognize-")
-    ):
+    if isinstance(session_id, str) and session_id.startswith(("legacy-", "recognize-")):
         fallback_dt = _parse_iso(
             (latest.get("start_utc") if isinstance(latest, dict) else None)
             or (latest.get("end_utc") if isinstance(latest, dict) else None)
@@ -4029,15 +4091,21 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
             f"Peak Simultaneous Faces : {_safe_int(hist.get('peak_simultaneous_faces'), 0)}",
             f"Face Throughput         : {_safe_float(hist.get('faces_per_sec'), 0.0):.2f} faces/s",
             f"Object Detections Total : {_safe_int(hist.get('object_detections_total'), 0)}",
-            f"Object Gen/Custom       : {_safe_int(hist.get('object_general_detections'), 0)}/"
-            f"{_safe_int(hist.get('object_custom_detections'), 0)}",
+            (
+                f"Object Gen/Custom       : {_safe_int(hist.get('object_general_detections'), 0)}/"
+                f"{_safe_int(hist.get('object_custom_detections'), 0)}"
+            ),
             f"Object Avg Confidence   : {_safe_float(hist.get('object_avg_confidence'), 0.0):.4f}",
-            f"Memory Snapshots A/M    : {_safe_int(hist.get('memory_auto_snapshots'), 0)}/"
-            f"{_safe_int(hist.get('memory_manual_snapshots'), 0)}",
+            (
+                f"Memory Snapshots A/M    : {_safe_int(hist.get('memory_auto_snapshots'), 0)}/"
+                f"{_safe_int(hist.get('memory_manual_snapshots'), 0)}"
+            ),
             f"Memory Queries Total    : {_safe_int(hist.get('memory_queries_total'), 0)}",
             f"Chat Queries Total      : {_safe_int(hist.get('chat_queries_total'), 0)}",
-            f"Chat Queries Hit/LLM    : {_safe_int(hist.get('chat_queries_hit'), 0)}/"
-            f"{_safe_int(hist.get('chat_queries_llm'), 0)}",
+            (
+                f"Chat Queries Hit/LLM    : {_safe_int(hist.get('chat_queries_hit'), 0)}/"
+                f"{_safe_int(hist.get('chat_queries_llm'), 0)}"
+            ),
             f"Summary Queries Total   : {_safe_int(hist.get('summary_queries_total'), 0)}",
             f"Behavior Interactions   : {_safe_int(hist.get('behavior_interactions_total'), 0)}",
             f"Behavior Attention (s)  : {_safe_float(hist.get('behavior_attention_total_sec'), 0.0):.1f}",
@@ -4067,6 +4135,270 @@ def cmd_report() -> None:
     print("Report files generated:")
     print(f"  Metrics JSONL: {METRICS_LOG_PATH}")
     print(f"  ASCII: {REPORT_TXT_PATH}")
+
+
+# ── Environment readiness ─────────────────────────────────────────────────────
+# (status, name, detail) rows. "fail" items block a monitoring session; "warn"
+# items disable one feature but let the pipeline run.
+_REQUIRED_MODULES = ("numpy", "cv2", "PIL", "onnxruntime", "insightface", "ultralytics", "torch")
+
+# Importable is not the same as usable: the pipeline calls APIs that only exist in
+# recent releases, so a module can import cleanly and still break the first session.
+# Only lower bounds are enforced here -- falling below a pinned minimum is a proven
+# break, whereas exceeding an upper bound is a forward-looking risk.
+_MIN_MODULE_VERSIONS: dict[str, tuple[tuple[int, ...], str]] = {
+    "insightface": (INSIGHTFACE_MIN_VERSION, "FaceAnalysis(providers=...) requires 0.7.x"),
+    "numpy": ((1, 26), "pixi.toml pins numpy >=1.26,<3"),
+    "torch": ((2, 5), "pixi.toml pins torch >=2.5,<3"),
+    "ultralytics": ((8, 4), "pixi.toml pins ultralytics >=8.4,<9"),
+    "onnxruntime": ((1, 17), "required for the InsightFace execution providers"),
+    "PIL": ((11,), "pixi.toml pins pillow >=11,<12"),
+}
+
+
+def _parse_version(value: Any) -> tuple[int, ...]:
+    match = re.match(r"\s*(\d+(?:\.\d+)*)", str(value or ""))
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(1).split("."))
+_OPTIONAL_MODULES = {
+    "l2cs": "gaze estimation",
+    "gdown": "gaze weight auto-download",
+    "groq": "LLM chat fallback",
+    "faiss": "vector scene search",
+    "open_clip": "vector scene search",
+    "dotenv": ".env loading",
+    "fastapi": "API server",
+    "uvicorn": "API server",
+}
+
+
+def _check_import(name: str) -> tuple[bool, str]:
+    try:
+        module = importlib.import_module(name)
+    except Exception as exc:
+        return False, f"not importable ({type(exc).__name__})"
+    version = str(getattr(module, "__version__", "") or "").strip()
+    return True, version or "installed"
+
+
+def _dir_summary(path: Path, pattern: str) -> str:
+    if not path.exists():
+        return f"{path} (absent)"
+    try:
+        count = sum(1 for _ in path.glob(pattern))
+    except OSError:
+        count = 0
+    return f"{path} ({count} file(s))"
+
+
+def collect_environment_report(check_camera: bool = False) -> list[tuple[str, str, str]]:
+    """Describe what this machine can actually run. Pure apart from the optional
+    camera probe, so it is safe to call from tests."""
+    rows: list[tuple[str, str, str]] = []
+
+    python_version = platform.python_version()
+    pinned = python_version.startswith("3.11")
+    rows.append(
+        (
+            "ok" if pinned else "warn",
+            "Python",
+            f"{python_version} (pixi workspace pins 3.11)"
+            if not pinned
+            else python_version,
+        )
+    )
+
+    for name in _REQUIRED_MODULES:
+        available, detail = _check_import(name)
+        status = "ok" if available else "fail"
+        minimum = _MIN_MODULE_VERSIONS.get(name)
+        if available and minimum:
+            parsed = _parse_version(detail)
+            if parsed and parsed < minimum[0]:
+                status = "fail"
+                want = ".".join(str(part) for part in minimum[0])
+                detail = f"{detail} is too old (need >= {want}: {minimum[1]})"
+        rows.append((status, f"module:{name}", detail))
+
+    for name, purpose in _OPTIONAL_MODULES.items():
+        available, detail = _check_import(name)
+        rows.append(
+            ("ok" if available else "warn", f"module:{name}", f"{detail} - {purpose}")
+        )
+
+    general_path = _resolve_general_model_path(None)
+    rows.append(
+        (
+            "ok" if Path(general_path).exists() else "warn",
+            "general YOLO",
+            f"{general_path} "
+            + ("present" if Path(general_path).exists() else "missing (Ultralytics downloads it on first run)"),
+        )
+    )
+
+    custom_path = _load_default_custom_model_path()
+    rows.append(
+        ("ok" if custom_path else "warn", "custom YOLO", custom_path or "not configured"),
+    )
+
+    gaze_weights = Path(GAZE_WEIGHTS_DEFAULT)
+    rows.append(
+        (
+            "ok" if gaze_weights.exists() else "warn",
+            "gaze weights",
+            f"{gaze_weights} "
+            + ("present" if gaze_weights.exists() else "missing (see `bootstrap`)"),
+        )
+    )
+
+    db = FaceDB.load()
+    rows.append(
+        (
+            "ok" if db.names else "warn",
+            "enrolled identities",
+            f"{len(db.names)} identity(ies) in {DB_PATH}"
+            if db.names
+            else f"none in {DB_PATH} - run `enroll --name <name>`",
+        )
+    )
+
+    rows.append(("ok", "memory store", _dir_summary(MEMORY_DIR / "snapshots", "*.jpg")))
+    rows.append(("ok", "incidents", _dir_summary(UNKNOWN_INCIDENTS_DIR, "*.jpg")))
+    rows.append(
+        (
+            "ok",
+            "retention caps",
+            (
+                f"auto snapshots {common.MEMORY_MAX_AUTO_SNAPSHOTS}, "
+                f"incidents {common.UNKNOWN_INCIDENT_MAX_FILES}, "
+                f"metrics {common.METRICS_MAX_BYTES} B x {common.METRICS_BACKUP_COUNT} backups"
+            ),
+        )
+    )
+
+    lock_backend = common.lock_backend_name()
+    lock_timeouts = common.lock_timeouts()
+    rows.append(
+        (
+            "ok" if lock_backend != "none" and lock_timeouts == 0 else "warn",
+            "cross-process lock",
+            f"backend {lock_backend}"
+            + (
+                ", no timeouts"
+                if lock_timeouts == 0
+                else f", {lock_timeouts} timeout(s): work proceeded without the lock"
+            )
+            + (
+                ""
+                if lock_backend != "none"
+                else " - metrics and snapshot writes are only thread-safe here"
+            ),
+        )
+    )
+
+    rows.append(("ok", "camera source", f"{CAMERA_SOURCE} (from AI_STUDIO_CAM_CAMERA_INDEX)"))
+    if check_camera:
+        try:
+            cap = _open_camera()
+            cap.release()
+            rows.append(("ok", "camera probe", "opened successfully"))
+        except Exception as exc:
+            rows.append(("fail", "camera probe", str(exc)))
+
+    return rows
+
+
+def cmd_doctor(check_camera: bool = False) -> None:
+    rows = collect_environment_report(check_camera=check_camera)
+    symbols = {"ok": "[ ok ]", "warn": "[warn]", "fail": "[FAIL]"}
+
+    print("Environment readiness")
+    print("-" * 72)
+    for status, name, detail in rows:
+        print(f"{symbols.get(status, '[ ?? ]')} {name:<20} {detail}")
+
+    failures = [name for status, name, _ in rows if status == "fail"]
+    warnings = [name for status, name, _ in rows if status == "warn"]
+    print("-" * 72)
+    print(f"{len(rows) - len(failures) - len(warnings)} ok, {len(warnings)} warning(s), {len(failures)} failure(s)")
+
+    if failures:
+        print("Blocking: " + ", ".join(failures))
+        print("These must be installed before monitoring can start. See the README install steps.")
+    elif warnings:
+        print("The pipeline can start; each warning above disables one feature only.")
+    else:
+        print("Everything the pipeline needs is present.")
+
+    if failures:
+        sys.exit(1)
+
+
+def cmd_bootstrap(download_gaze: bool = True) -> None:
+    """Create runtime directories and fetch the model assets a session needs."""
+    print("Bootstrapping runtime assets")
+    print("-" * 72)
+
+    for directory in (MEMORY_DIR / "snapshots", UNKNOWN_INCIDENTS_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
+        print(f"[ ok ] directory  {directory}")
+
+    problems: list[str] = []
+
+    general_path = _resolve_general_model_path(None)
+    if Path(general_path).exists():
+        print(f"[ ok ] general YOLO already present: {general_path}")
+    else:
+        try:
+            from ultralytics import YOLO
+
+            YOLO("yolov8n.pt")
+            print(f"[ ok ] general YOLO ready: {general_path}")
+        except Exception as exc:
+            problems.append(f"general YOLO weights unavailable ({exc})")
+            print(f"[warn] general YOLO could not be prepared: {exc}")
+
+    gaze_weights = Path(GAZE_WEIGHTS_DEFAULT)
+    if gaze_weights.exists():
+        print(f"[ ok ] gaze weights already present: {gaze_weights}")
+    elif not download_gaze:
+        print(f"[warn] gaze weights missing: {gaze_weights} (download skipped)")
+    else:
+        try:
+            runtime = _load_gaze_runtime(
+                gaze_arch=GAZE_ARCH_DEFAULT,
+                gaze_weights=str(gaze_weights),
+                gaze_weights_source=GAZE_WEIGHTS_SOURCE_DEFAULT,
+                gaze_auto_download=True,
+            )
+        except Exception as exc:
+            runtime = None
+            print(f"[warn] gaze weights could not be downloaded: {exc}")
+        if runtime is not None and Path(str(runtime.get("weights_path", gaze_weights))).exists():
+            print(f"[ ok ] gaze weights ready: {runtime.get('weights_path')}")
+        else:
+            problems.append("gaze weights unavailable")
+            print(
+                "[warn] gaze weights still missing. Place L2CSNet_gaze360.pkl in models/ "
+                "manually; gaze stays disabled until then."
+            )
+
+    db = FaceDB.load()
+    if db.names:
+        print(f"[ ok ] enrolled identities: {len(db.names)}")
+    else:
+        problems.append("no enrolled identities")
+        print("[warn] no enrolled identities yet.")
+
+    print("-" * 72)
+    print("Next steps:")
+    print("  1. pixi run python main.py doctor            # confirm the environment")
+    print("  2. pixi run python main.py enroll --name <your name>")
+    print("  3. pixi run python main.py recognize")
+
+    if problems:
+        print("Unresolved: " + "; ".join(problems))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -4178,6 +4510,18 @@ def main() -> None:
 
     sub.add_parser("list", help="List enrolled identities")
     sub.add_parser("report", help="Generate metrics/report files")
+    p_doc = sub.add_parser("doctor", help="Report which parts of the pipeline can run here")
+    p_doc.add_argument(
+        "--check-camera",
+        action="store_true",
+        help="Also probe the configured camera (opens and releases the device)",
+    )
+    p_boot = sub.add_parser("bootstrap", help="Create runtime directories and fetch model assets")
+    p_boot.add_argument(
+        "--no-gaze-download",
+        action="store_true",
+        help="Skip the L2CS gaze-weight download",
+    )
 
     args = parser.parse_args(sys.argv[1:] or ["recognize"])
     {
@@ -4216,6 +4560,8 @@ def main() -> None:
         "chat": lambda: cmd_chat(args.question),
         "list": cmd_list,
         "report": cmd_report,
+        "doctor": lambda: cmd_doctor(args.check_camera),
+        "bootstrap": lambda: cmd_bootstrap(download_gaze=not args.no_gaze_download),
     }.get(args.cmd, parser.print_help)()
 
 

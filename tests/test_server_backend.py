@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import time
 import unittest
+from typing import ClassVar
 from unittest import mock
 
 import numpy as np
@@ -212,7 +213,7 @@ class ServerBackendTests(unittest.TestCase):
         manager = self.server.PipelineManager()
 
         class _FakeDB:
-            names = []
+            names: ClassVar[list[str]] = []
 
         class _FakeFaceDB:
             @staticmethod

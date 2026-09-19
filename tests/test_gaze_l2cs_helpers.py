@@ -6,6 +6,17 @@ from pathlib import Path
 
 import numpy as np
 
+# torch is a real (un-stubbed) dependency of the L2CS decoding path. Probe once so
+# the one test that needs it can skip instead of failing on a machine without it
+# (for example a minimal CI job).
+try:
+    import torch
+
+    _TORCH_AVAILABLE = True
+except ImportError:  # pragma: no cover - depends on the environment
+    torch = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
+
 
 def _install_stubs():
     import sys
@@ -247,10 +258,10 @@ class GazeL2CSHelperTests(unittest.TestCase):
         self.assertGreater(ex2, ex1)
         self.assertGreater(ey2, ey1)
 
+    @unittest.skipUnless(_TORCH_AVAILABLE, "torch is needed for this L2CS decoding test")
     def test_decode_pitch_yaw_converts_to_radians_once(self):
         _install_stubs()
         main = importlib.import_module("main")
-        import torch
 
         pitch_logits = torch.linspace(-1.5, 1.5, steps=90).unsqueeze(0)
         yaw_logits = torch.linspace(1.0, -1.0, steps=90).unsqueeze(0)

@@ -8,8 +8,10 @@ import re
 import threading
 import time
 from collections import Counter, deque
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Literal
@@ -42,14 +44,14 @@ CHAT_SESSION_TTL_SEC = 30 * 60
 CHAT_CONFIRM_TTL_SEC = 2 * 60
 CHAT_HISTORY_MAX_TURNS = 10
 CHAT_CONTEXT_LOOKBACK_MIN = 30
-GAZE_ARCH_DEFAULT = "ResNet50"
+# Backbones L2CS-Net can instantiate. The CLI restricts `--gaze-arch`, the API used
+# to silently rewrite whatever the caller asked for.
+GazeArch = Literal["ResNet18", "ResNet34", "ResNet50", "ResNet101", "ResNet152"]
+GAZE_ARCH_DEFAULT: GazeArch = "ResNet50"
 # Gaze scheduling defaults come from `common` so the CLI and the API schedule gaze
 # identically; the interval only adapts when the caller opts in.
 GAZE_INTERVAL_DEFAULT = common.GAZE_INTERVAL_DEFAULT
 GAZE_TARGET_FPS_DROP_DEFAULT = common.GAZE_TARGET_FPS_DROP_DEFAULT
-# Backbones L2CS-Net can instantiate. The CLI restricts `--gaze-arch`, the API used
-# to silently rewrite whatever the caller asked for.
-GazeArch = Literal["ResNet18", "ResNet34", "ResNet50", "ResNet101", "ResNet152"]
 
 METRICS_PATH = Path(common.METRICS_FILENAME)
 MEMORY_DIR = Path("memory")
@@ -201,15 +203,11 @@ class EventHub:
             subs = list(self._subscribers)
         for q in subs:
             if q.full():
-                try:
+                with suppress(asyncio.QueueEmpty):
                     q.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            try:
+            # Dropping oldest already attempted; skip if still full.
+            with suppress(asyncio.QueueFull):
                 q.put_nowait(event)
-            except asyncio.QueueFull:
-                # Dropping oldest already attempted; skip if still full.
-                pass
 
 
 class MonitorStartRequest(BaseModel):
@@ -308,7 +306,7 @@ class PipelineManager:
             if phase == "starting":
                 now = _iso()
                 self._startup_started_utc = now
-                self._startup_deadline_utc = _iso(datetime.now(timezone.utc) + timedelta(seconds=STARTUP_TIMEOUT_SEC))
+                self._startup_deadline_utc = _iso(datetime.now(UTC) + timedelta(seconds=STARTUP_TIMEOUT_SEC))
                 self._startup_failure_reason = None
             elif phase == "failed":
                 self._startup_failure_reason = failure_reason or "startup_failed"
@@ -388,7 +386,7 @@ class PipelineManager:
                 started = _parse_iso(self._startup_started_utc)
                 if started is not None:
                     startup_elapsed_ms = max(
-                        int((datetime.now(timezone.utc) - started).total_seconds() * 1000.0),
+                        int((datetime.now(UTC) - started).total_seconds() * 1000.0),
                         0,
                     )
             last_seq = _safe_int(frame.get("sequence"), 0)
@@ -467,7 +465,7 @@ class PipelineManager:
             self._last_error = None
             self._startup_phase = "starting"
             self._startup_started_utc = _iso()
-            self._startup_deadline_utc = _iso(datetime.now(timezone.utc) + timedelta(seconds=STARTUP_TIMEOUT_SEC))
+            self._startup_deadline_utc = _iso(datetime.now(UTC) + timedelta(seconds=STARTUP_TIMEOUT_SEC))
             self._startup_failure_reason = None
             self._enroll = EnrollStatus()
             self._latest_session_summary = None
@@ -765,17 +763,14 @@ class PipelineManager:
                 )
         except Exception as exc:
             self._last_error = str(exc)
-            LOGGER.exception("Enrollment worker failed: %s", exc)
+            # logging.exception already includes the exception and traceback.
+            LOGGER.exception("Enrollment worker failed")
             self._publish_event("pipeline_state", {"error": str(exc)})
         finally:
-            try:
+            with suppress(Exception):
                 reader.close()
-            except Exception:
-                pass
-            try:
+            with suppress(Exception):
                 cap.release()
-            except Exception:
-                pass
             with self._lock:
                 if self._mode == "enroll":
                     self._mode = "idle"
@@ -853,7 +848,7 @@ class PipelineManager:
         except Exception as exc:
             startup_failed_reason = f"startup_init_error:{exc}"
             self._mark_startup_failed(startup_failed_reason)
-            LOGGER.exception("Monitor startup failed before frame loop: %s", exc)
+            LOGGER.exception("Monitor startup failed before frame loop")
             return
 
         behavior_tracker = core._BehaviorTracker()
@@ -917,7 +912,7 @@ class PipelineManager:
         visible_prev: set[str] = set()
         latest_active_subjects: list[dict[str, Any]] = []
         latest_object_labels: list[str] = []
-        start_dt = datetime.now(timezone.utc)
+        start_dt = datetime.now(UTC)
         start_ts = time.time()
         camera_failures = 0
         detector_error_seen = False
@@ -956,14 +951,10 @@ class PipelineManager:
                     camera_failures += 1
                     fail_threshold = STARTUP_CAMERA_FAILURE_THRESHOLD if not startup_ready else CAMERA_FAILURE_THRESHOLD
                     if camera_failures >= fail_threshold:
-                        try:
+                        with suppress(Exception):
                             reader.close()
-                        except Exception:
-                            pass
-                        try:
+                        with suppress(Exception):
                             cap.release()
-                        except Exception:
-                            pass
                         capture = self._attempt_camera_recovery(
                             startup=not startup_ready,
                             deadline_monotonic=startup_deadline_monotonic if not startup_ready else None,
@@ -1014,7 +1005,7 @@ class PipelineManager:
                 face_count = len(face_rows)
                 object_count = len(object_rows)
                 peak_simultaneous_faces = max(peak_simultaneous_faces, face_count)
-                timeline_key = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
+                timeline_key = datetime.now(UTC).astimezone().strftime("%H:%M:%S")
                 detection_timeline[timeline_key] = detection_timeline.get(timeline_key, 0) + face_count
                 object_detection_timeline[timeline_key] = object_detection_timeline.get(timeline_key, 0) + object_count
 
@@ -1084,7 +1075,7 @@ class PipelineManager:
                 if unknown_in_frame and (now_ts - last_unknown_alert_ts) >= core.UNKNOWN_ALERT_COOLDOWN_SEC:
                     unknown_alert_count += 1
                     last_unknown_alert_ts = now_ts
-                    snap = core._save_unknown_snapshot(frame, unknown_bboxes, datetime.now(timezone.utc))
+                    snap = core._save_unknown_snapshot(frame, unknown_bboxes, datetime.now(UTC))
                     add_event(
                         "unknown_alert",
                         "Unknown face detected",
@@ -1251,9 +1242,11 @@ class PipelineManager:
                     [
                         (f"Faces:{face_count} Objects:{object_count} FPS:{fps_ema:.1f}", (255, 255, 255)),
                         (
-                            f"Known:{known_detections} Unknown:{unknown_detections} "
-                            f"G:{'ON' if yolo_state['general']['enabled'] else 'OFF'} "
-                            f"C:{'ON' if yolo_state['custom']['enabled'] else 'OFF'}",
+                            (
+                                f"Known:{known_detections} Unknown:{unknown_detections} "
+                                f"G:{'ON' if yolo_state['general']['enabled'] else 'OFF'} "
+                                f"C:{'ON' if yolo_state['custom']['enabled'] else 'OFF'}"
+                            ),
                             (180, 180, 180),
                         ),
                         (f"Gaze:{gaze_status} Seq:{self.frame_store.get().get('sequence', 0)}", (170, 170, 170)),
@@ -1303,34 +1296,35 @@ class PipelineManager:
                 time.sleep(self._compute_sleep_duration(interval, processing))
         except Exception as exc:
             self._last_error = str(exc)
-            LOGGER.exception("Monitor worker crashed: %s", exc)
+            # logging.exception already includes the exception and traceback.
+            LOGGER.exception("Monitor worker crashed")
             if not startup_ready:
                 startup_failed_reason = f"startup_exception:{exc}"
                 self._mark_startup_failed(startup_failed_reason)
             else:
                 self._publish_event("pipeline_state", {"error": str(exc)})
         finally:
-            try:
+            with suppress(Exception):
                 reader.close()
-            except Exception:
-                pass
-            try:
+            with suppress(Exception):
                 cap.release()
-            except Exception:
-                pass
-            try:
+            with suppress(Exception):
                 memory.save_all_memory()
-            except Exception:
-                pass
 
             if startup_failed_reason is not None and not startup_ready:
                 with self._lock:
                     if self._mode == "monitor":
                         self._mode = "idle"
                         self._thread = None
-                return
+                # This early exit is intentional and must stay inside `finally`: the
+                # cleanup above has to run before the worker releases its slot, and the
+                # session summary below must not be written for a session that never
+                # started. (Ruff B012 flags it because a `return` in `finally` can also
+                # swallow a BaseException; the practical exposure here is nil, since
+                # this runs on a worker thread and no signal is delivered to it.)
+                return  # noqa: B012
 
-            end_dt = datetime.now(timezone.utc)
+            end_dt = datetime.now(UTC)
             end_ts = time.time()
             duration_sec = max(end_ts - start_ts, 0.0)
 
@@ -1340,10 +1334,10 @@ class PipelineManager:
                 self._publish_event("behavior_event", evt)
 
             for name in visible_prev:
-                info = people.get(name)
-                if info and info["present"] and info["last_enter_ts"] is not None:
-                    info["presence_sec"] += max(end_ts - float(info["last_enter_ts"]), 0.0)
-                    info["last_enter_ts"] = None
+                presence = people.get(name)
+                if presence and presence["present"] and presence["last_enter_ts"] is not None:
+                    presence["presence_sec"] += max(end_ts - float(presence["last_enter_ts"]), 0.0)
+                    presence["last_enter_ts"] = None
                     info["present"] = False
 
             people_clean: dict[str, dict[str, Any]] = {}
@@ -1490,7 +1484,21 @@ class PipelineManager:
 
 MANAGER = PipelineManager()
 
-app = FastAPI(title="Monitoring Backend", version="1.0.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Startup/shutdown hooks. `@app.on_event` is deprecated in current FastAPI."""
+    MANAGER.set_event_loop(asyncio.get_running_loop())
+    MANAGER._set_pipeline_state(mode="idle", running=False, degraded=False)
+    try:
+        yield
+    finally:
+        # Stop any worker still running so a shutdown does not leave a camera open.
+        with suppress(Exception):
+            MANAGER.stop()
+
+
+app = FastAPI(title="Monitoring Backend", version="1.0.0", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1500,12 +1508,6 @@ app.add_middleware(
 )
 app.mount("/incidents", StaticFiles(directory=str(INCIDENTS_DIR)), name="incidents")
 app.mount("/snapshots", StaticFiles(directory=str(SNAPSHOTS_DIR)), name="snapshots")
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    MANAGER.set_event_loop(asyncio.get_running_loop())
-    MANAGER._set_pipeline_state(mode="idle", running=False, degraded=False)
 
 
 def _load_metric_events() -> list[dict[str, Any]]:
@@ -1561,7 +1563,7 @@ class ChatSessionStore:
             if sid and sid in self._sessions:
                 self._sessions[sid].last_seen_monotonic = now
                 return sid
-            sid = f"chat-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
+            sid = f"chat-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
             self._sessions[sid] = ChatSessionState(
                 created_monotonic=now,
                 last_seen_monotonic=now,
@@ -1636,7 +1638,7 @@ def _compact_citation(row: dict[str, Any], idx: int) -> dict[str, Any]:
 
 
 def _build_chat_grounding(question: str, runtime_context: dict[str, Any]) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cutoff = now - timedelta(minutes=CHAT_CONTEXT_LOOKBACK_MIN)
     metrics = _load_metric_events()
     recent_metric_rows: list[dict[str, Any]] = []
@@ -1665,7 +1667,9 @@ def _build_chat_grounding(question: str, runtime_context: dict[str, Any]) -> dic
             latest_session = row
             break
     if isinstance(latest_session, dict):
-        agg = latest_session.get("aggregate") if isinstance(latest_session.get("aggregate"), dict) else {}
+        # Bind once so the isinstance check actually narrows the value used below.
+        raw_agg = latest_session.get("aggregate")
+        agg = raw_agg if isinstance(raw_agg, dict) else {}
         citations_raw.append(
             {
                 "source": "recognize_session",
@@ -1727,7 +1731,9 @@ def _query_groq_grounded(
     session_history: list[dict[str, Any]],
     grounding: dict[str, Any],
 ) -> tuple[str | None, bool]:
-    api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq_api_key")
+    # Both spellings are supported on purpose: `.env.example` documents the lowercase
+    # form, so dropping it would break existing setups.
+    api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq_api_key")  # noqa: SIM112
     if not api_key:
         return None, False
     try:
@@ -1771,10 +1777,10 @@ def _query_groq_grounded(
     if not response.choices:
         return None, False
     msg = response.choices[0].message
-    content = getattr(msg, "content", None)
-    if not content:
+    raw_content = getattr(msg, "content", None)
+    if not raw_content:
         return None, False
-    return str(content).strip(), True
+    return str(raw_content).strip(), True
 
 
 def _extract_minutes_from_query(question: str, default: int = 5) -> int:
@@ -1798,7 +1804,7 @@ def _collect_recent_people_signal(
 ) -> tuple[int, list[str]]:
     core = _core()
     lookback = max(int(minutes), 1)
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback)
+    cutoff = datetime.now(UTC) - timedelta(minutes=lookback)
     events = _load_metric_events()
     names: set[str] = set()
     max_unique = 0
@@ -1810,11 +1816,12 @@ def _collect_recent_people_signal(
             continue
         et = str(event.get("event_type", ""))
         if et == "recognize_session":
-            agg = event.get("aggregate") if isinstance(event.get("aggregate"), dict) else {}
+            raw_agg = event.get("aggregate")
+            agg = raw_agg if isinstance(raw_agg, dict) else {}
             max_unique = max(max_unique, _safe_int(agg.get("unique_individuals_seen"), 0))
             people_map = event.get("people")
             if isinstance(people_map, dict):
-                for name in people_map.keys():
+                for name in people_map:
                     label = str(name).strip()
                     if label and label.lower() not in unknown_tokens:
                         names.add(label)
@@ -2189,7 +2196,9 @@ def build_video_stream_generator() -> Any:
             elif (now_mono - last_emit_mono) >= MJPEG_KEEPALIVE_SEC:
                 # Keepalive chunk to prevent clients from hanging indefinitely on quiet sequences.
                 should_emit = True
-        if should_emit:
+        # Re-narrow here: `should_emit` is only ever set inside the isinstance check
+        # above, but type checkers cannot follow that across the boolean.
+        if should_emit and isinstance(frame_bytes, (bytes, bytearray)):
             last_seq = seq
             last_emit_mono = now_mono
             yield _mjpeg_chunk(bytes(frame_bytes))

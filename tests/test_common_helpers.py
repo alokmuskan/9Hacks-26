@@ -6,7 +6,7 @@ import tempfile
 import threading
 import types
 import unittest
-from datetime import timezone
+from datetime import UTC
 from pathlib import Path
 from unittest import mock
 
@@ -158,7 +158,7 @@ class SharedHelperTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "metrics.jsonl"
             good = json.dumps({"timestamp_utc": common.iso(), "event_type": "ok"})
-            path.write_text(f"{good}\n" '{"broken": \n', encoding="utf-8")
+            path.write_text(f"{good}\n" + '{"broken": \n', encoding="utf-8")
 
             before = common.metrics_parse_errors()
             with mock.patch.object(self.main, "METRICS_LOG_PATH", path), mock.patch.object(
@@ -197,11 +197,11 @@ class SharedHelperTests(unittest.TestCase):
 
         aware = common.parse_iso("2026-03-14T10:00:00+00:00")
         self.assertIsNotNone(aware)
-        self.assertEqual(aware.tzinfo, timezone.utc)
+        self.assertEqual(aware.tzinfo, UTC)
 
         naive = common.parse_iso("2026-03-14T10:00:00")
         self.assertIsNotNone(naive)
-        self.assertEqual(naive.tzinfo, timezone.utc, "naive timestamps are treated as UTC")
+        self.assertEqual(naive.tzinfo, UTC, "naive timestamps are treated as UTC")
 
         self.assertIsNone(common.parse_iso(""))
         self.assertIsNone(common.parse_iso("not-a-date"))

@@ -5,6 +5,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 import numpy as np
@@ -284,7 +285,7 @@ class MonitorWorkerResilienceTests(unittest.TestCase):
         main = self.main
 
         class _FakeDB:
-            names = []
+            names: ClassVar[list[str]] = []
 
         class _FakeFaceDB:
             @staticmethod

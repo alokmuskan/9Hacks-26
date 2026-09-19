@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import threading
-from datetime import datetime, timedelta, timezone
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +14,10 @@ from PIL import Image
 
 import common
 
-
 # Guards metadata read/merge/write across every SceneMemoryManager instance in the
 # process. The monitor worker and per-request API handlers all share one file.
+# This is only the thread half of the guarantee: `_store_guard` below also takes
+# the OS-level lock, so a separately-launched `main.py` cannot race `server.py`.
 _STORE_LOCK = threading.RLock()
 
 
@@ -108,19 +111,33 @@ class SceneMemoryManager:
         self.vectors_enabled = False
         self.vector_backend_error: str | None = None
 
-        self._faiss = None
-        self._faiss_index = None
-        self._torch = None
-        self._clip_model = None
-        self._clip_preprocess = None
-        self._clip_tokenizer = None
-        self._clip_device = None
+        # Third-party handles for the optional vector backend. `Any` is honest here:
+        # faiss/torch/open_clip objects have no stubs, and all of them stay None when
+        # `enable_vectors` is false or the optional imports are missing.
+        self._faiss: Any = None
+        self._faiss_index: Any = None
+        self._torch: Any = None
+        self._clip_model: Any = None
+        self._clip_preprocess: Any = None
+        self._clip_tokenizer: Any = None
+        self._clip_device: str | None = None
 
         if enable_vectors:
             self._init_vector_backend()
 
+    @contextmanager
+    def _store_guard(self) -> Iterator[None]:
+        """Serialise a read-merge-write cycle against other processes and threads."""
+        with _STORE_LOCK:
+            with common.process_lock(self.metadata_path):
+                yield
+
     def _load_metadata(self) -> list[dict[str, Any]]:
-        return _read_metadata_file(self.metadata_path)
+        # Guarded like the merge cycles: on Windows `os.replace` fails if another
+        # process has the destination open, so a lock-free read here could make a
+        # concurrent writer fail.
+        with self._store_guard():
+            return _read_metadata_file(self.metadata_path)
 
     def _save_metadata(self) -> None:
         """Merge the on-disk index with this instance's view, then replace atomically.
@@ -129,7 +146,7 @@ class SceneMemoryManager:
         by another instance (for example a manual snapshot taken through the API
         while the monitor worker holds an older view).
         """
-        with _STORE_LOCK:
+        with self._store_guard():
             disk_rows = _read_metadata_file(self.metadata_path)
             self.metadata = _merge_entries(disk_rows, self.metadata)
             _write_metadata_file(self.metadata_path, self.metadata)
@@ -186,7 +203,7 @@ class SceneMemoryManager:
         only checks `exists()`, so two concurrent writers would otherwise pick the
         same filename and one image would overwrite the other.
         """
-        with _STORE_LOCK:
+        with self._store_guard():
             path = self._next_snapshot_path(timestamp_utc)
             image.save(path, format="JPEG", quality=95)
             return path
@@ -290,7 +307,7 @@ class SceneMemoryManager:
         people: list[str] | None = None,
         attention: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        ts_utc = datetime.now(timezone.utc)
+        ts_utc = datetime.now(UTC)
         image = self._frame_to_rgb_image(frame)
         snapshot_path = self._save_snapshot_image(image, ts_utc)
 
@@ -350,9 +367,9 @@ class SceneMemoryManager:
             if safe_attention:
                 entry["attention"] = safe_attention
 
-        # Merge under the store lock so a concurrent writer cannot win the race
-        # between reading the index and replacing it.
-        with _STORE_LOCK:
+        # Merge under the store guard so neither another thread nor another process
+        # can win the race between reading the index and replacing it.
+        with self._store_guard():
             merged = _merge_entries(_read_metadata_file(self.metadata_path), self.metadata)
             entry["id"] = len(merged) + 1
             merged.append(entry)
@@ -365,7 +382,7 @@ class SceneMemoryManager:
         if current_time is not None:
             self.last_snapshot_time = float(current_time)
         else:
-            self.last_snapshot_time = float(datetime.now().timestamp())
+            self.last_snapshot_time = datetime.now(UTC).timestamp()
 
         if not manual:
             pruned = self._prune_auto_snapshots()
@@ -391,7 +408,7 @@ class SceneMemoryManager:
         if self.max_auto_snapshots <= 0:
             return 0
 
-        with _STORE_LOCK:
+        with self._store_guard():
             merged = _merge_entries(_read_metadata_file(self.metadata_path), self.metadata)
             auto_entries = [row for row in merged if not row.get("manual")]
             excess = len(auto_entries) - self.max_auto_snapshots
@@ -407,11 +424,9 @@ class SceneMemoryManager:
                 raw_path = str(row.get("snapshot_path") or "").strip()
                 if not raw_path:
                     continue
-                try:
+                # A locked or already-deleted image must not stop the index update.
+                with suppress(OSError):
                     Path(raw_path).unlink(missing_ok=True)
-                except OSError:
-                    # A locked or already-deleted image must not stop the index update.
-                    pass
 
             kept = [row for row in merged if _entry_key(row) not in doomed_keys]
             self.metadata = kept
@@ -440,7 +455,7 @@ class SceneMemoryManager:
         if not self.metadata:
             return []
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         cutoff = now - timedelta(minutes=max(int(minutes), 0))
 
         rows: list[dict[str, Any]] = []
@@ -489,7 +504,7 @@ class SceneMemoryManager:
         try:
             dt = datetime.fromisoformat(str(value))
             if dt.tzinfo is None:
-                return dt.replace(tzinfo=timezone.utc)
+                return dt.replace(tzinfo=UTC)
             return dt
         except Exception:
             return None
@@ -515,7 +530,9 @@ class SceneMemoryManager:
             distances, indices = self._faiss_index.search(emb, count)
 
             out: list[dict[str, Any]] = []
-            for dist, idx in zip(distances[0].tolist(), indices[0].tolist()):
+            # strict=False: faiss returns parallel arrays, but a mismatched pair should
+            # not turn a scene search into an exception.
+            for dist, idx in zip(distances[0].tolist(), indices[0].tolist(), strict=False):
                 if idx < 0 or idx >= len(self.metadata):
                     continue
                 row = dict(self.metadata[idx])

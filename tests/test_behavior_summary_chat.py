@@ -33,6 +33,18 @@ def _install_stubs():
         cv2_stub.line = lambda *_args, **_kwargs: None
         cv2_stub.circle = lambda *_args, **_kwargs: None
         cv2_stub.getTextSize = lambda text, *_args, **_kwargs: ((len(text) * 8, 12), 2)
+        # This is the FIRST stub installed when the suite runs, so it must cover
+        # everything the pipeline calls -- otherwise any later test that imports
+        # `server` or `main` trips over the gap. Keep it a superset.
+        cv2_stub.imwrite = lambda *_args, **_kwargs: True
+        cv2_stub.imencode = lambda *_args, **_kwargs: (True, np.zeros(4, dtype=np.uint8))
+        cv2_stub.imshow = lambda *_args, **_kwargs: None
+        cv2_stub.waitKey = lambda *_args, **_kwargs: -1
+        cv2_stub.namedWindow = lambda *_args, **_kwargs: None
+        cv2_stub.destroyAllWindows = lambda: None
+        cv2_stub.setLogLevel = lambda *_args, **_kwargs: None
+        cv2_stub.VideoCapture = lambda *_args, **_kwargs: None
+        cv2_stub.CAP_FFMPEG = 1900
         sys.modules["cv2"] = cv2_stub
 
     if "insightface" not in sys.modules:

@@ -3,6 +3,7 @@ import sys
 import time
 import types
 import unittest
+from typing import ClassVar
 from unittest import mock
 
 import numpy as np
@@ -46,9 +47,9 @@ def _install_stubs():
 
 
 class _FakeDB:
-    names = ["Hemanth"]
-    counts = [5]
-    centroids = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+    names: ClassVar[list[str]] = ["Hemanth"]
+    counts: ClassVar[list[int]] = [5]
+    centroids: ClassVar[np.ndarray] = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
 
 
 class _FakeFaceDB:

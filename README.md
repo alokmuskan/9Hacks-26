@@ -24,6 +24,7 @@ The system ships two front ends over one shared core:
 - [Usage](#usage)
   - [API Mode (Backend)](#api-mode-backend)
   - [Frontend Dashboard](#frontend-dashboard)
+  - [First Run](#first-run)
   - [CLI Mode](#cli-mode)
   - [Gaze Scheduling](#gaze-scheduling)
   - [Runtime Keyboard Controls](#runtime-keyboard-controls)
@@ -32,6 +33,9 @@ The system ships two front ends over one shared core:
 - [Data and Storage Model](#data-and-storage-model)
   - [Storage Lifecycle](#storage-lifecycle)
 - [Testing](#testing)
+  - [Lint and Types](#lint-and-types)
+  - [Continuous Integration](#continuous-integration)
+  - [End-to-End](#end-to-end)
 - [Troubleshooting](#troubleshooting)
 - [Current Limitations](#current-limitations)
 - [Security and Privacy Notice](#security-and-privacy-notice)
@@ -137,8 +141,10 @@ The `PipelineManager` owns:
 .
 ├── main.py                  # CLI entry point + core inference/utility library
 ├── server.py                # FastAPI backend (REST, WebSocket, MJPEG, PipelineManager)
+├── common.py                # Plumbing shared by both entry points (schema versions,
+│                            #   metrics log + rotation, session ids, gaze scheduling)
 ├── object_detection.py      # DualYoloDetector (general + custom) and box normalisation
-├── scene_memory.py          # Snapshot store, metadata index, last-seen and search
+├── scene_memory.py          # Snapshot store, metadata index, retention, last-seen and search
 ├── frontend/                # React + Vite dashboard
 │   ├── index.html
 │   ├── package.json
@@ -160,6 +166,10 @@ The `PipelineManager` owns:
 │   └── CHAT_AND_SUMMARY.md  # Chat intents, summaries, and API chat behavior
 ├── pixi.toml                # Environment definition (Python 3.11, linux-64)
 ├── pixi.lock                # Locked dependency set
+├── requirements.txt         # pip fallback for non-linux-64 platforms (best-effort)
+├── ruff.toml                # Lint rule set (explicit, not tool defaults)
+├── mypy.ini                 # Static type configuration (staged scope)
+├── .github/workflows/ci.yml # CI: backend tests, lint/type checks, frontend
 └── .env.example             # Environment variable template
 ```
 
@@ -170,7 +180,8 @@ The `PipelineManager` owns:
 | `main.py` | Core logic: models, camera handling, gaze math, behavior tracker, metrics, chat, reports |
 | `server.py` | The whole HTTP/WS surface; worker loops that mirror the CLI pipeline |
 | `object_detection.py` | YOLO wrapper and detection schema shared by both modes |
-| `scene_memory.py` | All persisted snapshot state and retrieval helpers |
+| `scene_memory.py` | All persisted snapshot state, retention and retrieval helpers |
+| `common.py` | The shared contract between the CLI and the API; keep schema versions and defaults here, not duplicated |
 | `frontend/src/context/SurveillanceContext.jsx` | Dashboard state, polling, operation/error handling |
 | `pixi.toml` / `pixi.lock` | Reproducible backend environment |
 
@@ -244,7 +255,15 @@ Optionally run an interactive shell inside the environment:
 pixi shell
 ```
 
-If you are not using pixi, install the equivalent packages in a Python 3.11 virtual environment. The `l2cs` and `face_detection` packages must be installed from their Git repositories.
+**Not on Linux, or prefer not to use pixi?** The pixi workspace is pinned to `linux-64` and is the only environment verified for this project. A pip fallback is provided for other platforms:
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+python main.py doctor
+```
+
+That path is **best-effort**: the computer-vision wheels resolve differently per platform, and `l2cs` / `face_detection` are Git dependencies. `doctor` tells you precisely which parts came up rather than leaving you to guess. On Windows, WSL2 with the pixi workspace is the more predictable option if you want the full pipeline.
 
 ### 2. Frontend dependencies
 
@@ -271,10 +290,10 @@ All variables are optional; the defaults below reflect the code.
 
 | Variable | Default | Used by | Description |
 | --- | --- | --- | --- |
-| `AI_STUDIO_CAM_CAMERA_INDEX` | `/dev/video42` on Linux, `0` elsewhere | backend | Camera device path, numeric index, or stream URL |
+| `AI_STUDIO_CAM_CAMERA_INDEX` | `/dev/video42` on Linux **when that device exists**, otherwise `0` | backend | Camera device path, numeric index, or stream URL |
 | `AI_STUDIO_CAM_INCLUDE_INDEX_FALLBACK` | `0` | backend | Set to `1` to also try the numeric index when a `/dev/video*` path is configured |
 | `AI_STUDIO_CAM_SCAN_ALL_DEVICES` | `0` | backend (Linux) | Set to `1` to scan every `/dev/video*` device before giving up |
-| `AI_STUDIO_GENERAL_YOLO_MODEL` | `.references/AI-Studio-Cam-(On-Hold)/models/yolov8n.pt` | backend | General YOLO checkpoint; falls back to `yolov8n.pt` if the path does not exist |
+| `AI_STUDIO_GENERAL_YOLO_MODEL` | `yolov8n.pt` | backend | General YOLO checkpoint. Ultralytics downloads it on first use; `bootstrap` fetches it up front |
 | `AI_STUDIO_METRICS_MAX_BYTES` | `4194304` (4 MiB) | backend | Size at which `metrics_log.jsonl` rotates; floored at 64 KiB |
 | `AI_STUDIO_METRICS_BACKUPS` | `2` | backend | Rotated generations to keep (`0` truncates instead of rotating) |
 | `AI_STUDIO_MEMORY_MAX_AUTO_SNAPSHOTS` | `5000` | backend | Automatic snapshots to keep; `0` disables pruning. Manual snapshots are never pruned |
@@ -293,7 +312,7 @@ Camera selection tries multiple candidate sources and backends (FFmpeg / V4L2 / 
 | Asset | Default location | How it is obtained |
 | --- | --- | --- |
 | InsightFace face pack | `~/.insightface/models/<pack>` | Downloaded automatically on first use. If the pack is extracted with a nested directory layout, the app repairs it in place. |
-| General YOLO weights | `yolov8n.pt` (or `AI_STUDIO_GENERAL_YOLO_MODEL`) | Ultralytics downloads the checkpoint if it is not present |
+| General YOLO weights | `yolov8n.pt` (or `AI_STUDIO_GENERAL_YOLO_MODEL`) | Ultralytics downloads the checkpoint if it is not present; `bootstrap` fetches it explicitly |
 | Custom YOLO weights | `custom_model_path.txt` pointer, else newest of `runs/detect/*/weights/best.pt`, `models/custom_yolo*.pt` | Produced by `train-objects`; optional |
 | L2CS-Net gaze weights | `models/L2CSNet_gaze360.pkl` | Auto-downloaded via `gdown` from a Google Drive folder, or placed manually. Cannot be embedded in the repository due to size. |
 
@@ -349,6 +368,34 @@ For a production build:
 ```bash
 cd frontend
 npm run build
+```
+
+### First Run
+
+Two commands stand between a fresh checkout and a working session:
+
+```bash
+# Create runtime directories and fetch the model assets (safe to re-run)
+pixi run python main.py bootstrap
+
+# Report exactly what this machine can run
+pixi run python main.py doctor
+```
+
+`bootstrap` creates `memory/snapshots/` and `unknown_incidents/`, ensures the general YOLO checkpoint is present (downloading `yolov8n.pt` via Ultralytics if needed), and attempts the L2CS gaze-weight download. It never aborts on a missing asset: it reports what is unresolved and prints the next steps.
+
+`doctor` prints one row per requirement with `ok` / `warn` / `fail`:
+
+- **`fail`** items block monitoring (they are the required inference modules: `numpy`, `cv2`, `PIL`, `onnxruntime`, `insightface`, `ultralytics`, `torch`). A failure exits with status 1.
+- **`warn`** items each disable exactly one feature. Missing `l2cs` disables gaze, missing `groq` disables the LLM chat fallback, missing `faiss`/`open_clip` disables vector search, missing gaze weights disables gaze, and no enrolled identities means every face reads as `Unknown`.
+
+Add `--check-camera` to actually open and release the configured camera. A successful run on this machine looks like:
+
+```
+[ ok ] module:torch          2.10.0+cpu
+[warn] module:l2cs          not importable (ModuleNotFoundError) - gaze estimation
+[warn] gaze weights         models/L2CSNet_gaze360.pkl missing (see `bootstrap`)
+[ ok ] camera source        0 (from AI_STUDIO_CAM_CAMERA_INDEX)
 ```
 
 ### CLI Mode
@@ -537,6 +584,28 @@ All three growth paths are bounded, and every cap is configurable through the en
 
 Pruning is announced on stdout when it happens. `memory-stats` reports the active cap alongside the current count.
 
+### Cross-Process Safety
+
+`main.py` and `server.py` can be launched at the same time against the same working directory, and they share `metrics_log.jsonl` and `memory/metadata.json`. Thread locks do not protect against that, so every read-merge-write cycle over a shared file additionally takes an **OS-level advisory lock**:
+
+| Platform | Mechanism |
+| --- | --- |
+| Linux / macOS | `fcntl.flock` (`LOCK_EX`) |
+| Windows | `msvcrt.locking` (`LK_NBLCK`) |
+
+The lock lives in a sidecar `<name>.lock` file, not on the data file itself, because writes replace the data file atomically with `os.replace` — a handle to the old file would guard nothing. Locking is re-entrant per thread, so nested acquisitions inside one process cannot deadlock on themselves.
+
+Without this, concurrent processes silently destroyed data. The same workload run both ways, four processes writing twelve snapshots each:
+
+```
+UNSYNCHRONISED : expected 48 entries -> got 13
+WITH OS LOCK   : expected 48 entries -> got 48  (jpegs on disk: 48)
+```
+
+On Windows the unlocked version does not merely lose entries — concurrent `os.replace` raises a sharing violation, because the destination is open in another process.
+
+Waiting is bounded (10 s for writers, 2 s for readers). If a required lock cannot be taken, the work **proceeds anyway rather than hanging** and the event is counted; `doctor` reports the backend and the timeout count, so a degraded run is visible instead of silent.
+
 ---
 
 ## Testing
@@ -547,7 +616,7 @@ Pruning is announced on stdout when it happens. `memory-stats` reports the activ
 pixi run python -m unittest discover -s tests -q
 ```
 
-100 tests cover the detection schema and toggles, gaze L2CS helpers and interval scheduling, the shared session aggregate contract, storage lifecycle (metrics rotation, snapshot and incident retention), persistence integrity (including concurrent snapshot and metrics writers), behavior tracking and summaries, chat and snapshot actions, metrics schema normalisation, scene memory, the CLI `recognize` loop end-to-end, and the FastAPI surface (status schema, monitor lifecycle, camera recovery, stream generator, WebSocket envelope, chat sessions, and two-step action confirmation).
+133 tests cover the detection schema and toggles, gaze L2CS helpers and interval scheduling, the shared session aggregate contract, environment readiness and first-run bootstrap, storage lifecycle (metrics rotation, snapshot and incident retention), cross-process locking (real subprocess contention, including control cases proving those tests detect unsynchronised writers), persistence integrity (including concurrent snapshot and metrics writers), behavior tracking and summaries, chat and snapshot actions, metrics schema normalisation, scene memory, the CLI `recognize` loop end-to-end, and the FastAPI surface (status schema, monitor lifecycle, camera recovery, stream generator, WebSocket envelope, chat sessions, and two-step action confirmation).
 
 > The server tests import `server.py` at module scope, which creates `memory/snapshots/` and `unknown_incidents/`. Chat tests append to `metrics_log.jsonl`. These paths are git-ignored.
 
@@ -561,17 +630,84 @@ npm run build     # production build
 
 Frontend tests cover the WebSocket client (event forwarding, backoff reconnects) and stream stall detection.
 
+### Lint and Types
+
+```bash
+ruff check .     # lint (config: ruff.toml)
+mypy             # static types (config: mypy.ini)
+```
+
+Install the tools with `pip install ruff mypy` (they are listed in `requirements.txt`). The rule set in `ruff.toml` is listed explicitly rather than inherited from the tool's defaults, so results do not drift when ruff is upgraded. The file also records **which families are deliberately not selected and why** — notably `BLE`/`S` (broad `except Exception` is how the pipeline degrades around optional dependencies, and `try/except/pass` is how best-effort cleanup is written) and `D`/`ANN` (behaviour is documented in the README and the test suite rather than in docstrings). Individual rules within the selected families that would fight the existing style (`SIM117`, `TRY003`, `TRY300`) are ignored in the same file, each with a reason.
+
+`mypy` is **staged, not all-or-nothing**: `common.py`, `object_detection.py`, `scene_memory.py` and `server.py` are enforced and currently clean, while `main.py` is opted out *explicitly* in `mypy.ini` with its remaining finding count recorded there. It reports ~108 issues today, 104 of them possible-`None` dereferences in the long CLI/report/chat helpers; guarding those is a refactor, not a config change. Deleting the one override line is all that is needed to start enforcing it.
+
+Formatting is configured (`line-length = 100`, double quotes) but **not applied to the existing code** — running `ruff format .` would rewrite every file at once, so it is left as an opt-in. `ruff format --check` is therefore not yet enforced in CI.
+
+### Continuous Integration
+
+`.github/workflows/ci.yml` runs three jobs on every push to `main` and every pull request:
+
+| Job | What it runs |
+| --- | --- |
+| Backend tests | `python -m unittest discover -s tests -q`, then a byte-compile of every module |
+| Lint and types | `ruff check .` and `mypy` |
+| Frontend | `npm ci`, `npm test`, `npm run build` |
+
+The backend job installs only `numpy`, `pillow`, `fastapi` and `httpx`, because the suite stubs cv2 and insightface — the full computer-vision stack is not needed to run the tests. It also installs a CPU-only `torch` so the one L2CS decoding test executes rather than skipping; remove that step to make the job lighter and that test will report as skipped instead of failing.
+
+### End-to-End
+
+Run the backend and the dashboard together, then load the dashboard in a browser. On a machine with the pinned InsightFace installed:
+
+```bash
+python server.py                # terminal 1
+cd frontend && npm run dev      # terminal 2  -> http://localhost:5173
+```
+
+The following were verified against a live server and a real headless browser:
+
+| Check | Result |
+| --- | --- |
+| Every endpoint the dashboard calls | 200 (status, detections, behavior, memory stats/recent/find/search, logs, session summary, chat) |
+| Monitor start / snapshot / toggles / stop | Lifecycle responds; snapshot and toggles return 409 with a clear reason when no session is running |
+| CORS from the dashboard origin | Preflight 200, origin allowed |
+| WebSocket `/api/v1/stream/events/ws` | Connects; first frame is a valid `{type, timestamp, session_id, payload}` envelope |
+| Dashboard render | React app mounts, renders nav and counters, and lists real events fetched from the backend |
+| Browser console | No errors |
+
+A monitoring session needs the pinned InsightFace; without it the API degrades cleanly and reports why through `degraded_reason` and `last_error` (which persists after `stop`, so a failure stays diagnosable).
+
 ---
 
 ## Troubleshooting
 
 **The camera cannot be opened**
 
-`_open_camera()` tries each candidate source across several backends and throws with the list of attempts. Check that `AI_STUDIO_CAM_CAMERA_INDEX` points at a real device. On Linux, `/dev/video42` typically indicates a `v4l2loopback` virtual device, so the producer feeding that device must be running. Set `AI_STUDIO_CAM_SCAN_ALL_DEVICES=1` to scan all devices.
+`_open_camera()` tries each candidate source across several backends and throws with the list of attempts. Check that `AI_STUDIO_CAM_CAMERA_INDEX` points at a real device, and run `python main.py doctor --check-camera` to see the probe result directly.
+
+**About `/dev/video42`:** that path is the signature of a `v4l2loopback` virtual device, so it only works while something (OBS, ffmpeg) is feeding it. It is used as the Linux default **only when the device actually exists**; otherwise the default is `0`. If you want the virtual-camera workflow, start the producer first and set the variable explicitly:
+
+```bash
+AI_STUDIO_CAM_CAMERA_INDEX=/dev/video42 pixi run python main.py recognize
+```
+
+Set `AI_STUDIO_CAM_SCAN_ALL_DEVICES=1` to scan every `/dev/video*` device before giving up, or `AI_STUDIO_CAM_INCLUDE_INDEX_FALLBACK=1` to also try the numeric index when a device path is configured.
 
 **Monitoring starts but the frontend shows "Stalled"**
 
 The stream is driven by a monotonic frame `sequence` plus UTC timestamps. Stalls are only reported after a 15-second warmup grace period, so the message indicates the worker is not producing frames. Check the pipeline status endpoint for `degraded`, `degraded_reason`, and `last_error`.
+
+**`insightface ... is too old: FaceAnalysis(providers=...) requires insightface >= 0.7.3`**
+
+The installed InsightFace is an old 0.2.x release whose `FaceAnalysis` has no `providers` argument, so no monitoring session can start. This is a hard blocker, not a degraded mode. Install the pinned version:
+
+```bash
+pixi install                    # pixi.toml pins insightface>=0.7.3,<0.8
+# or, outside pixi:
+pip install -U "insightface>=0.7.3,<0.8"
+```
+
+`python main.py doctor` flags this as a `fail` and exits non-zero, because an importable module is not necessarily a usable one.
 
 **Gaze is unavailable**
 
@@ -595,7 +731,7 @@ Enrollment requires exactly one detectable face at a time; multiple faces or zer
 
 Verified against the current code:
 
-- **Linux-targeted environment.** The pixi workspace and lock file resolve `linux-64` only.
+- **Linux-targeted environment.** The pixi workspace and lock file resolve `linux-64` only. A `requirements.txt` pip fallback exists for other platforms but is not verified on them; use `doctor` to see what came up.
 - **One active worker.** A single global `PipelineManager` runs either monitor or enroll, never both.
 - **Vector search is not wired in.** `scene_memory.py` supports CLIP + FAISS semantic search, but the monitor and enroll pipelines construct the memory manager with `enable_vectors=False`, so the index is never populated during normal operation. `memory-search` falls back to lexical matching.
 - **Gaze runs every processed frame by default.** Adaptive throttling is implemented and test-covered but opt-in (`--gaze-max-interval N`, or `gaze_max_interval` on the API). Enabling it trades attention-data fidelity for speed, since skipped frames reuse the previous gaze estimate.
