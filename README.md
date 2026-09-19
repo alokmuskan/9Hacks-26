@@ -9,11 +9,16 @@ The system ships two front ends over one shared core:
 
 **Status:** `Milestone: Frontend and Backend Working`
 
+> **New here?** [GETTING_STARTED.md](GETTING_STARTED.md) is the short, verified path
+> from clone to a live session (Windows pip and Linux pixi). This README is the
+> full reference.
+
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [Getting Started](GETTING_STARTED.md)
 - [Key Features](#key-features)
 - [Architecture](#architecture)
 - [Project Structure](#project-structure)
@@ -166,7 +171,7 @@ The `PipelineManager` owns:
 │   └── CHAT_AND_SUMMARY.md  # Chat intents, summaries, and API chat behavior
 ├── pixi.toml                # Environment definition (Python 3.11, linux-64)
 ├── pixi.lock                # Locked dependency set
-├── requirements.txt         # pip fallback for non-linux-64 platforms (best-effort)
+├── requirements.txt         # pip fallback for non-linux-64 platforms (verified on Windows/Python 3.13)
 ├── ruff.toml                # Lint rule set (explicit, not tool defaults)
 ├── mypy.ini                 # Static type configuration (staged scope)
 ├── .github/workflows/ci.yml # CI: backend tests, lint/type checks, frontend
@@ -255,15 +260,15 @@ Optionally run an interactive shell inside the environment:
 pixi shell
 ```
 
-**Not on Linux, or prefer not to use pixi?** The pixi workspace is pinned to `linux-64` and is the only environment verified for this project. A pip fallback is provided for other platforms:
+**Not on Linux, or prefer not to use pixi?** The pixi workspace is pinned to `linux-64`. A pip fallback is provided for other platforms — **verified on Windows 11 + Python 3.13 with every feature working** (face recognition via insightface 2.0, YOLO, gaze, memory, chat):
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
+python -m venv .venv && . .venv/Scripts/activate   # Linux/macOS: . .venv/bin/activate
 pip install -r requirements.txt
 python main.py doctor
 ```
 
-That path is **best-effort**: the computer-vision wheels resolve differently per platform, and `l2cs` / `face_detection` are Git dependencies. `doctor` tells you precisely which parts came up rather than leaving you to guess. On Windows, WSL2 with the pixi workspace is the more predictable option if you want the full pipeline.
+Notes for the pip path: `l2cs` / `face_detection` are Git dependencies (a working `git` is required, no compiler needed); insightface installs from the pure-Python 2.x wheel on Windows, where the conda-forge 0.7.x build does not exist. `doctor` tells you precisely which parts came up rather than leaving you to guess.
 
 ### 2. Frontend dependencies
 
@@ -701,19 +706,29 @@ The stream is driven by a monotonic frame `sequence` plus UTC timestamps. Stalls
 
 **`Face recognition DISABLED: insightface ... cannot be used: FaceAnalysis(providers=...) requires insightface >= 0.7.3`**
 
-The installed InsightFace is an old 0.2.x release whose `FaceAnalysis` has no `providers` argument (or it is not installed at all). Face recognition is a degradable capability, so the session keeps running with objects, gaze and memory; identities simply are not matched, and `degraded_reason` says so. To restore it, install the pinned version:
+The installed InsightFace is an old 0.2.x release whose `FaceAnalysis` has no `providers` argument (or it is not installed at all). Face recognition is a degradable capability, so the session keeps running with objects, gaze and memory; identities simply are not matched, and `degraded_reason` says so. To restore it:
 
 ```bash
-pixi install                    # pixi.toml pins insightface>=0.7.3,<0.8
-# or, outside pixi:
-pip install -U "insightface>=0.7.3,<0.8"
+pixi install                        # Linux: pixi.toml pins insightface>=0.7.3,<0.8
+# or, outside pixi (works on Windows too):
+pip install -U "insightface>=0.7.3,<3"
 ```
 
-Note the pinned release is **source-only on PyPI**: the pip path needs a C++ toolchain (on Windows, the MSVC Build Tools) and Cython. The pixi/conda-forge workspace ships it prebuilt, which is why the Linux pixi environment is the supported one. `python main.py doctor` reports this as a `warn`, not a `fail`, because an importable module is not necessarily a usable one — and an unusable one no longer blocks the session.
+The 0.7.x line is **source-only on PyPI** (needs a C++ toolchain and Cython), but the **2.x line ships a pure-Python wheel** (`py3-none-any`) that installs with no compiler and was verified against this project's API — `FaceAnalysis(providers=..., allowed_modules=...)`, `prepare`, `get` — including on Windows/Python 3.13. `python main.py doctor` reports an unusable insightface as a `warn`, not a `fail`, because an importable module is not necessarily a usable one — and an unusable one no longer blocks the session.
 
 **Gaze is unavailable**
 
-The L2CS checkpoint could not be resolved. Place the weights at `models/L2CSNet_gaze360.pkl`, or allow auto-download (`gdown` must be installed and the Google Drive source reachable). The pipeline continues without gaze.
+The L2CS checkpoint could not be resolved. Place the weights at `models/L2CSNet_gaze360.pkl`. The pipeline continues without gaze.
+
+> **Heads-up:** the Google Drive folder advertised by upstream L2CS-Net returns **404** (as of September 2026), so `gdown` auto-download cannot work. A verified mirror of the same Gaze360 ResNet50 checkpoint exists as `py-feat/l2cs` on Hugging Face (`l2cs_gaze360_resnet50.safetensors`, key names identical to upstream: `fc_yaw_gaze.weight [90, 2048]`, etc.). Convert it once and drop it in `models/`:
+>
+> ```python
+> # pip install safetensors  (or parse the header with stdlib; see git history)
+> from safetensors.torch import load_file
+> import torch
+> state = load_file("l2cs_gaze360_resnet50.safetensors")
+> torch.save(state, "models/L2CSNet_gaze360.pkl")
+> ```
 
 **Chat replies "Insufficient evidence"**
 
@@ -733,8 +748,8 @@ Enrollment requires exactly one detectable face at a time; multiple faces or zer
 
 Verified against the current code:
 
-- **Linux-targeted environment.** The pixi workspace and lock file resolve `linux-64` only. A `requirements.txt` pip fallback exists for other platforms but is not verified on them; use `doctor` to see what came up.
-- **Face recognition degrades rather than blocks.** Without a usable `insightface` (not installed, or an old 0.2.x whose `FaceAnalysis` has no `providers` argument) a session still runs with object detection, gaze and memory; identity matching is simply off, `degraded_reason` explains why, and `face_recognition_enabled` is `false` in the session aggregate. The pinned release is source-only on PyPI, so installing it outside the pixi workspace needs a C++ toolchain.
+- **Two verified environments.** Linux via the pixi workspace (`linux-64`, `insightface 0.7.x` from conda-forge) and Windows via the `requirements.txt` pip path (verified on Python 3.13 with `insightface 2.0`, whose pure-Python wheel needs no compiler). Run `doctor` on either to see what came up.
+- **Face recognition degrades rather than blocks.** Without a usable `insightface` (not installed, or an old 0.2.x whose `FaceAnalysis` has no `providers` argument) a session still runs with object detection, gaze and memory; identity matching is simply off, `degraded_reason` explains why, and `face_recognition_enabled` is `false` in the session aggregate.
 - **One active worker.** A single global `PipelineManager` runs either monitor or enroll, never both.
 - **Vector search is not wired in.** `scene_memory.py` supports CLIP + FAISS semantic search, but the monitor and enroll pipelines construct the memory manager with `enable_vectors=False`, so the index is never populated during normal operation. `memory-search` falls back to lexical matching.
 - **Gaze runs every processed frame by default.** Adaptive throttling is implemented and test-covered but opt-in (`--gaze-max-interval N`, or `gaze_max_interval` on the API). Enabling it trades attention-data fidelity for speed, since skipped frames reuse the previous gaze estimate.

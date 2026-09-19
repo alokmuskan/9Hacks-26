@@ -18,7 +18,10 @@
 numpy>=1.26,<3
 opencv-python>=4.10,<5
 onnxruntime>=1.17
-insightface>=0.7.3,<0.8
+# 0.7.x needs a C++ toolchain to build from source; the 2.x line ships a
+# pure-Python wheel (py3-none-any) and is verified against this project's API
+# (FaceAnalysis(providers=..., allowed_modules=...), prepare, get).
+insightface>=0.7.3,<3
 ultralytics>=8.4.0,<9
 torch>=2.5,<3
 torchvision>=0.20,<1

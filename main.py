@@ -342,7 +342,7 @@ def _insightface_unavailable_message(installed: str | None = None) -> str:
     return (
         f"insightface {version} cannot be used: FaceAnalysis(providers=...) requires "
         f"insightface >= {required}. Install it with `pixi install` (pixi.toml pins "
-        f"insightface>=0.7.3,<0.8) or `pip install -U insightface`."
+        f"insightface>=0.7.3,<0.8) or `pip install -U 'insightface>=0.7.3,<3'`."
     )
 
 
@@ -582,6 +582,14 @@ class _AsyncCameraReader:
             self._thread.join(timeout=0.2)
 
 
+def _face_score(face: object) -> float:
+    # InsightFace 2.x's Face.__getattr__ returns None for absent keys, which
+    # bypasses getattr()'s default. A missing score must degrade to a neutral
+    # value, not crash the frame loop with float(None).
+    raw = getattr(face, "det_score", None)
+    return 1.0 if raw is None else float(raw)
+
+
 def _detect(
     app: FaceAnalysis | None, frame: np.ndarray
 ) -> list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None]]:
@@ -605,7 +613,7 @@ def _detect(
         (
             np.asarray(f.bbox, np.float32) * inv,
             _l2(np.asarray(f.normed_embedding, np.float32)),
-            float(getattr(f, "det_score", 1.0)),
+            _face_score(f),
             (
                 np.asarray(f.kps, np.float32) * inv
                 if getattr(f, "kps", None) is not None
@@ -4206,7 +4214,7 @@ _DEGRADABLE_MODULES = {"insightface": "face recognition"}
 # Only lower bounds are enforced here -- falling below a pinned minimum is a proven
 # break, whereas exceeding an upper bound is a forward-looking risk.
 _MIN_MODULE_VERSIONS: dict[str, tuple[tuple[int, ...], str]] = {
-    "insightface": (INSIGHTFACE_MIN_VERSION, "FaceAnalysis(providers=...) requires 0.7.x"),
+    "insightface": (INSIGHTFACE_MIN_VERSION, "FaceAnalysis(providers=...) requires 0.7+ (2.x supported)"),
     "numpy": ((1, 26), "pixi.toml pins numpy >=1.26,<3"),
     "torch": ((2, 5), "pixi.toml pins torch >=2.5,<3"),
     "ultralytics": ((8, 4), "pixi.toml pins ultralytics >=8.4,<9"),

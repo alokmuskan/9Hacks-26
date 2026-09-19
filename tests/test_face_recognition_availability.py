@@ -42,6 +42,17 @@ class FaceAppBuilderTests(unittest.TestCase):
         frame = np.zeros((8, 8, 3), dtype=np.uint8)
         self.assertEqual(self.main._detect(None, frame), [])
 
+    def test_face_score_tolerates_insightface_2x_none_getattr(self):
+        # InsightFace 2.x's Face.__getattr__ returns None for absent keys, which
+        # bypasses getattr()'s default. The score must degrade, not float(None).
+        class Face2x:
+            def __getattr__(self, name):
+                return None
+
+        self.assertEqual(self.main._face_score(Face2x()), 1.0)
+        self.assertEqual(self.main._face_score(type("F", (), {"det_score": 0.75})()), 0.75)
+        self.assertEqual(self.main._face_score(object()), 1.0)
+
     def test_missing_face_analysis_raises_an_actionable_message(self):
         with mock.patch.object(self.main, "FaceAnalysis", None):
             with self.assertRaises(RuntimeError) as caught:
@@ -102,6 +113,14 @@ class DoctorFaceRecognitionTests(unittest.TestCase):
         status, detail = rows["module:insightface"]
         self.assertEqual(status, "warn")
         self.assertIn("too old", detail)
+
+    def test_insightface_2x_is_accepted(self):
+        rows = self._rows(
+            lambda name: (True, "2.0") if name == "insightface" else (True, "9.9.9")
+        )
+        status, detail = rows["module:insightface"]
+        self.assertEqual(status, "ok")
+        self.assertNotIn("too old", detail)
 
     def test_a_missing_required_module_still_blocks(self):
         rows = self._rows(
