@@ -49,7 +49,7 @@ class ChatTruthfulnessTests(unittest.TestCase):
             old_metrics = self.main.METRICS_LOG_PATH
             self.main.METRICS_LOG_PATH = Path(td) / "metrics.jsonl"
             try:
-                reply, found = self.main._answer_attention_query("what is Hemanth looking at", ["Hemanth"])
+                reply, found = self.main._answer_attention_query("what is Alok looking at", ["Alok"])
                 self.assertFalse(found)
                 self.assertIn("No recent attention events", reply)
 
@@ -57,12 +57,12 @@ class ChatTruthfulnessTests(unittest.TestCase):
                     "timestamp_utc": self.main._iso(),
                     "event_type": "behavior_event",
                     "event": "start",
-                    "person": "Hemanth",
+                    "person": "Alok",
                     "target_object": "laptop",
                 }
                 self.main.METRICS_LOG_PATH.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
-                reply, found = self.main._answer_attention_query("what is Hemanth looking at", ["Hemanth"])
+                reply, found = self.main._answer_attention_query("what is Alok looking at", ["Alok"])
                 self.assertTrue(found)
                 self.assertIn("laptop", reply)
             finally:
@@ -73,7 +73,7 @@ class ChatTruthfulnessTests(unittest.TestCase):
             with TestClient(self.server.app) as client:
                 row = client.post(
                     "/api/v1/chat/query",
-                    json={"message": "what is Hemanth looking at"},
+                    json={"message": "what is Alok looking at"},
                 ).json()
 
         self.assertEqual(row["intent"], "attention_lookup")
@@ -85,7 +85,7 @@ class ChatTruthfulnessTests(unittest.TestCase):
                 "timestamp_utc": self.main._iso(),
                 "event_type": "behavior_event",
                 "event": "start",
-                "person": "Hemanth",
+                "person": "Alok",
                 "target_object": "laptop",
             }
         ]
@@ -93,7 +93,7 @@ class ChatTruthfulnessTests(unittest.TestCase):
             with TestClient(self.server.app) as client:
                 row = client.post(
                     "/api/v1/chat/query",
-                    json={"message": "what is Hemanth looking at"},
+                    json={"message": "what is Alok looking at"},
                 ).json()
 
         self.assertEqual(row["intent"], "attention_lookup")

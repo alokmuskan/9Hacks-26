@@ -1287,8 +1287,14 @@ class PipelineManager:
                         "counts": {
                             "face_count": face_count,
                             "object_count": object_count,
+                            # Cumulative per-frame match counters (a face seen in
+                            # N frames adds N). Unique people and cooldown-gated
+                            # alert events are published alongside so the UI can
+                            # show honest "how many faces" numbers.
                             "known_detections": known_detections,
                             "unknown_detections": unknown_detections,
+                            "known_unique": len(people),
+                            "unknown_alerts": unknown_alert_count,
                         },
                     }
                     with self._lock:
@@ -2197,7 +2203,7 @@ def api_monitor_snapshot() -> dict[str, Any]:
     return {"status": "ok", "snapshot": snap}
 
 
-def build_video_stream_generator() -> Any:
+async def build_video_stream_generator() -> AsyncIterator[bytes]:
     last_seq = -1
     last_emit_mono = 0.0
     while True:
@@ -2218,7 +2224,10 @@ def build_video_stream_generator() -> Any:
             last_seq = seq
             last_emit_mono = now_mono
             yield _mjpeg_chunk(bytes(frame_bytes))
-        time.sleep(FRAME_WAIT_IDLE_SEC)
+        # Async sleep keeps this generator on the event loop, so shutdown/client
+        # disconnect cancels it at the await instead of blocking a threadpool
+        # thread that never observes the stop event (the old Ctrl+C hang).
+        await asyncio.sleep(FRAME_WAIT_IDLE_SEC)
 
 
 @app.get("/api/v1/stream/video")
@@ -2586,4 +2595,11 @@ def legacy_enroll_status() -> dict[str, Any]:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    # Bound the graceful-shutdown wait: an open MJPEG/WS stream otherwise keeps
+    # uvicorn in "Waiting for connection to close" for a very long time.
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        timeout_graceful_shutdown=int(os.getenv("UVICORN_GRACEFUL_SHUTDOWN_SEC", "5")),
+    )

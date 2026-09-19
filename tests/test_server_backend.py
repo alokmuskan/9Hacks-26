@@ -52,8 +52,8 @@ class ServerBackendTests(unittest.TestCase):
         # If stream path accidentally touches core inference stack, this will fail.
         with mock.patch.object(self.server, "_core", side_effect=AssertionError("core should not be called")):
             gen = self.server.build_video_stream_generator()
-            data = next(gen)
-            gen.close()
+            data = asyncio.run(gen.__anext__())
+            asyncio.run(gen.aclose())
             self.assertIn(b"Content-Type: image/jpeg", data)
 
     def test_camera_recovery_retries_and_recovers(self):
@@ -147,10 +147,10 @@ class ServerBackendTests(unittest.TestCase):
         with mock.patch.object(self.server, "_core", side_effect=AssertionError("core should not be called")):
             g1 = self.server.build_video_stream_generator()
             g2 = self.server.build_video_stream_generator()
-            c1 = next(g1)
-            c2 = next(g2)
-            g1.close()
-            g2.close()
+            c1 = asyncio.run(g1.__anext__())
+            c2 = asyncio.run(g2.__anext__())
+            asyncio.run(g1.aclose())
+            asyncio.run(g2.aclose())
 
         self.assertIn(jpeg, c1)
         self.assertIn(jpeg, c2)
@@ -162,8 +162,8 @@ class ServerBackendTests(unittest.TestCase):
 
         with mock.patch.object(self.server, "_encode_jpeg", side_effect=AssertionError("should not encode in stream")):
             gen = self.server.build_video_stream_generator()
-            chunk = next(gen)
-            gen.close()
+            chunk = asyncio.run(gen.__anext__())
+            asyncio.run(gen.aclose())
         self.assertIn(raw, chunk)
 
     def test_stream_generator_keepalive_emits_when_sequence_static(self):
@@ -175,9 +175,9 @@ class ServerBackendTests(unittest.TestCase):
             self.server, "FRAME_WAIT_IDLE_SEC", 0.0
         ):
             gen = self.server.build_video_stream_generator()
-            first = next(gen)
-            second = next(gen)
-            gen.close()
+            first = asyncio.run(gen.__anext__())
+            second = asyncio.run(gen.__anext__())
+            asyncio.run(gen.aclose())
 
         self.assertIn(raw, first)
         self.assertIn(raw, second)

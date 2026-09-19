@@ -19,6 +19,7 @@ export function SurveillanceProvider({ children }) {
   const [wsState, setWsState] = useState({ connected: false, reconnecting: false });
   const [streamStalled, setStreamStalled] = useState(false);
   const [errors, setErrors] = useState([]);
+  const suppressedErrorsRef = useRef({});
   const [operation, setOperation] = useState({ active: false, message: "", since: 0 });
   const [startupFailure, setStartupFailure] = useState(null);
   const [chatSessionId, setChatSessionId] = useState(null);
@@ -48,12 +49,35 @@ export function SurveillanceProvider({ children }) {
 
   const pushError = useCallback((err) => {
     const text = err instanceof Error ? err.message : String(err);
-    setErrors((prev) => [{ id: Date.now(), message: text }, ...prev].slice(0, 15));
+    const now = Date.now();
+    const suppressedUntil = suppressedErrorsRef.current[text] || 0;
+    if (now < suppressedUntil) {
+      return;
+    }
+    setErrors((prev) => {
+      // The heartbeat poll re-fires the same failure every 2s; without dedupe
+      // the stack fills with identical toasts faster than they can be dismissed.
+      if (prev.some((row) => row.message === text && now - row.ts < 10_000)) {
+        return prev;
+      }
+      return [{ id: now, ts: now, message: text }, ...prev].slice(0, 15);
+    });
   }, []);
 
   const removeError = useCallback((id) => {
     const target = Number(id);
-    setErrors((prev) => prev.filter((row) => Number(row?.id) !== target));
+    setErrors((prev) => {
+      // Suppress this exact message for a while so the heartbeat poll doesn't
+      // instantly re-add what the user just dismissed.
+      const suppressed = prev.find((row) => Number(row?.id) === target);
+      if (suppressed) {
+        suppressedErrorsRef.current = {
+          ...suppressedErrorsRef.current,
+          [suppressed.message]: Date.now() + 60_000
+        };
+      }
+      return prev.filter((row) => Number(row?.id) !== target);
+    });
   }, []);
 
   const beginOperation = useCallback((message) => {

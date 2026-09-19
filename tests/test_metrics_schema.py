@@ -34,7 +34,7 @@ class MetricsSchemaTests(unittest.TestCase):
                 "behavior_interactions_total": 7,
                 "behavior_attention_total_sec": 123.4,
                 "behavior_top_objects": [["laptop", 90.2]],
-                "behavior_attention_map": {"Hemanth": {"laptop": 90.2}},
+                "behavior_attention_map": {"Alok": {"laptop": 90.2}},
                 "behavior_events_count": 11,
                 "behavior_activity_patterns": {"transitions_per_min": 1.2},
                 "gaze_enabled": True,
@@ -67,7 +67,7 @@ class MetricsSchemaTests(unittest.TestCase):
         self.assertEqual(agg["behavior_interactions_total"], 7)
         self.assertAlmostEqual(agg["behavior_attention_total_sec"], 123.4, places=6)
         self.assertEqual(agg["behavior_top_objects"], [["laptop", 90.2]])
-        self.assertEqual(agg["behavior_attention_map"], {"Hemanth": {"laptop": 90.2}})
+        self.assertEqual(agg["behavior_attention_map"], {"Alok": {"laptop": 90.2}})
         self.assertEqual(agg["behavior_events_count"], 11)
         self.assertEqual(agg["behavior_activity_patterns"], {"transitions_per_min": 1.2})
         self.assertTrue(agg["gaze_enabled"])

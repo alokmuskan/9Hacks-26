@@ -84,7 +84,7 @@ class SessionAggregateContractTests(unittest.TestCase):
                 "interactions_total": 4,
                 "attention_total_sec": 30.0,
                 "top_objects": [["laptop", 20.0]],
-                "attention_map": {"Hemanth": {"laptop": 20.0}},
+                "attention_map": {"Alok": {"laptop": 20.0}},
                 "events_count": 7,
             },
             gaze_enabled=True,

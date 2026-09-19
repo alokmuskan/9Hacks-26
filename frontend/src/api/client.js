@@ -18,6 +18,11 @@ async function request(path, options = {}) {
     if (err?.name === "AbortError") {
       throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
     }
+    // fetch rejects with a bare TypeError ("Failed to fetch") when the backend
+    // is down/unreachable — say that in words a person can act on.
+    if (err instanceof TypeError) {
+      throw new Error(`Cannot reach the backend at ${API_BASE}. Is server.py running?`);
+    }
     throw err;
   }
   clearTimeout(timeoutId);

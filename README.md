@@ -411,7 +411,7 @@ All commands run from the repository root so that relative artifact paths resolv
 
 ```bash
 # Enroll an identity (press q to finish early)
-pixi run python main.py enroll --name Hemanth
+pixi run python main.py enroll --name Alok
 
 # Run the unified pipeline in a local OpenCV window
 pixi run python main.py recognize
@@ -429,7 +429,7 @@ pixi run python main.py train-objects --data path/to/data.yaml --epochs 30 --set
 pixi run python main.py memory-stats
 pixi run python main.py memory-recent --minutes 10
 pixi run python main.py memory-find --object laptop
-pixi run python main.py memory-find-person --name Hemanth
+pixi run python main.py memory-find-person --name Alok
 pixi run python main.py memory-search --text "person using laptop"
 
 # Summaries

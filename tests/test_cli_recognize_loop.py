@@ -10,7 +10,7 @@ from _stubs import install as _install_stubs
 
 
 class _FakeDB:
-    names: ClassVar[list[str]] = ["Hemanth"]
+    names: ClassVar[list[str]] = ["Alok"]
     counts: ClassVar[list[int]] = [5]
     centroids: ClassVar[np.ndarray] = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
 
@@ -227,7 +227,7 @@ class CliRecognizeLoopTests(unittest.TestCase):
         self.assertGreaterEqual(aggregate["frames_total"], 3)
         self.assertGreaterEqual(aggregate["known_detections"], 3)
         self.assertEqual(aggregate["unknown_detections"], 0)
-        self.assertIn("Hemanth", payload["people"])
+        self.assertIn("Alok", payload["people"])
         self.assertGreaterEqual(payload["events_total_count"], 0)
 
     def test_default_gaze_runs_every_frame_and_reports_full_rate(self):

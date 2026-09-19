@@ -53,3 +53,4 @@ frontend/.cache/
 
 # os noise
 .DS_Store
+data/
