@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+import common
+
 
 # Guards metadata read/merge/write across every SceneMemoryManager instance in the
 # process. The monitor worker and per-request API handlers all share one file.
@@ -80,10 +82,19 @@ class SceneMemoryManager:
         snapshot_interval_sec: float = 15.0,
         base_dir: str | Path = "memory",
         enable_vectors: bool = True,
+        max_auto_snapshots: int | None = None,
     ) -> None:
         # Floor the interval so a zero/negative value cannot snapshot every frame.
         self.snapshot_interval_sec = max(float(snapshot_interval_sec), 1.0)
         self.last_snapshot_time = 0.0
+
+        # Retention caps only automatic captures. Manual snapshots are user actions
+        # and are never pruned: silently deleting them is the bug this module
+        # already had once. 0 disables pruning entirely.
+        if max_auto_snapshots is None:
+            max_auto_snapshots = common.MEMORY_MAX_AUTO_SNAPSHOTS
+        self.max_auto_snapshots = max(int(max_auto_snapshots), 0)
+        self.pruned_snapshots = 0
 
         self.base_dir = Path(base_dir)
         self.snapshots_dir = self.base_dir / "snapshots"
@@ -356,7 +367,56 @@ class SceneMemoryManager:
         else:
             self.last_snapshot_time = float(datetime.now().timestamp())
 
+        if not manual:
+            pruned = self._prune_auto_snapshots()
+            if pruned:
+                self.pruned_snapshots += pruned
+                # Print rather than log: this module has no logger, and silently
+                # deleting captures is exactly what a user needs to be told about.
+                print(
+                    f"Memory retention: pruned {pruned} auto snapshot(s); "
+                    f"keeping the newest {self.max_auto_snapshots} "
+                    f"(manual snapshots are kept)."
+                )
+
         return entry
+
+    def _prune_auto_snapshots(self) -> int:
+        """Delete the oldest automatic snapshots once the cap is exceeded.
+
+        The cap is enforced across every instance because the index on disk is the
+        authority: a long-lived worker and per-request handlers would otherwise each
+        believe the store was under the limit.
+        """
+        if self.max_auto_snapshots <= 0:
+            return 0
+
+        with _STORE_LOCK:
+            merged = _merge_entries(_read_metadata_file(self.metadata_path), self.metadata)
+            auto_entries = [row for row in merged if not row.get("manual")]
+            excess = len(auto_entries) - self.max_auto_snapshots
+            if excess <= 0:
+                self.metadata = merged
+                return 0
+
+            # `merged` is chronological, so the head of `auto_entries` is the oldest.
+            doomed = auto_entries[:excess]
+            doomed_keys = {_entry_key(row) for row in doomed if _entry_key(row)}
+
+            for row in doomed:
+                raw_path = str(row.get("snapshot_path") or "").strip()
+                if not raw_path:
+                    continue
+                try:
+                    Path(raw_path).unlink(missing_ok=True)
+                except OSError:
+                    # A locked or already-deleted image must not stop the index update.
+                    pass
+
+            kept = [row for row in merged if _entry_key(row) not in doomed_keys]
+            self.metadata = kept
+            _write_metadata_file(self.metadata_path, kept)
+            return len(doomed)
 
     def get_memory_stats(self) -> dict[str, Any]:
         manual = sum(1 for row in self.metadata if row.get("manual"))
@@ -368,6 +428,10 @@ class SceneMemoryManager:
             "auto_snapshots": auto,
             "last_snapshot": self.metadata[-1]["timestamp_local"] if self.metadata else None,
             "snapshot_interval_sec": self.snapshot_interval_sec,
+            # Retention config, not a per-instance counter: a fresh manager reports 0
+            # pruned events even when earlier instances pruned the store, so only
+            # `total_snapshots` above describes the actual state.
+            "max_auto_snapshots": self.max_auto_snapshots,
             "vectors_enabled": self.vectors_enabled,
             "vector_backend_error": self.vector_backend_error,
         }

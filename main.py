@@ -208,7 +208,46 @@ def _save_unknown_snapshot(
         _bracket_box(snap, bbox, AMBER, thickness=2)
     cv2.imwrite(str(candidate), snap)
 
+    pruned = _prune_unknown_incidents()
+    if pruned:
+        print(
+            f"Incident retention: pruned {pruned} capture(s); "
+            f"keeping the newest {common.UNKNOWN_INCIDENT_MAX_FILES}."
+        )
+
     return str(candidate)
+
+
+def _prune_unknown_incidents(keep: int | None = None) -> int:
+    """Delete the oldest unknown-face captures once the directory exceeds its cap.
+
+    Unlike the snapshot store there is no index to keep in step, so this prunes by
+    file modification time. 0 disables pruning.
+    """
+    limit = common.UNKNOWN_INCIDENT_MAX_FILES if keep is None else max(int(keep), 0)
+    if limit <= 0 or not UNKNOWN_INCIDENTS_DIR.exists():
+        return 0
+
+    try:
+        captures = sorted(
+            (path for path in UNKNOWN_INCIDENTS_DIR.iterdir() if path.is_file()),
+            key=lambda path: (path.stat().st_mtime, path.name),
+        )
+    except OSError:
+        return 0
+
+    excess = len(captures) - limit
+    if excess <= 0:
+        return 0
+
+    removed = 0
+    for path in captures[:excess]:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def _resolve_general_model_path(path: str | None) -> str:

@@ -12,6 +12,7 @@ torch or ultralytics installed. It exists so the two entry points share:
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,27 @@ GAZE_TARGET_FPS_DROP_DEFAULT = 0.25
 GAZE_RECOVERY_STREAK_MIN = 5
 
 METRICS_FILENAME = "metrics_log.jsonl"
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.getenv(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+# ── Storage lifecycle ─────────────────────────────────────────────────────────
+# The metrics log rotates by size so it cannot grow without bound, and rotated
+# generations stay readable so reports keep their history. All three caps are
+# overridable from the environment so a deployment can size them to its disk.
+METRICS_MAX_BYTES = max(_env_int("AI_STUDIO_METRICS_MAX_BYTES", 4 * 1024 * 1024), 64 * 1024)
+METRICS_BACKUP_COUNT = max(_env_int("AI_STUDIO_METRICS_BACKUPS", 2), 0)
+
+# Auto snapshots are pruned to the newest N; manual snapshots are never pruned.
+MEMORY_MAX_AUTO_SNAPSHOTS = max(_env_int("AI_STUDIO_MEMORY_MAX_AUTO_SNAPSHOTS", 5000), 0)
+
+# Unknown-face incident captures are pruned to the newest N files.
+UNKNOWN_INCIDENT_MAX_FILES = max(_env_int("AI_STUDIO_UNKNOWN_INCIDENT_MAX_FILES", 500), 0)
 
 # Single process-wide lock: the monitor worker thread and FastAPI request
 # handlers both append to the metrics log, and rows can exceed the size where
@@ -85,35 +107,79 @@ def metrics_parse_errors() -> int:
     return int(_METRICS_PARSE_ERRORS)
 
 
+def metric_generations(path: Path | str) -> list[Path]:
+    """Existing generations of a rotating JSONL log, oldest first."""
+    path = Path(path)
+    generations = [
+        path.with_name(f"{path.name}.{index}")
+        for index in range(METRICS_BACKUP_COUNT, 0, -1)
+    ]
+    return [candidate for candidate in generations if candidate.exists()] + [path]
+
+
+def _rotate_metrics(path: Path) -> None:
+    """Shift generations once the active log exceeds its size cap.
+
+    Called while holding ``METRICS_LOCK``. Rotation is best-effort: a reader can
+    hold the file open (notably on Windows, where that blocks the rename), and
+    losing a rotation is far better than failing the append. The log then simply
+    keeps growing until a later append succeeds in rotating it.
+    """
+    try:
+        if not path.exists() or path.stat().st_size < METRICS_MAX_BYTES:
+            return
+        if METRICS_BACKUP_COUNT == 0:
+            path.unlink(missing_ok=True)
+            return
+        oldest = path.with_name(f"{path.name}.{METRICS_BACKUP_COUNT}")
+        oldest.unlink(missing_ok=True)
+        for index in range(METRICS_BACKUP_COUNT - 1, 0, -1):
+            source = path.with_name(f"{path.name}.{index}")
+            if source.exists():
+                os.replace(source, path.with_name(f"{path.name}.{index + 1}"))
+        os.replace(path, path.with_name(f"{path.name}.1"))
+    except OSError:
+        return
+
+
 def append_jsonl(path: Path | str, record: dict[str, Any]) -> None:
     """Append one JSON object as a single line, serialised across threads."""
+    path = Path(path)
     line = json.dumps(record, ensure_ascii=True) + "\n"
     with METRICS_LOCK:
-        with Path(path).open("a", encoding="utf-8") as handle:
+        _rotate_metrics(path)
+        with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
             handle.flush()
 
 
-def read_jsonl(path: Path | str) -> list[dict[str, Any]]:
-    """Read newline-delimited JSON, counting unreadable rows instead of hiding them."""
+def read_jsonl(path: Path | str, include_backups: bool = True) -> list[dict[str, Any]]:
+    """Read newline-delimited JSON, counting unreadable rows instead of hiding them.
+
+    Rotated generations are read oldest first so reports keep their history, which
+    also makes the read bounded by ``(METRICS_BACKUP_COUNT + 1) * METRICS_MAX_BYTES``.
+    """
     global _METRICS_PARSE_ERRORS
     path = Path(path)
-    if not path.exists():
-        return []
+    sources = metric_generations(path) if include_backups else [path]
+
     rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                # Surface the count through `report` rather than discarding silently.
-                _METRICS_PARSE_ERRORS += 1
-                continue
-            if isinstance(row, dict):
-                rows.append(row)
+    for source in sources:
+        if not source.exists():
+            continue
+        with source.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    # Surface the count through `report` rather than discarding silently.
+                    _METRICS_PARSE_ERRORS += 1
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
     return rows
 
 
