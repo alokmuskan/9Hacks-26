@@ -1,5 +1,7 @@
 # Getting Started
 
+> Taking this to a public demo or expo? [`DEPLOYMENT.md`](DEPLOYMENT.md) is the runbook for that.
+
 A short, verified path from clone to a live monitoring session. The full reference
 (including architecture, storage internals, and every endpoint) lives in
 [README.md](README.md).
@@ -132,6 +134,9 @@ The persisted session aggregate records `face_recognition_enabled` and
 | `AI_STUDIO_METRICS_BACKUPS` | `2` | Rotated metric generations kept |
 | `AI_STUDIO_MEMORY_MAX_AUTO_SNAPSHOTS` | `5000` | Auto-snapshot retention cap |
 | `AI_STUDIO_UNKNOWN_INCIDENT_MAX_FILES` | `500` | Unknown-face capture cap |
+| `AI_STUDIO_FPS_CAP` | `12` | Monitor FPS ceiling (lower = less CPU) |
+| `AI_STUDIO_ENROLL_FPS_CAP` | `20` | Enrollment FPS ceiling |
+| `AI_STUDIO_SNAPSHOT_INTERVAL` | `8.0` | Seconds between auto snapshots (the instances used for analysis) |
 
 Dashboard → backend URL: set `VITE_API_BASE` in `frontend/.env.local` (defaults to
 `http://localhost:8000`).

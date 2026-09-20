@@ -1,6 +1,9 @@
 import asyncio
 import importlib
 import logging
+import os
+import subprocess
+import sys
 import time
 import unittest
 from typing import ClassVar
@@ -403,6 +406,78 @@ class ServerBackendTests(unittest.TestCase):
                 self.assertTrue(row.get("hit"))
                 self.assertIn("2 distinct persons", str(row.get("reply")))
                 self.assertTrue(isinstance(row.get("citations"), list))
+
+
+class PacingAndCaptureDefaultsTests(unittest.TestCase):
+    """Live-FPS pacing and instance-capture cadence are env-tunable defaults.
+
+    The monitor loop treats fps_cap as a ceiling (a slow machine simply runs at
+    whatever it can keep up with), while auto snapshots — the instances reports
+    and chat ground on — run on their own wall-clock cadence. These tests pin
+    the defaults, the status plumbing, and the env overrides with clamping.
+    """
+
+    def setUp(self):
+        self.server = importlib.import_module("server")
+
+    def test_request_defaults_are_tuned_for_capture(self):
+        monitor = self.server.MonitorStartRequest()
+        self.assertEqual(monitor.fps_cap, 12)
+        self.assertEqual(monitor.snapshot_interval, 8.0)
+        # Enrollment keeps the faster cap on purpose: sample collection wants rate.
+        enroll = self.server.EnrollStartRequest(name="x")
+        self.assertEqual(enroll.fps_cap, 20)
+
+    def test_status_reports_active_pacing_and_cadence(self):
+        manager = self.server.PipelineManager()
+        st = manager.status()
+        self.assertEqual(st["fps_cap"], self.server.FPS_CAP_DEFAULT)
+        self.assertEqual(st["snapshot_interval"], self.server.SNAPSHOT_INTERVAL_DEFAULT)
+
+        # What start_monitor stores must be exactly what status exposes.
+        manager._fps_cap = 7
+        manager._snapshot_interval = 3.5
+        st = manager.status()
+        self.assertEqual(st["fps_cap"], 7)
+        self.assertEqual(st["snapshot_interval"], 3.5)
+
+    def _probe(self, **env_overrides: str) -> list[str]:
+        code = (
+            "import common;"
+            "print(common.FPS_CAP_DEFAULT, common.ENROLL_FPS_CAP_DEFAULT, "
+            "common.SNAPSHOT_INTERVAL_DEFAULT)"
+        )
+        env = {**os.environ, **env_overrides}
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))) or ".",
+        )
+        return proc.stdout.split()
+
+    def test_env_overrides_apply_and_clamp(self):
+        # Overrides apply.
+        self.assertEqual(
+            self._probe(
+                AI_STUDIO_FPS_CAP="9",
+                AI_STUDIO_ENROLL_FPS_CAP="33",
+                AI_STUDIO_SNAPSHOT_INTERVAL="2.5",
+            ),
+            ["9", "33", "2.5"],
+        )
+        # Values outside the API's own validation ranges clamp instead of exploding.
+        self.assertEqual(
+            self._probe(AI_STUDIO_FPS_CAP="500", AI_STUDIO_SNAPSHOT_INTERVAL="0.1"),
+            ["60", "20", "1.0"],
+        )
+        # Garbage falls back to the defaults.
+        self.assertEqual(
+            self._probe(AI_STUDIO_FPS_CAP="abc", AI_STUDIO_SNAPSHOT_INTERVAL="xyz"),
+            ["12", "20", "8.0"],
+        )
 
 
 if __name__ == "__main__":

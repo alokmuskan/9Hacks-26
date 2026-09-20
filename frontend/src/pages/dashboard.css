@@ -4,11 +4,45 @@
   gap: 16px;
 }
 
+/* Cards are buttons: they open the drill-down dialog, so they need button
+   resets on top of the glass-panel look. */
 .metric-card {
   padding: 18px;
   display: flex;
   align-items: center;
   gap: 12px;
+  position: relative;
+  width: 100%;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.metric-card:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+.metric-card:hover .metric-open,
+.metric-card:focus-visible .metric-open {
+  color: var(--accent-blue);
+  transform: translate(2px, -2px);
+}
+
+.metric-open {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  color: var(--text-muted);
+  transition: color 0.2s ease, transform 0.2s ease;
+}
+
+.metric-hint {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 0.72rem;
 }
 
 .metric-icon {
@@ -83,6 +117,63 @@
   padding: 18px;
 }
 
+/* Readable event feed: a plain sentence replaces the raw type/detail columns. */
+.event-when {
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.event-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 600;
+}
+
+.event-title.tone-info {
+  color: var(--accent-blue);
+}
+
+.event-title.tone-success {
+  color: var(--accent-green);
+}
+
+.event-title.tone-warn {
+  color: var(--accent-amber);
+}
+
+.event-title.tone-alert {
+  color: var(--accent-red);
+}
+
+.event-title.tone-muted {
+  color: var(--text-secondary);
+}
+
+/* Raw type + session id: useful for traceability, deliberately quiet. */
+.event-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  margin-left: 22px;
+  flex-wrap: wrap;
+}
+
+.event-type-badge {
+  padding: 1px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.03em;
+}
+
+.event-session {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
 @media (max-width: 640px) {
   .metric-card {
     padding: 14px;
@@ -90,6 +181,20 @@
 
   .metric-copy div {
     font-size: 1.5rem;
+  }
+
+  .metric-open {
+    top: 10px;
+    right: 10px;
+  }
+
+  .event-meta {
+    margin-left: 0;
+  }
+
+  .event-when {
+    color: var(--text-muted);
+    font-size: 0.78rem;
   }
 
   /* Card-style event log: columns become stacked rows so nothing is clipped. */

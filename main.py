@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
 import platform
 import re
+import struct
 import sys
+import tempfile
 import threading
 import time
+import urllib.request
 from collections import Counter, defaultdict, deque
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -77,10 +81,24 @@ UNKNOWN_ALERT_COOLDOWN_SEC = 3.0
 GAZE_INTERVAL_DEFAULT = common.GAZE_INTERVAL_DEFAULT
 GAZE_MAX_INTERVAL_DEFAULT = common.GAZE_MAX_INTERVAL_DEFAULT
 GAZE_TARGET_FPS_DROP_DEFAULT = common.GAZE_TARGET_FPS_DROP_DEFAULT
+# Same story for capture cadence: CLI and API must not disagree on it.
+SNAPSHOT_INTERVAL_DEFAULT = common.SNAPSHOT_INTERVAL_DEFAULT
 GAZE_ARCH_DEFAULT = "ResNet50"
 GAZE_WEIGHTS_DEFAULT = "models/L2CSNet_gaze360.pkl"
 GAZE_WEIGHTS_SOURCE_DEFAULT = (
     "https://drive.google.com/drive/folders/17p6ORr-JQJcw-eYtG2WGNiuS_qVKwdWd?usp=sharing"
+)
+# The upstream Google Drive folder has been unreachable (404) since 2026-09, so
+# bootstrap falls back to py-feat's mirror of the same upstream Gaze360 ResNet50
+# checkpoint (safetensors, converted to the `.pkl` this project expects). Size
+# and sha256 are pinned to the LFS object so a truncated or tampered download
+# is rejected instead of loaded.
+GAZE_WEIGHTS_MIRROR_URL = (
+    "https://huggingface.co/py-feat/l2cs/resolve/main/l2cs_gaze360_resnet50.safetensors"
+)
+GAZE_WEIGHTS_MIRROR_SIZE = 95_773_960
+GAZE_WEIGHTS_MIRROR_SHA256 = (
+    "75405bdc01f7086b3887280fe50c28a14bc62463a53fa749781e4a3cf98eca0e"
 )
 GAZE_EMA_ALPHA = 0.10
 GAZE_RECOVERY_STREAK_MIN = common.GAZE_RECOVERY_STREAK_MIN
@@ -668,6 +686,146 @@ def _select_gaze360_weight_path(
     return min(filtered, key=lambda p: p.name.lower())
 
 
+def _download_gaze_weights_from_mirror(destination: Path) -> Path | None:
+    """Fetch the pinned Hugging Face mirror and convert it to the expected .pkl.
+
+    The upstream Google Drive folder is dead, so this is the only working
+    download path for fresh clones. Returns the converted checkpoint path, or
+    None on any failure (network, truncated file, checksum mismatch, missing
+    safetensors dependency). Strictly additive: never touches an existing
+    weights file.
+    """
+    if destination.exists():
+        return None
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    buffer = bytearray()
+    try:
+        request = urllib.request.Request(
+            GAZE_WEIGHTS_MIRROR_URL,
+            headers={"User-Agent": "gaze-weights-bootstrap"},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            expected_len = int(response.headers.get("Content-Length") or 0)
+            if expected_len and expected_len != GAZE_WEIGHTS_MIRROR_SIZE:
+                print(
+                    "[GAZE] Mirror file size changed "
+                    f"({expected_len} != {GAZE_WEIGHTS_MIRROR_SIZE}); refusing to use it."
+                )
+                return None
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                buffer.extend(chunk)
+                if len(buffer) > GAZE_WEIGHTS_MIRROR_SIZE + 1024 * 1024:
+                    print("[GAZE] Mirror download exceeded the pinned size; aborting.")
+                    return None
+    except Exception as ex:
+        msg = str(ex).splitlines()[0] if str(ex) else type(ex).__name__
+        print(f"[GAZE] Mirror download failed ({msg})")
+        return None
+
+    if len(buffer) != GAZE_WEIGHTS_MIRROR_SIZE:
+        print(
+            f"[GAZE] Mirror download truncated ({len(buffer)} != {GAZE_WEIGHTS_MIRROR_SIZE})"
+        )
+        return None
+    digest = hashlib.sha256(bytes(buffer)).hexdigest()
+    if digest != GAZE_WEIGHTS_MIRROR_SHA256:
+        print("[GAZE] Mirror checksum mismatch; refusing to use the download.")
+        return None
+
+    try:
+        state_dict = _load_safetensors_state_dict(bytes(buffer))
+    except Exception as ex:
+        msg = str(ex).splitlines()[0] if str(ex) else type(ex).__name__
+        print(f"[GAZE] Mirror file could not be parsed ({msg})")
+        return None
+
+    if "fc_yaw_gaze.weight" not in state_dict:
+        print("[GAZE] Mirror checkpoint lacks the expected L2CS head keys.")
+        return None
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent, prefix=".gaze-mirror-", suffix=".pkl", delete=False
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            _save_gaze_weights_pkl(state_dict, tmp)
+        os.replace(tmp_path, destination)
+        return destination
+    except Exception as ex:
+        msg = str(ex).splitlines()[0] if str(ex) else type(ex).__name__
+        print(f"[GAZE] Could not write converted weights ({msg})")
+        if tmp_path is not None:
+            with suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+        return None
+
+
+def _load_safetensors_state_dict(payload: bytes) -> dict[str, Any]:
+    """Minimal safetensors reader: header JSON + raw tensor data.
+
+    Used by the mirror fallback so a fresh clone does not need the
+    `safetensors` package. Rejects unsupported dtypes and offsets that fall
+    outside the buffer instead of importing corrupted data.
+    """
+    if len(payload) < 8:
+        raise ValueError("safetensors buffer too short")
+    (header_len,) = struct.unpack("<Q", payload[:8])
+    if header_len <= 0 or 8 + header_len > len(payload):
+        raise ValueError("safetensors header length out of range")
+    header = json.loads(payload[8 : 8 + header_len].decode("utf-8"))
+    data_start = 8 + header_len
+
+    dtype_map = {
+        "F64": ("float64", 8),
+        "F32": ("float32", 4),
+        "F16": ("float16", 2),
+        "I64": ("int64", 8),
+        "I32": ("int32", 4),
+        "I16": ("int16", 2),
+        "I8": ("int8", 1),
+        "U8": ("uint8", 1),
+        "BOOL": ("bool", 1),
+    }
+    tensors: dict[str, Any] = {}
+    for name, info in header.items():
+        if name == "__metadata__":
+            continue
+        dtype, item_size = dtype_map[info["dtype"]]
+        shape = list(info["shape"])
+        begin, end = info["data_offsets"]
+        count = 1
+        for dim in shape:
+            count *= int(dim)
+        if end - begin != count * item_size or data_start + end > len(payload):
+            raise ValueError(f"safetensors tensor {name!r} has invalid extents")
+        tensors[name] = np.frombuffer(
+            payload, dtype=dtype, count=count, offset=data_start + begin
+        ).reshape(shape)
+    return tensors
+
+
+def _save_gaze_weights_pkl(state_dict: dict[str, Any], handle: Any) -> None:
+    """Save a numpy state_dict as the torch-tensor `.pkl` the loader expects.
+
+    `model.load_state_dict` rejects numpy arrays on current torch (verified:
+    torch 2.x raises "expected torch.Tensor ... received numpy.ndarray"), so
+    the safetensors numpy values are converted to torch tensors before pickling
+    — matching the checkpoint format upstream ships. `from_numpy` on a copy
+    because the safetensors buffers are read-only.
+    """
+    import torch
+
+    tensor_dict = {
+        key: torch.from_numpy(np.asarray(value).copy()) for key, value in state_dict.items()
+    }
+    torch.save(tensor_dict, handle)
+
+
 def _resolve_l2cs_weights_path(
     weights_path: Path,
     weights_source: str,
@@ -691,22 +849,23 @@ def _resolve_l2cs_weights_path(
         if local_selected is not None and local_selected.exists():
             return local_selected.resolve()
 
-    if not auto_download or gdown_module is None:
+    if not auto_download:
         return None
 
     weights_path.parent.mkdir(parents=True, exist_ok=True)
     downloaded_files: list[str] = []
-    try:
-        rows = gdown_module.download_folder(
-            url=weights_source,
-            output=str(weights_path.parent),
-            quiet=True,
-            use_cookies=False,
-        )
-        if isinstance(rows, list):
-            downloaded_files = [str(x) for x in rows if x]
-    except Exception:
-        return None
+    if gdown_module is not None:
+        try:
+            rows = gdown_module.download_folder(
+                url=weights_source,
+                output=str(weights_path.parent),
+                quiet=True,
+                use_cookies=False,
+            )
+            if isinstance(rows, list):
+                downloaded_files = [str(x) for x in rows if x]
+        except Exception:
+            downloaded_files = []
 
     candidate_paths: list[Path] = []
     for row in downloaded_files:
@@ -719,7 +878,16 @@ def _resolve_l2cs_weights_path(
     if not candidate_paths:
         candidate_paths = list(weights_path.parent.rglob("*.pkl"))
     selected = _select_gaze360_weight_path([str(p) for p in candidate_paths], preferred_arch=preferred_arch)
-    return selected if selected is None else selected.resolve()
+    if selected is not None and selected.exists():
+        return selected.resolve()
+
+    # The upstream Google Drive folder returns 404 for everyone, so gdown
+    # typically yields nothing. Fall back to the pinned Hugging Face mirror of
+    # the same upstream checkpoint before giving up.
+    mirrored = _download_gaze_weights_from_mirror(weights_path)
+    if mirrored is not None:
+        return mirrored.resolve()
+    return None
 
 
 def _expand_bbox_by_ratio(
@@ -4505,8 +4673,11 @@ def main() -> None:
     p_r.add_argument(
         "--snapshot-interval",
         type=float,
-        default=15.0,
-        help="Automatic snapshot interval in seconds (default: 15)",
+        default=SNAPSHOT_INTERVAL_DEFAULT,
+        help=(
+            "Automatic snapshot interval in seconds "
+            f"(default: {SNAPSHOT_INTERVAL_DEFAULT:g}, env AI_STUDIO_SNAPSHOT_INTERVAL)"
+        ),
     )
     p_r.add_argument(
         "--gaze-arch",

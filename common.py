@@ -46,6 +46,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 # ── Storage lifecycle ─────────────────────────────────────────────────────────
 # The metrics log rotates by size so it cannot grow without bound, and rotated
 # generations stay readable so reports keep their history. All three caps are
@@ -58,6 +65,21 @@ MEMORY_MAX_AUTO_SNAPSHOTS = max(_env_int("AI_STUDIO_MEMORY_MAX_AUTO_SNAPSHOTS", 
 
 # Unknown-face incident captures are pruned to the newest N files.
 UNKNOWN_INCIDENT_MAX_FILES = max(_env_int("AI_STUDIO_UNKNOWN_INCIDENT_MAX_FILES", 500), 0)
+
+# ── Live pacing & instance capture ────────────────────────────────────────────
+# The monitor loop targets at most FPS_CAP_DEFAULT frames per second; the cap is
+# a ceiling, so a slow machine simply runs at whatever it can keep up with. The
+# default is deliberately modest: every frame pays for two YOLO passes, face
+# recognition and (sometimes) gaze, and the same machine also encodes the
+# MJPEG stream for every connected dashboard.
+#
+# Auto snapshots — the "instances" that reports and chat ground on — run on
+# their own wall-clock cadence (SNAPSHOT_INTERVAL_DEFAULT seconds), fully
+# decoupled from FPS, so instance volume is tuned independently of processing
+# speed. Enrollment keeps a faster cap because sample collection benefits.
+FPS_CAP_DEFAULT = min(max(_env_int("AI_STUDIO_FPS_CAP", 12), 1), 60)
+ENROLL_FPS_CAP_DEFAULT = min(max(_env_int("AI_STUDIO_ENROLL_FPS_CAP", 20), 1), 60)
+SNAPSHOT_INTERVAL_DEFAULT = min(max(_env_float("AI_STUDIO_SNAPSHOT_INTERVAL", 8.0), 1.0), 3600.0)
 
 # Single process-wide lock: the monitor worker thread and FastAPI request
 # handlers both append to the metrics log, and rows can exceed the size where

@@ -19,6 +19,7 @@ The system ships two front ends over one shared core:
 
 - [Overview](#overview)
 - [Getting Started](GETTING_STARTED.md)
+- [Deployment](DEPLOYMENT.md)
 - [Key Features](#key-features)
 - [Architecture](#architecture)
 - [Project Structure](#project-structure)
@@ -303,6 +304,9 @@ All variables are optional; the defaults below reflect the code.
 | `AI_STUDIO_METRICS_BACKUPS` | `2` | backend | Rotated generations to keep (`0` truncates instead of rotating) |
 | `AI_STUDIO_MEMORY_MAX_AUTO_SNAPSHOTS` | `5000` | backend | Automatic snapshots to keep; `0` disables pruning. Manual snapshots are never pruned |
 | `AI_STUDIO_UNKNOWN_INCIDENT_MAX_FILES` | `500` | backend | Unknown-face captures to keep, oldest pruned first; `0` disables pruning |
+| `AI_STUDIO_FPS_CAP` | `12` | backend | Monitor-loop ceiling in frames/s. The cap is a ceiling — slow machines run at whatever they keep up with. Lower = less CPU, higher = snappier detection |
+| `AI_STUDIO_ENROLL_FPS_CAP` | `20` | backend | Same ceiling for enrollment sessions (kept faster on purpose; sample collection wants rate) |
+| `AI_STUDIO_SNAPSHOT_INTERVAL` | `8.0` | backend | Seconds between auto snapshots — the instances reports and chat ground on. Runs on wall-clock time, independent of FPS; clamped to 1–3600 |
 | `GROQ_API_KEY` *(or `groq_api_key`)* | unset | backend | Enables the LLM chat fallback |
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | backend | Groq model name |
 | `PORT` | `8000` | backend | Port for `python server.py` |
@@ -776,6 +780,7 @@ Treat this project as a research/development prototype. Before any real deployme
 
 ## Related Documentation
 
+- [`DEPLOYMENT.md`](DEPLOYMENT.md) — expo/public demo runbook: tunnel setup, pre-flight checks, contingency plans
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — pipeline internals, startup/recovery model, behavior rules, storage schema
 - [`docs/CHAT_AND_SUMMARY.md`](docs/CHAT_AND_SUMMARY.md) — chat intents, action confirmation flow, summaries, citations, telemetry
 

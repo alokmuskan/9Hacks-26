@@ -1,0 +1,285 @@
+/* Detail dialog opened from the dashboard metric cards. */
+.detail-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(2, 6, 16, 0.72);
+  backdrop-filter: blur(3px);
+}
+
+.detail-modal {
+  width: min(920px, 94vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: var(--glass-shadow);
+}
+
+.detail-modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 18px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.detail-modal-titles h3 {
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+}
+
+.detail-modal-sub {
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+
+.detail-modal-close {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: border-color 0.2s ease, color 0.2s ease;
+}
+
+.detail-modal-close:hover,
+.detail-modal-close:focus-visible {
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
+  outline: none;
+}
+
+.detail-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 12px 18px 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.detail-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.detail-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.2s ease, color 0.2s ease, background 0.2s ease;
+}
+
+.detail-tab:hover,
+.detail-tab:focus-visible {
+  color: var(--text-primary);
+  border-color: rgba(0, 210, 254, 0.35);
+  outline: none;
+}
+
+.detail-tab.active {
+  color: var(--accent-blue);
+  border-color: rgba(0, 210, 254, 0.45);
+  background: rgba(0, 210, 254, 0.1);
+}
+
+.detail-tab-count {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.detail-tab.active .detail-tab-count {
+  color: var(--accent-blue);
+}
+
+.detail-modal-body {
+  padding: 16px 18px 20px;
+  overflow-y: auto;
+}
+
+/* Shared blocks used inside the dialog. */
+.detail-section + .detail-section {
+  margin-top: 18px;
+}
+
+.detail-section h4 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+
+.detail-stat-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+}
+
+.detail-stat {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.detail-stat span {
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
+.detail-stat strong {
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+}
+
+.detail-stat.positive strong {
+  color: var(--accent-green);
+}
+
+.detail-stat.alert strong {
+  color: var(--accent-red);
+}
+
+.detail-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.detail-table th,
+.detail-table td {
+  text-align: left;
+  padding: 9px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  font-size: 0.85rem;
+  vertical-align: top;
+}
+
+.detail-table th {
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  letter-spacing: 0.03em;
+}
+
+.detail-empty {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  padding: 10px 0;
+}
+
+.detail-note {
+  margin-top: 10px;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 0.8rem;
+}
+
+.chip.known {
+  border-color: rgba(0, 255, 102, 0.3);
+  color: var(--accent-green);
+}
+
+.chip.muted {
+  color: var(--text-secondary);
+}
+
+.chip-now {
+  color: var(--accent-cyan);
+}
+
+@media (max-width: 640px) {
+  .detail-scrim {
+    padding: 0;
+    align-items: stretch;
+  }
+
+  .detail-modal {
+    width: 100%;
+    max-height: 100%;
+    border-radius: 0;
+  }
+
+  .detail-modal-head {
+    padding: 14px 14px 10px;
+  }
+
+  .detail-tabs {
+    padding: 10px 14px 0;
+  }
+
+  .detail-modal-body {
+    padding: 14px;
+  }
+
+  /* Tables become stacked cards so nothing is clipped on phones. */
+  .detail-table thead {
+    display: none;
+  }
+
+  .detail-table,
+  .detail-table tbody,
+  .detail-table tr,
+  .detail-table td {
+    display: block;
+  }
+
+  .detail-table tr {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    padding: 8px 0;
+  }
+
+  .detail-table td {
+    padding: 2px 0;
+    border-bottom: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .detail-table td::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+}
