@@ -6,6 +6,8 @@ from typing import Any
 
 import numpy as np
 
+import common
+
 
 def _to_numpy(value: Any) -> np.ndarray:
     if value is None:
@@ -83,9 +85,22 @@ class DualYoloDetector:
         enable_custom: bool = True,
         general_model_obj: Any | None = None,
         custom_model_obj: Any | None = None,
+        conf: float | None = None,
+        iou: float | None = None,
+        imgsz: int | None = None,
+        max_det: int | None = None,
     ) -> None:
         self.general_model_path = general_model_path
         self.custom_model_path = custom_model_path
+
+        # Inference parameters are resolved once, here, so the live loop and the
+        # offline benchmark cannot drift apart, and so `/monitor/status` can report
+        # exactly what inference is using.
+        self.conf: float = common.YOLO_CONF_DEFAULT
+        self.iou: float = common.YOLO_IOU_DEFAULT
+        self.imgsz: int = common.YOLO_IMGSZ_DEFAULT
+        self.max_det: int = common.YOLO_MAX_DET_DEFAULT
+        self.configure(conf=conf, iou=iou, imgsz=imgsz, max_det=max_det)
 
         self.general_model = general_model_obj
         self.custom_model = custom_model_obj
@@ -104,6 +119,30 @@ class DualYoloDetector:
         if self.custom_model is None:
             self.custom_enabled = False
 
+    def configure(
+        self,
+        *,
+        conf: float | None = None,
+        iou: float | None = None,
+        imgsz: int | None = None,
+        max_det: int | None = None,
+    ) -> dict[str, Any]:
+        """Apply inference parameters (clamped to usable ranges) and return them.
+
+        One clamping path for the constructor, runtime tuning and the offline
+        benchmark, so a value cannot be valid in one place and invalid in another.
+        ``None`` leaves a parameter at its configured default.
+        """
+        if conf is not None:
+            self.conf = min(max(float(conf), 0.01), 0.99)
+        if iou is not None:
+            self.iou = min(max(float(iou), 0.1), 0.95)
+        if imgsz is not None:
+            self.imgsz = common.normalize_imgsz(int(imgsz))
+        if max_det is not None:
+            self.max_det = min(max(int(max_det), 1), 1000)
+        return self.params()
+
     def _load_model(self, model_path: str) -> Any:
         try:
             from ultralytics import YOLO
@@ -118,7 +157,7 @@ class DualYoloDetector:
         if model is None:
             return []
 
-        results = model(frame, verbose=False)
+        results = model(frame, verbose=False, **self.params())
         if not results:
             return []
 
@@ -167,8 +206,13 @@ class DualYoloDetector:
         self.custom_enabled = not self.custom_enabled
         return self.custom_enabled
 
+    def params(self) -> dict[str, Any]:
+        """The inference kwargs handed to Ultralytics on every call."""
+        return {"conf": self.conf, "iou": self.iou, "imgsz": self.imgsz, "max_det": self.max_det}
+
     def get_state(self) -> dict[str, Any]:
         return {
+            "params": self.params(),
             "general": {
                 "enabled": self.general_enabled,
                 "loaded": self.general_model is not None,

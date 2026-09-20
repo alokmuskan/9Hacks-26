@@ -304,6 +304,10 @@ All variables are optional; the defaults below reflect the code.
 | `AI_STUDIO_METRICS_BACKUPS` | `2` | backend | Rotated generations to keep (`0` truncates instead of rotating) |
 | `AI_STUDIO_MEMORY_MAX_AUTO_SNAPSHOTS` | `5000` | backend | Automatic snapshots to keep; `0` disables pruning. Manual snapshots are never pruned |
 | `AI_STUDIO_UNKNOWN_INCIDENT_MAX_FILES` | `500` | backend | Unknown-face captures to keep, oldest pruned first; `0` disables pruning |
+| `AI_STUDIO_YOLO_IMGSZ` | `768` | backend | Object-detection inference size (320–1920, snapped to a multiple of 32). Benchmarked: 768 found 8 classes vs 5 at 640 on this project's own frames at ~150 ms vs ~90 ms per frame |
+| `AI_STUDIO_YOLO_CONF` | `0.25` | backend | Object-detection confidence threshold (0.01–0.99). Lower finds more at the cost of low-confidence noise |
+| `AI_STUDIO_YOLO_IOU` | `0.7` | backend | NMS IoU threshold (0.1–0.95) |
+| `AI_STUDIO_YOLO_MAX_DET` | `300` | backend | Maximum boxes per frame (1–1000) |
 | `AI_STUDIO_FPS_CAP` | `12` | backend | Monitor-loop ceiling in frames/s. The cap is a ceiling — slow machines run at whatever they keep up with. Lower = less CPU, higher = snappier detection |
 | `AI_STUDIO_ENROLL_FPS_CAP` | `20` | backend | Same ceiling for enrollment sessions (kept faster on purpose; sample collection wants rate) |
 | `AI_STUDIO_SNAPSHOT_INTERVAL` | `8.0` | backend | Seconds between auto snapshots — the instances reports and chat ground on. Runs on wall-clock time, independent of FPS; clamped to 1–3600 |

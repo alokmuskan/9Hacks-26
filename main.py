@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 
 import common
+import detection_bench
 from object_detection import DualYoloDetector, find_latest_custom_model
 from scene_memory import SceneMemoryManager
 
@@ -229,7 +230,7 @@ def _timeline_bar(count: int, max_count: int, width: int = 12) -> str:
 
 def _save_unknown_snapshot(
     frame: np.ndarray, unknown_bboxes: list[np.ndarray], ts_utc: datetime
-) -> str:
+) -> str | None:
     UNKNOWN_INCIDENTS_DIR.mkdir(parents=True, exist_ok=True)
     ts_local = ts_utc.astimezone()
     base = ts_local.strftime("unknown_%Y-%m-%d_%H-%M-%S")
@@ -259,7 +260,14 @@ def _save_unknown_snapshot(
         if candidate is None:
             candidate = UNKNOWN_INCIDENTS_DIR / f"{base}_overflow.jpg"
 
-        cv2.imwrite(str(candidate), snap)
+        # A reserved-but-empty file is worse than no capture at all: it looks like
+        # evidence while containing nothing. (The detection benchmark found 28 such
+        # files on this machine.) Verify the write and leave nothing misleading.
+        written = bool(cv2.imwrite(str(candidate), snap)) and candidate.stat().st_size > 0
+        if not written:
+            with suppress(OSError):
+                candidate.unlink()
+            candidate = None
 
     pruned = _prune_unknown_incidents()
     if pruned:
@@ -267,6 +275,10 @@ def _save_unknown_snapshot(
             f"Incident retention: pruned {pruned} capture(s); "
             f"keeping the newest {common.UNKNOWN_INCIDENT_MAX_FILES}."
         )
+
+    if candidate is None:
+        print("Unknown-face capture could not be written; incident image skipped.")
+        return None
 
     return str(candidate)
 
@@ -2845,7 +2857,7 @@ def cmd_recognize(
                     severity="alert",
                     extra={
                         "image_path": snapshot_path,
-                        "image_name": Path(snapshot_path).name,
+                        "image_name": Path(snapshot_path).name if snapshot_path else None,
                     },
                 )
 
@@ -4640,6 +4652,33 @@ def cmd_bootstrap(download_gaze: bool = True) -> None:
         print("Unresolved: " + "; ".join(problems))
 
 
+def cmd_bench_detect(
+    frame_patterns: list[str],
+    model: str | None,
+    confs: list[float] | None,
+    sizes: list[int] | None,
+    min_brightness: float,
+    json_out: str | None,
+) -> None:
+    """Measure object detection offline, so tuning claims can be verified."""
+    model_path = _resolve_general_model_path(model)
+    params = detection_bench.default_param_grid(confs, sizes)
+    frames, rejected = detection_bench.load_frames(frame_patterns, min_brightness=min_brightness)
+    references = detection_bench.reference_assets()
+
+    print(f"Model      : {model_path}")
+    print(f"Frames     : {len(frames)} usable, {len(rejected)} excluded")
+    print(f"References : {len(references)}")
+    print()
+
+    results = detection_bench.run_benchmark(model_path, params, frames, references)
+    print(detection_bench.format_report(results, rejected))
+
+    if json_out:
+        Path(json_out).write_text(json.dumps(results, indent=2), encoding="utf-8")
+        print(f"\nWrote {json_out}")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
     if not hasattr(np, "int"):
@@ -4758,6 +4797,30 @@ def main() -> None:
         action="store_true",
         help="Also probe the configured camera (opens and releases the device)",
     )
+    p_bd = sub.add_parser(
+        "bench-detect",
+        help="Benchmark object detection offline on saved frames and reference images",
+    )
+    p_bd.add_argument(
+        "--frames",
+        nargs="+",
+        default=["memory/snapshots/*.jpg", "unknown_incidents/*.jpg"],
+        help="Glob patterns for the frames to benchmark (default: the project's saved frames)",
+    )
+    p_bd.add_argument(
+        "--model",
+        default=None,
+        help="Detector checkpoint, or a name for Ultralytics to download (default: configured general model)",
+    )
+    p_bd.add_argument("--conf", type=float, nargs="+", default=None, help="Confidence thresholds to compare")
+    p_bd.add_argument("--imgsz", type=int, nargs="+", default=None, help="Inference sizes to compare")
+    p_bd.add_argument(
+        "--min-brightness",
+        type=float,
+        default=detection_bench.DEFAULT_MIN_BRIGHTNESS,
+        help="Frames darker than this are excluded and reported instead of skewing recall",
+    )
+    p_bd.add_argument("--json", dest="json_out", default=None, help="Also write raw results to this JSON file")
     p_boot = sub.add_parser("bootstrap", help="Create runtime directories and fetch model assets")
     p_boot.add_argument(
         "--no-gaze-download",
@@ -4803,6 +4866,14 @@ def main() -> None:
         "list": cmd_list,
         "report": cmd_report,
         "doctor": lambda: cmd_doctor(args.check_camera),
+        "bench-detect": lambda: cmd_bench_detect(
+            args.frames,
+            args.model,
+            args.conf,
+            args.imgsz,
+            args.min_brightness,
+            args.json_out,
+        ),
         "bootstrap": lambda: cmd_bootstrap(download_gaze=not args.no_gaze_download),
     }.get(args.cmd, parser.print_help)()
 

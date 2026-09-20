@@ -134,6 +134,8 @@ The persisted session aggregate records `face_recognition_enabled` and
 | `AI_STUDIO_METRICS_BACKUPS` | `2` | Rotated metric generations kept |
 | `AI_STUDIO_MEMORY_MAX_AUTO_SNAPSHOTS` | `5000` | Auto-snapshot retention cap |
 | `AI_STUDIO_UNKNOWN_INCIDENT_MAX_FILES` | `500` | Unknown-face capture cap |
+| `AI_STUDIO_YOLO_IMGSZ` | `768` | Object-detection inference size (bigger finds more, costs CPU) |
+| `AI_STUDIO_YOLO_CONF` | `0.25` | Object-detection confidence threshold |
 | `AI_STUDIO_FPS_CAP` | `12` | Monitor FPS ceiling (lower = less CPU) |
 | `AI_STUDIO_ENROLL_FPS_CAP` | `20` | Enrollment FPS ceiling |
 | `AI_STUDIO_SNAPSHOT_INTERVAL` | `8.0` | Seconds between auto snapshots (the instances used for analysis) |

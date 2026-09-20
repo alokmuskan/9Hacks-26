@@ -66,6 +66,28 @@ MEMORY_MAX_AUTO_SNAPSHOTS = max(_env_int("AI_STUDIO_MEMORY_MAX_AUTO_SNAPSHOTS", 
 # Unknown-face incident captures are pruned to the newest N files.
 UNKNOWN_INCIDENT_MAX_FILES = max(_env_int("AI_STUDIO_UNKNOWN_INCIDENT_MAX_FILES", 500), 0)
 
+# ── Object-detection inference ────────────────────────────────────────────────
+# The detector used to call `model(frame)` with *no* arguments, so every value
+# below was unreachable and all tuning was guesswork. The defaults come from the
+# offline benchmark (`main.py bench-detect`, see OBJECT_DETECTION_PLAN.md): on
+# this project's own frames, imgsz=768 found 8 classes versus 5 at 640 with
+# reference recall unchanged at 1.00, for ~150 ms versus ~90 ms per frame on a
+# CPU-only box.
+#
+# Confidence and IoU stay at Ultralytics' defaults on purpose: lowering the
+# global threshold adds low-confidence junk (surfboard/tie at 0.17), which is a
+# per-class policy decision rather than a global one.
+def normalize_imgsz(value: int | float) -> int:
+    """Clamp an inference size to what YOLO can use: 320-1920, multiple of 32."""
+    clamped = min(max(int(value), 320), 1920)
+    return int(round(clamped / 32.0) * 32)
+
+
+YOLO_CONF_DEFAULT = min(max(_env_float("AI_STUDIO_YOLO_CONF", 0.25), 0.01), 0.99)
+YOLO_IOU_DEFAULT = min(max(_env_float("AI_STUDIO_YOLO_IOU", 0.7), 0.1), 0.95)
+YOLO_IMGSZ_DEFAULT = normalize_imgsz(_env_int("AI_STUDIO_YOLO_IMGSZ", 768))
+YOLO_MAX_DET_DEFAULT = min(max(_env_int("AI_STUDIO_YOLO_MAX_DET", 300), 1), 1000)
+
 # ── Live pacing & instance capture ────────────────────────────────────────────
 # The monitor loop targets at most FPS_CAP_DEFAULT frames per second; the cap is
 # a ceiling, so a slow machine simply runs at whatever it can keep up with. The

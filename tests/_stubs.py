@@ -37,6 +37,7 @@ CV2_CONSTANTS = {
     "INTER_AREA": 3,
     "COLOR_BGR2RGB": 4,
     "IMWRITE_JPEG_QUALITY": 1,
+    "CV_64F": 6,
 }
 
 #: Functions the pipeline calls on `cv2`. Keep this list and `_build_cv2` in step.
@@ -50,8 +51,11 @@ CV2_FUNCTIONS = (
     "line",
     "circle",
     "getTextSize",
+    "imread",
+    "imdecode",
     "imwrite",
     "imencode",
+    "Laplacian",
     "imshow",
     "waitKey",
     "namedWindow",
@@ -77,8 +81,14 @@ def _build_cv2() -> types.ModuleType:
     stub.line = lambda *_args, **_kwargs: None
     stub.circle = lambda *_args, **_kwargs: None
     stub.getTextSize = lambda text, *_args, **_kwargs: ((len(text) * 8, 12), 2)
+    stub.imread = lambda *_args, **_kwargs: None
+    stub.imdecode = lambda *_args, **_kwargs: None
     stub.imwrite = lambda *_args, **_kwargs: True
     stub.imencode = lambda *_args, **_kwargs: (True, np.zeros(4, dtype=np.uint8))
+    # Zeros, not real edge response: sharpness numbers only mean something with
+    # real OpenCV, so tests that assert on them must require it (see
+    # `test_detection_bench`).
+    stub.Laplacian = lambda frame, *_args, **_kwargs: np.zeros_like(frame, dtype=np.float64)
     stub.imshow = lambda *_args, **_kwargs: None
     stub.waitKey = lambda *_args, **_kwargs: -1
     stub.namedWindow = lambda *_args, **_kwargs: None

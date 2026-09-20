@@ -167,5 +167,69 @@ class IncidentCaptureRaceTests(unittest.TestCase):
             self.assertEqual(Path(path).parent, directory)
 
 
+class IncidentCaptureWriteFailureTests(unittest.TestCase):
+    """A capture that cannot be written must not leave an empty file behind.
+
+    A reserved filename with no image in it reads as evidence while containing
+    nothing — the detection benchmark found 28 such zero-byte files on this
+    machine, so the capture path now verifies the write instead of ignoring
+    `cv2.imwrite`'s return value.
+    """
+
+    def setUp(self):
+        _install_stubs()
+        self.core = importlib.import_module("main")
+        self.frame = np.zeros((16, 16, 3), dtype=np.uint8)
+        self.bboxes = [np.array([1, 1, 8, 8], dtype=np.float32)]
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.directory = Path(self._tmp.name)
+        patcher = mock.patch.object(self.core, "UNKNOWN_INCIDENTS_DIR", self.directory)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _patch_imwrite(self, behaviour):
+        fake_cv2 = mock.MagicMock()
+        fake_cv2.imwrite.side_effect = behaviour
+        patcher = mock.patch.object(self.core, "cv2", fake_cv2)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_failed_write_removes_the_reserved_file_and_returns_none(self):
+        self._patch_imwrite(lambda *_args, **_kwargs: False)
+
+        with mock.patch("builtins.print") as printed:
+            result = self.core._save_unknown_snapshot(self.frame, self.bboxes, datetime.now(UTC))
+
+        self.assertIsNone(result)
+        self.assertEqual(list(self.directory.glob("*.jpg")), [], "an empty file was left behind")
+        self.assertTrue(
+            any("could not be written" in str(call) for call in printed.call_args_list),
+            "the failure was silent",
+        )
+
+    def test_imwrite_claiming_success_but_writing_nothing_is_a_failure(self):
+        self._patch_imwrite(lambda *_args, **_kwargs: True)
+
+        result = self.core._save_unknown_snapshot(self.frame, self.bboxes, datetime.now(UTC))
+
+        self.assertIsNone(result)
+        self.assertEqual(list(self.directory.glob("*.jpg")), [])
+
+    def test_successful_write_returns_a_non_empty_path(self):
+        def imwrite(path, _image, *_args, **_kwargs):
+            Path(path).write_bytes(b"jpeg-bytes")
+            return True
+
+        self._patch_imwrite(imwrite)
+
+        result = self.core._save_unknown_snapshot(self.frame, self.bboxes, datetime.now(UTC))
+
+        self.assertIsNotNone(result)
+        written = Path(str(result))
+        self.assertEqual(written.parent, self.directory)
+        self.assertGreater(written.stat().st_size, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

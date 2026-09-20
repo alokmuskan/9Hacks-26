@@ -1144,7 +1144,9 @@ class PipelineManager:
                         severity="alert",
                         extra={
                             "image_path": snap,
-                            "image_name": Path(snap).name,
+                            # None when the capture could not be written: the event is
+                            # still reported, it just has no image to point at.
+                            "image_name": Path(snap).name if snap else None,
                         },
                     )
 
@@ -1296,6 +1298,7 @@ class PipelineManager:
 
                 yolo_state = detector.get_state()
                 self._latest_yolo_state = yolo_state
+                object_params = yolo_state.get("params") or {}
                 gaze_status = "ON" if gaze_state["gaze"] else "OFF"
                 if gaze_state["gaze"] and gaze_scheduler.adaptive:
                     gaze_status = f"ON 1/{gaze_scheduler.interval}"
@@ -1312,6 +1315,16 @@ class PipelineManager:
                             (180, 180, 180),
                         ),
                         (f"Gaze:{gaze_status} Seq:{self.frame_store.get().get('sequence', 0)}", (170, 170, 170)),
+                        (
+                            # What object inference is actually using: the values used
+                            # to be unreachable, so they were worth showing. Tolerant of
+                            # a detector state that omits them (the HUD is not critical).
+                            (
+                                f"Objects: {object_params.get('imgsz', '?')}px "
+                                f"conf {object_params.get('conf', '?')}"
+                            ),
+                            (160, 160, 160),
+                        ),
                         (
                             f"Snapshots(auto/manual): {memory_auto_snapshots}/{self._manual_snapshots}",
                             (160, 160, 160),

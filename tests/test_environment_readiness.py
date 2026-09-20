@@ -1,4 +1,6 @@
 import importlib
+import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -108,6 +110,58 @@ class RunabilityConfigTests(unittest.TestCase):
             else "0"
         )
         self.assertEqual(self.main._DEFAULT_CAMERA_SOURCE, expected)
+
+    def test_yolo_inference_defaults_match_the_benchmark(self):
+        """Pins the measured decision: see OBJECT_DETECTION_PLAN.md.
+
+        On this project's own frames, imgsz=768 found 8 classes versus 5 at 640
+        with reference recall unchanged, for ~150 ms versus ~90 ms per frame.
+        """
+        common = importlib.import_module("common")
+        self.assertEqual(common.YOLO_IMGSZ_DEFAULT, 768)
+        self.assertEqual(common.YOLO_CONF_DEFAULT, 0.25)
+        self.assertEqual(common.YOLO_IOU_DEFAULT, 0.7)
+        self.assertEqual(common.YOLO_MAX_DET_DEFAULT, 300)
+
+    def test_inference_size_is_normalised_and_clamped(self):
+        common = importlib.import_module("common")
+        self.assertEqual(common.normalize_imgsz(100), 320)
+        self.assertEqual(common.normalize_imgsz(768), 768)
+        self.assertEqual(common.normalize_imgsz(700), 704)
+        self.assertEqual(common.normalize_imgsz(5000), 1920)
+
+    def _probe_yolo_env(self, **env_overrides):
+        code = (
+            "import common;"
+            "print(common.YOLO_CONF_DEFAULT, common.YOLO_IOU_DEFAULT, "
+            "common.YOLO_IMGSZ_DEFAULT, common.YOLO_MAX_DET_DEFAULT)"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            env={**os.environ, **env_overrides},
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=str(PROJECT_ROOT),
+        )
+        return proc.stdout.split()
+
+    def test_yolo_env_overrides_apply_and_clamp(self):
+        self.assertEqual(
+            self._probe_yolo_env(
+                AI_STUDIO_YOLO_CONF="0.4", AI_STUDIO_YOLO_IMGSZ="640", AI_STUDIO_YOLO_MAX_DET="50"
+            ),
+            ["0.4", "0.7", "640", "50"],
+        )
+        # Garbage and out-of-range values fall back or clamp instead of exploding.
+        self.assertEqual(
+            self._probe_yolo_env(AI_STUDIO_YOLO_CONF="5", AI_STUDIO_YOLO_IMGSZ="100"),
+            ["0.99", "0.7", "320", "300"],
+        )
+        self.assertEqual(
+            self._probe_yolo_env(AI_STUDIO_YOLO_IMGSZ="nonsense"),
+            ["0.25", "0.7", "768", "300"],
+        )
 
     def test_pixi_tasks_do_not_hardcode_a_camera_device(self):
         text = (PROJECT_ROOT / "pixi.toml").read_text(encoding="utf-8")
