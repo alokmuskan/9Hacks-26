@@ -1,10 +1,12 @@
 import importlib
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -99,9 +101,41 @@ class RunabilityConfigTests(unittest.TestCase):
         self.assertEqual(self.main.DEFAULT_GENERAL_MODEL, "yolov8n.pt")
         self.assertNotIn(".references", self.main.DEFAULT_GENERAL_MODEL)
 
-    def test_general_model_resolves_to_a_usable_checkpoint(self):
-        with mock.patch.object(self.main, "DEFAULT_GENERAL_MODEL", "definitely-missing.pt"):
-            self.assertEqual(self.main._resolve_general_model_path(None), "yolov8n.pt")
+    def test_a_configured_model_name_is_honoured(self):
+        """The old resolver swapped in `yolov8n.pt` whenever the file was absent.
+
+        So `AI_STUDIO_GENERAL_YOLO_MODEL=yolo11s.pt` was accepted, silently
+        ignored, and reported as success — the checkpoint named in the README as
+        configurable was the one thing that could not be configured.
+        """
+        with mock.patch.object(self.main, "DEFAULT_GENERAL_MODEL", "yolo11s.pt"):
+            self.assertEqual(self.main._resolve_general_model_path(None), "yolo11s.pt")
+
+    def test_an_explicit_model_wins_over_the_configured_default(self):
+        with mock.patch.object(self.main, "DEFAULT_GENERAL_MODEL", "yolov8n.pt"):
+            self.assertEqual(self.main._resolve_general_model_path("yolo11m.pt"), "yolo11m.pt")
+
+    def test_only_bare_names_are_treated_as_downloadable(self):
+        # A bare name is resolved against Ultralytics' release assets; a path is
+        # only ever opened from disk, so `doctor` must not promise a download.
+        self.assertTrue(self.main._is_downloadable_model_name("yolo11s.pt"))
+        self.assertFalse(self.main._is_downloadable_model_name("runs/detect/train/weights/best.pt"))
+        self.assertFalse(self.main._is_downloadable_model_name("models/custom.pt"))
+
+    def test_an_existing_checkpoint_is_never_re_downloaded(self):
+        with tempfile.TemporaryDirectory() as td:
+            weights = Path(td) / "yolov8n.pt"
+            weights.write_bytes(b"weights")
+            # Any call at all would return the fake's error instead of "".
+            with self._fake_ultralytics("should not have been called"):
+                self.assertEqual(self.main._ensure_general_model(str(weights)), "")
+
+    def test_ensure_general_model_reports_why_it_could_not_be_prepared(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self._fake_ultralytics("no network"):
+                reason = self.main._ensure_general_model(str(Path(td) / "yolo11s.pt"))
+
+        self.assertEqual(reason, "no network")
 
     def test_virtual_camera_is_only_the_default_when_it_exists(self):
         expected = (
@@ -238,18 +272,52 @@ class RunabilityConfigTests(unittest.TestCase):
             self.assertTrue((memory_dir / "snapshots").is_dir())
             self.assertTrue(incidents_dir.is_dir())
 
-    def test_bootstrap_never_raises_when_assets_are_missing(self):
+    def test_bootstrap_reports_a_checkpoint_it_could_not_prepare(self):
+        """Offline, bootstrap must name what failed — never swap in another model."""
         with tempfile.TemporaryDirectory() as td:
+            absent = str(Path(td) / "yolo11s.pt")
+            output = io.StringIO()
             with (
                 mock.patch.object(self.main, "MEMORY_DIR", Path(td) / "memory"),
                 mock.patch.object(self.main, "UNKNOWN_INCIDENTS_DIR", Path(td) / "incidents"),
-                mock.patch.object(
-                    self.main, "_resolve_general_model_path", return_value=str(Path(td) / "absent.pt")
-                ),
+                mock.patch.object(self.main, "_resolve_general_model_path", return_value=absent),
                 self._fake_ultralytics("no network"),
+                mock.patch.object(self.main.FaceDB, "load", return_value=self.main.FaceDB.empty()),
+                redirect_stdout(output),
+            ):
+                self.main.cmd_bootstrap(download_gaze=False)  # must not raise
+
+            text = output.getvalue()
+            self.assertIn(absent, text, "the failed checkpoint must be named")
+            self.assertIn("no network", text, "the reason must be reported")
+            self.assertIn("Unresolved:", text)
+
+    def test_bootstrap_fetches_the_configured_checkpoint(self):
+        """Bootstrap used to call `YOLO("yolov8n.pt")` whatever was configured.
+
+        So the one place that exists to make the model available up front was the
+        one place guaranteed not to fetch the model the user had chosen.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            requested: list[str] = []
+            module = types.ModuleType("ultralytics")
+
+            def record(name, *_args, **_kwargs):
+                requested.append(str(name))
+                return object()
+
+            module.YOLO = record
+            configured = str(Path(td) / "yolo11s.pt")
+            with (
+                mock.patch.object(self.main, "MEMORY_DIR", Path(td) / "memory"),
+                mock.patch.object(self.main, "UNKNOWN_INCIDENTS_DIR", Path(td) / "incidents"),
+                mock.patch.object(self.main, "_resolve_general_model_path", return_value=configured),
+                mock.patch.dict(sys.modules, {"ultralytics": module}),
                 mock.patch.object(self.main.FaceDB, "load", return_value=self.main.FaceDB.empty()),
             ):
                 self.main.cmd_bootstrap(download_gaze=False)
+
+            self.assertEqual(requested, [configured])
 
     def test_bootstrap_does_not_attempt_a_gaze_download_when_skipped(self):
         with tempfile.TemporaryDirectory() as td:

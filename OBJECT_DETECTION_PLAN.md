@@ -3,7 +3,9 @@
 Goal: make object detection recognise more real objects, reliably, without
 exceeding the frame budget of a **CPU-only** machine.
 
-Status: **Phases 0 and 1 complete and verified.** Phase 2 (model upgrade) is next.
+Status: **Phases 0, 1 and 2 complete.** Phase 2 fixed the model-name fallback (§2d)
+and then benchmarked `yolo11*` and **rejected** it (§2e); the harness gap that made
+that comparison inconclusive is the next thing to fix.
 Every number below was measured on this machine (see *Evidence*), not assumed.
 
 Re-verified after Phase 1 landed; that audit found several deliverables that were
@@ -13,7 +15,7 @@ claimed but not actually in place, and they are fixed (see *§2c Re-verification
 | --- | --- |
 | 0 — benchmark harness | ✅ done — `main.py bench-detect`, `detection_bench.py` |
 | 1 — parameterise inference | ✅ done — env knobs, typed `DetectorConfig`, status + HUD reporting, defaults from the benchmark |
-| 2 — model upgrade | ⏭ next |
+| 2 — model upgrade | ✅ done, gate half met — fallback fixed (§2d), `yolo11*` benchmarked and **rejected** (§2e) |
 | 3–7 | not started |
 
 ---
@@ -69,9 +71,12 @@ cost — which is what makes a larger model affordable *if* gaze is throttled.
    `agnostic_nms` or `classes`. Everything is Ultralytics' default
    (`conf=0.25`, `imgsz=640`), with **no per-class tuning possible**.
    Measured effect of exposing just two of these: **3 → 5 classes.**
-2. **Nano model.** `yolov8n.pt` is the weakest variant in the family; the
+2. ~~**Nano model.** `yolov8n.pt` is the weakest variant in the family; the
    installed Ultralytics supports v11/v12/v26, which are materially stronger
-   at similar or modestly higher cost.
+   at similar or modestly higher cost.~~ **Not supported by measurement — see
+   §2e.** On this project's own frames every `yolo11` variant scored *worse* than
+   `yolov8n` on both of the harness's metrics, and the largest was the worst value
+   by a wide margin. The bottleneck was never model capacity.
 3. **No measurement harness.** There is no repeatable way to say whether a
    change improved detection, so tuning is guesswork.
 4. **Capture quality/size.** 640×480 capture, ~46 % of saved frames too dark to
@@ -81,10 +86,13 @@ cost — which is what makes a larger model affordable *if* gaze is throttled.
    flicker — which reads as unreliability even when individual frames are fine.
 6. **Cross-source duplicates.** General and custom models are concatenated and
    re-sorted with no NMS across sources, so the same object can appear twice.
-7. **Silent model fallback bug.** `_resolve_general_model_path` returns the
+7. **Silent model fallback bug.** ~~`_resolve_general_model_path` returns the
    configured value only *if the file already exists*, else `yolov8n.pt` — so a
    new model name set via `AI_STUDIO_GENERAL_YOLO_MODEL` is silently ignored,
-   contradicting the README's "Ultralytics downloads it on first use".
+   contradicting the README's "Ultralytics downloads it on first use".~~
+   **Fixed in Phase 2 (§2d).** The audit found the same bug in a second place:
+   `cmd_bootstrap` downloaded a hardcoded `yolov8n.pt` regardless of what was
+   configured.
 
 ---
 
@@ -171,12 +179,16 @@ left to look like a pass.
 | Check | Result |
 | --- | --- |
 | `python -m unittest discover -s tests` | **Ran 198 tests, OK — 0 skipped** (was 190 with 5 skipped) |
-| `ruff check .` | All checks passed |
+| `ruff check .` | All checks passed. The first battery run had flagged a **real defect in the new test**, not a style preference: `tests/test_object_detection.py:164: B017 Do not assert blind exception`. It is fixed — the test now asserts `FrozenInstanceError`, which is what a frozen dataclass actually raises, instead of `Exception`, which every exception satisfies — and the re-run is clean. |
 | `mypy` | Success: no issues found in 6 source files |
 | `python main.py bench-detect` | 8 classes at 768 (86 ms) vs 5 at 640 (59 ms), reference recall 1.00 both; excluded frames now `too_dark=9, too_small=1` |
 
 The skip count going 5 → 0 is the evidence that the Phase-0 wiring test is real
 again. It had been reporting as skipped in the very command used to claim the gate.
+
+The battery was run twice: once before the B017 fix (198 passed, ruff red) and
+once after it (198 passed, ruff green), so the count above is not a stale result
+from a different revision of the test file.
 
 **Spec corrections — the specs, not the code, were wrong**
 
@@ -205,9 +217,359 @@ again. It had been reporting as skipped in the very command used to claim the ga
   detection-benchmark inference tests still report as **skipped** there. That is
   honest but it means the wiring guard runs locally only; wiring it into CI is
   Phase 7's job ("add a CI job running the benchmark smoke test").
-- `_resolve_general_model_path` (root cause 7) is still unfixed, so the README's
-  "Ultralytics downloads it on first use" remains false for an env-set model name.
-  That is Phase 2's first task.
+- `_resolve_general_model_path` (root cause 7) was unfixed at this point, so the
+  README's "Ultralytics downloads it on first use" was false for an env-set model
+  name. **Fixed since — see §2d.**
+
+## 2d. Phase 2 — the model-name fallback (done first)
+
+Phase 2's second half is a benchmark of stronger checkpoints. That benchmark is
+meaningless until the code stops ignoring which checkpoint it was asked to use, so
+the fallback bug (root cause 7) was fixed first.
+
+**The bug was in two places, not one.**
+
+| Where | What it did |
+| --- | --- |
+| `_resolve_general_model_path` | Returned the configured value only if a file of that name already existed, else `yolov8n.pt`. `AI_STUDIO_GENERAL_YOLO_MODEL=yolo11s.pt` was therefore accepted, silently ignored, and reported as success. |
+| `cmd_bootstrap` | Downloaded a **hardcoded** `YOLO("yolov8n.pt")` regardless of configuration, then printed `[ ok ] general YOLO ready: <whatever was configured>`. The one command whose job is to fetch the configured model was the one command guaranteed not to. |
+
+The second one is what made the first hard to notice: `bootstrap` reported the
+configured name as ready while placing a different checkpoint on disk.
+
+**The fix** — the resolver is now honest, and fetching is a separate, reporting step:
+
+- `_resolve_general_model_path()` returns what was configured, full stop. A bare
+  name like `yolo11s.pt` is a *model name* (Ultralytics downloads it on first
+  use), not a missing file. Substituting a different checkpoint is removed
+  entirely, because a silent swap also corrupts benchmark output: the harness
+  would print the name it was handed and measure something else.
+- `_ensure_general_model()` performs the one-time download, or returns a reason it
+  could not — offline, unknown name, unusable path. It never substitutes.
+- `cmd_bootstrap` fetches the *configured* checkpoint and, on failure, prints the
+  path **and** the reason and lists it under `Unresolved:` instead of claiming
+  success.
+- `doctor` now reports the configured checkpoint. Previously it could read
+  `yolov8n.pt present` while the session was configured for something else, and it
+  promised "Ultralytics downloads it on first run" even for a *path* that
+  Ultralytics would never download. `_is_downloadable_model_name()` draws that
+  distinction, so the row says "not downloaded yet" for a name and "not found" for
+  a path.
+
+**Tests** (`tests/test_environment_readiness.py`): a configured name is honoured;
+an explicit model beats the configured default; only bare names count as
+downloadable; an existing checkpoint is never re-downloaded; a failed fetch
+returns its reason; `bootstrap` names the checkpoint it could not prepare and
+lists it as unresolved; and `bootstrap` fetches the configured checkpoint rather
+than a hardcoded one. The test that previously *asserted the buggy fallback*
+(`test_general_model_resolves_to_a_usable_checkpoint`) is gone — it pinned
+`_resolve_general_model_path(None) == "yolov8n.pt"` for a missing configured model,
+i.e. it encoded root cause 7 as the contract.
+
+**Status: implemented and verified.** `Ran 203 tests` / `OK` (was 198 — five net new)
+and `ruff check .` clean. `mypy` is unaffected by construction: the only files
+touched are `main.py`, which `mypy.ini` opts out via `[mypy-main] ignore_errors`,
+and `tests/`, which is outside `files=`. The battery output shows the fix working
+end to end — `[ ok ] general YOLO ready: ...\yolo11s.pt` is `bootstrap` fetching the
+configured checkpoint rather than a hardcoded one.
+
+The remaining Phase 2 work — benchmarking `yolo11n`/`s`/`m` on the 50-frame set — was
+expected to be blocked on the open latency-budget question in §6. It was run anyway,
+and the answer did not depend on the budget: **see §2e**.
+
+## 2e. Phase 2 — model benchmark (`yolo11*` measured and rejected)
+
+Same protocol as §2b: 50 usable saved frames plus the 2 labelled reference images, all
+four models at `conf=0.25, imgsz=768`, driven through the production
+`DualYoloDetector`. **Run twice.** Every class count and every box count below was
+identical in both runs; only the latency moved, so it is given for both.
+
+| Model | ms/frame (run 1 / run 2) | classes | reference recall | per-class detections |
+| --- | --- | --- | --- | --- |
+| `yolov8n.pt` | 85 / 79 | **8** | **1.00** | person 56, remote 8, cell phone 5, toothbrush 5, surfboard 2, tie 2, bottle 1, refrigerator 1 |
+| `yolo11n.pt` | 77 / 77 | 5 | 0.80 | person 52, **surfboard 37**, cell phone 5, toothbrush 4, bottle 1 |
+| `yolo11s.pt` | 177 / 166 | 5 | 0.80 | person 51, surfboard 8, cell phone 7, toothbrush 4, bottle 1 |
+| `yolo11m.pt` | 438 / **503** | 6 | 0.80 | person 52, **surfboard 45**, toothbrush 10, cell phone 6, bottle 1, remote 1 |
+
+**The premise did not survive contact.** Phase 2 was written on the assumption that
+`yolov8n` was the weak link. Every `yolo11` variant scored worse on both headline
+metrics, and the largest was the worst value by a wide margin.
+
+**But the two headline metrics are too coarse to carry that conclusion either**, and
+that is the more useful finding:
+
+- *"classes found"* counts boxes above a threshold. `yolov8n`'s eighth class is
+  `refrigerator x1 (max 0.28)`, plus `tie x2 (max 0.37)` — one or two marginal boxes
+  sitting just above 0.25. "8 classes versus 5" reads as a large difference and is not
+  one.
+- *"reference recall"* is 4/5 against 5/5: **one label, across two images**. The
+  harness now names it — `missed reference: bus.jpg:stop sign`, identically for all
+  three `yolo11` variants — and §1 recorded `yolov8n` finding that same stop sign at
+  **0.26** against a 0.25 threshold. So the whole "recall regression" is one box
+  sitting essentially on the threshold line. Naming the label turned a number that
+  read like a capability gap into a difference that is barely one.
+- **Neither metric measures precision at all** — which is precisely where the real
+  difference turned out to be.
+
+### The frames are one scene, and it is curtains
+
+The saved frames are a person seated in front of floor-to-ceiling pale curtains with
+deep vertical folds. Three of them were opened to confirm this rather than assumed
+from the metadata. It is not a varied scene.
+
+That explains the one **robust, non-marginal** signal in the table, and the
+per-frame statistics added during this phase sharpen it considerably. The surfboard
+detections are not a steady one-per-frame drift; they arrive in **bursts**:
+
+| Model | surfboard boxes | frames containing any | max in one frame | peak conf |
+| --- | --- | --- | --- | --- |
+| `yolov8n` | 2 | **1** / 50 | 2 | 0.31 |
+| `yolo11n` | 37 | 18 / 50 | 4 | **0.83** |
+| `yolo11s` | 8 | 3 / 50 | 5 | 0.78 |
+| `yolo11m` | 45 | 16 / 50 | **6** | 0.79 |
+
+Up to six *separate* `surfboard` boxes in a single frame, none merged by NMS, is what
+several distinct curtain folds each being read as its own surfboard looks like. The
+newer models do it far more confidently (0.83 against 0.31), and `yolov8n` does it in
+one frame out of fifty. This is not threshold noise, and it is not visible in a box
+count at all — 45 boxes reads identically whether it is 45 objects spread over 45
+frames or six folds misread in sixteen.
+
+**The confidence floor cannot be the fix, and the measurements say so.** For
+`yolo11n`, the false `surfboard` peaks at **0.83** while real `cell phone` detections
+peak at **0.64**. Any threshold that suppresses the curtains also suppresses the
+phone. A per-class floor of "surfboard ≥ 0.85" would work, but it is a deny-list
+wearing a threshold's clothes, and choosing it from these frames means fitting the
+threshold to curtains. That is precisely the decision §2f says cannot be made yet.
+
+### The one genuine regression
+
+`remote` is named in §6 as an object that matters. `yolov8n` found **8** (max 0.48);
+`yolo11n` found **0**, `yolo11s` found **0**, `yolo11m` found **1** (max 0.52). That is
+a real miss at a threshold where the older model was finding them, not a marginal one.
+
+### The one genuine gain
+
+`cell phone` confidence rises monotonically with model size — 0.45 → 0.64 → 0.82 →
+0.86 — on broadly the same boxes. The newer architectures are meaningfully more
+certain about the phone, but it changed no class count and no recall number here.
+
+### Latency
+
+`yolo11n` and `yolov8n` are indistinguishable — 77 against 85 ms in the first run and
+77 against 79 ms in the second, i.e. the two swap places, which is what noise looks
+like. `yolo11s` is **~2.1x** in both runs (177/85 and 166/79). `yolo11m` is **5.2x** in
+the first run and **6.4x** in the second (438/85 and 503/79), because it is the one
+measurement that moved materially — 438 → 503 ms, +15%, on identical input.
+
+Against the §1 frame budget (gaze ~433 ms per frame), `yolo11m` at 438–503 ms roughly
+doubles total frame time in exchange for a net loss on every metric.
+
+### Decision
+
+**Keep `yolov8n.pt`.** No `yolo11` variant earned its cost on this evidence, and the
+one with the strongest "bigger is better" claim is at least 5x the latency for fewer
+classes and worse recall — a conclusion the run-to-run spread does not threaten, since
+it is the *small* differences that the spread undermines, not this one.
+`AI_STUDIO_GENERAL_YOLO_MODEL` remains the escape hatch, and it now actually works
+(§2d).
+
+What Phase 2 *did* establish is that **the harness cannot yet answer its own
+question.** Root cause 3 ("no measurement harness") was only half fixed: the harness
+exists and is reproducible, but it measures recall without precision, and it reported
+an aggregate that hid which label regressed. Both were needed here and neither was
+there.
+
+### Harness changes made during this phase
+
+Both were forced by findings the harness could not express, which is the pattern
+worth noting: each time, a real result was invisible until the reporting changed.
+
+| Change | What it fixed |
+| --- | --- |
+| `format_report` names the reference labels that were missed | `recall=0.80` said something regressed but not what; it turned out to be one marginal stop sign, not a capability gap. |
+| `summarize_per_frame()` — detection statistics per class | A box count cannot distinguish one object seen 45 times from six false boxes in a single frame. Reports boxes/frame, frames-with-detection, frame coverage and max-in-one-frame, sorted busiest first, and labels itself **detection statistics, not precision**. |
+
+`run_benchmark` now keeps each frame's detections separate instead of flattening them
+immediately, and adds a `detection_stats` key. `summarize_detections` and every
+pre-existing result key are unchanged, so the JSON output and the existing report
+lines still read as before — the new block is additive.
+
+### Still missing from the harness
+
+- **No precision, and none is computable.** The reference images are labelled, so
+  recall against them is a real measurement — over 5 labels in 2 images, which is
+  enough to catch a catastrophic regression and nothing more. The project's own
+  frames carry no labels at all, so every per-class number above is a *detection
+  statistic*. A class at 0.9 boxes/frame may be a real object in almost every frame
+  or a systematic false positive; only labelled frames separate those. No threshold
+  should be set from these numbers.
+- **The frame set cannot discriminate models.** §6's first question is now answered
+  the hard way: these frames are one scene — a person, a phone and curtains — so a
+  benchmark over them ranks models largely by how they handle curtains. Frames of the
+  objects the system is actually expected to find are a precondition for any further
+  work; Phase 3 onwards will hit the same wall.
+- **Latency is a single mean, and it moves.** The same model and configuration
+  measured **438 ms** in one run and **503 ms** in the next (~15%), which is larger
+  than several of the differences being compared. `ms_per_frame` also folds the cold
+  first frame into the average. Neither is fatal for the "is `yolo11m` affordable"
+  question, where the gap is 5x, but neither supports a fine-grained budget claim.
+
+## 2f. Phase 3 readiness
+
+Phase 3 has **not been started** — there is no Phase 3 code in the repository, so
+"run the Phase 3 pipeline" is not yet a thing that exists. What follows is what the
+current evidence can and cannot support.
+
+### The four kinds of number, kept apart
+
+Conflating these is how a detection count turns into a "precision" claim by accident.
+
+| Kind | Where it comes from | Status |
+| --- | --- | --- |
+| **Detection statistics** — boxes/frame, frame coverage, max-in-one-frame, confidence distribution | The project's 50 saved frames; no labels involved | Measured. Valid. Says nothing about correctness. |
+| **Reference-label measurements** — `reference_recall`, and now *which* label missed | 5 labels over 2 bundled images with hand-verified contents | Measured and real, but the sample is two images. Catches catastrophic regressions; cannot rank models. |
+| **Precision / per-class recall** | Requires labelled detections | **Not available. Not computed. Not estimated.** |
+| **Conclusions about the expo** | Requires representative frames | **Cannot be made.** The frame set is one scene. |
+
+### READY NOW
+
+- Reproducible detection statistics per model and per class, including the burst
+  structure that exposed the curtain false positives.
+- Detection-only latency, to a resolution of "5x apart, yes; 15% apart, no".
+- Recall against 5 verified labels, with the failing label named.
+- The model decision, which is settled: **keep `yolov8n`** (§2e).
+- **A diagnostic experiment**, worth recording because it is arithmetically free and
+  it rules out the obvious Phase 3 design. Removing `surfboard` from the output takes
+  the four models to **1.56 / 1.24 / 1.26 / 1.40** boxes per frame, from
+  1.60 / 1.98 / 1.42 / 2.30 — one deny-list entry deletes 37–45 spurious boxes per 50
+  frames from the newer models and 2 from `yolov8n`. **What this does not show** is
+  that a deny-list is the right policy. It shows that on *this* scene the spurious
+  boxes are concentrated in one class, which is a fact about curtains, not about the
+  expo.
+
+### BLOCKED
+
+| Blocked item | What it needs |
+| --- | --- |
+| Any per-class confidence floor | Labelled frames. A floor fitted to curtains is a floor fitted to curtains. |
+| Any allow/deny list justified by evidence | Same. The diagnostic above shows the shape of the problem, not the right policy. |
+| Precision, per-class recall, false-positive rate | Frames with hand-labelled boxes. Nothing outside the 2 reference images has this. |
+| Ranking `yolov8n` against `yolo11*` on scene recall | Frames containing the target objects, in expo-like lighting. |
+| The §6 Q2 latency budget | See below. |
+
+**On §6 Q2: the harness cannot measure it.** Q2 asks for an acceptable *end-to-end*
+FPS. The harness measures object detection alone, on saved frames, in one process. It
+does not measure, and cannot be tuned into measuring:
+
+1. **The rest of the loop.** Capture, face recognition, gaze, memory writes and
+   snapshot encoding are not exercised at all. §1 puts gaze at ~433 ms per call
+   against detection's ~80 ms, so the harness sees roughly a sixth of the frame.
+2. **CPU contention.** Detection alone may use all 12 cores; in the live loop it
+   shares them with gaze and face recognition, so the costs do not simply add.
+   Summing component times would be an estimate, and a wrong one — which is why none
+   is given here.
+3. **Gaze throttling.** `AI_STUDIO_GAZE_MAX_INTERVAL` moves the balance completely
+   and is not exercised.
+4. **A latency distribution.** The current figure is a single mean that includes the
+   cold first frame; run-to-run spread on one configuration was ~15%.
+
+Neither of the two cheap fixes has been made yet: reporting a median and a max per
+frame instead of one mean, and reading the *existing* `metrics_log.jsonl` from a real
+session, which already records `avg_fps` and gaze timings.
+
+### NEXT ACTION
+
+One step unblocks more than anything else: **capture a labelled frame set of the
+objects the system is expected to find, in expo-like conditions** — the same objects
+at a few distances and angles, in both lighting states, with the correct labels
+recorded as they are captured.
+
+That single artefact makes precision computable, makes per-class thresholds fittable
+to something other than curtains, makes the model comparison meaningful, and gives
+Phase 3 the evaluation set its gate ("measured precision/recall per class under the
+chosen policy") assumes already exists. Nothing else on the blocked list becomes
+reachable before it does.
+
+**What that set must contain is specified separately**, in
+[`OBJECT_DETECTION_FRAME_SET_SPEC.md`](OBJECT_DETECTION_FRAME_SET_SPEC.md) — scope and
+target classes, the coverage matrix, the negatives and controls without which precision
+is not computable at all, the label format, and a pre-handover checklist. It also
+records a prerequisite that is easy to miss: **the harness cannot read a labelled frame
+set today.** `detection_bench.py` has one source of ground truth, the hardcoded
+`REFERENCE_LABELS` counts for the two bundled images, and no IoU matching or precision
+code of any kind — so a loader and a box-matching metric have to be built before the
+captured set can be used for anything.
+
+## 2g. Dataset validator and latency distribution
+
+Two pieces of groundwork done while the labelled set is being captured. Neither
+touches the detector, and neither makes any Phase 3 decision.
+
+### `validate-frames` — checking the spec mechanically
+
+`frame_set_validation.py` plus `python main.py validate-frames --root frames`. The
+spec's checklist is mostly checkable by machine, and the failures it guards against are
+all silent ones, so leaving them to a human reading a list means they get skimmed.
+
+| Checked automatically | Why it cannot be left to inspection |
+| --- | --- |
+| Every image has a label file, and every label file an image | A missing `.txt` reads as "no objects here", so every detection in that frame scores as a false positive |
+| Class names and indices against the model vocabulary | `phone` does not match `cell phone`; it reports precision 0 and no error |
+| Boxes normalised 0–1, non-degenerate, inside the frame | Pixel coordinates parse fine and match nothing |
+| Height, brightness and sharpness floors | These are the frames `load_frames` silently drops, so the benchmark reports healthy numbers on whatever survived |
+| Coverage: per class × lighting state | A hole is invisible in an aggregate |
+| Target-free frames exist, in every lighting state | **Without them precision is not computable at all** — it reads 1.00 by construction |
+| Filename convention, defined in spec §7 | The metadata that makes the coverage matrix checkable |
+
+Validation failures exit non-zero. What it **cannot** check is anything requiring
+judgement — whether a label is *correct*, whether the collection is biased, whether the
+right objects were chosen. Those stay marked `[human]` in the spec's checklist, and
+they are the ones that let a set pass every automated check and still be worthless.
+
+**Status: written, unit-tested, NOT YET RUN.** See the verification note below.
+
+### Latency as a distribution
+
+`latency_stats()` in `detection_bench.py`, reported by `bench-detect` beneath the
+existing mean. One number was never enough: §2e measured the *same* configuration at
+438 ms and then 503 ms — a 15% move on identical input, larger than several of the
+differences being compared — and a mean cannot separate that drift from a real
+difference between two models. The report now gives median, min and max alongside it.
+
+The cold first frame is handled by **naming it, not dropping it**. It is left in the
+mean and reported as `first_frame_ms` against `mean_after_first_ms`, so the size of the
+warm-up effect is visible instead of being assumed away. `ms_per_frame` is unchanged and
+is now read from `latency["mean_ms"]` so the two cannot drift apart.
+
+Every latency figure here remains **detection-only**: saved frames, one process, nothing
+else running. It is roughly a sixth of a live frame (§1 puts gaze at ~433 ms per call)
+and the components contend for the same CPU rather than adding. **§6 Q2 is not answered
+by this and is not closer to being answered** — it needs the whole loop.
+
+**Status: written, unit-tested, NOT YET RUN.** See below.
+
+### Verification note — outstanding
+
+Both changes were written in a session where the shell could not be reached: every
+`Bash`/`PowerShell` call, and a dispatched subagent, was refused with a harness error
+(`deepseek-v4-flash is temporarily unavailable, so auto mode cannot determine the
+safety of …`). So, recorded plainly:
+
+- **Not run:** `python -m unittest discover -s tests`, `ruff check .`, `mypy`.
+- **Not run:** `validate-frames` against any frame set, including the existing 50.
+- The only verification performed is inspection, including a manual count of
+  `COCO_CLASSES` (80 entries, `person` at index 0) and three defects fixed by reading:
+  a bad filename double-reporting its label file as an orphan; `targets.txt` being
+  reported as an orphan label in the flat layout; and `_check_negatives` reading
+  `report.stats` before it was populated, which made the check silently dead.
+- `frame_set_validation.py` was added to `mypy.ini`'s enforced `files` list, so the
+  next `mypy` run covers it.
+- `main.py` now imports the new module, so **a defect in it would break the whole
+  battery** — this is the first thing to establish.
+
+This is the same standard applied to the earlier ruff claim in §2c: a check that has
+not been run is recorded as not run.
 
 ## 3. Phases
 
@@ -255,6 +617,11 @@ measurement can satisfy is a bug in the plan (see §2c).
   and downloaded once (with a graceful, reported fallback when offline).
 - **Gate:** chosen model fits the frame budget alongside the other detectors;
   measured recall gain; verified fallback with the network unavailable.
+  *Half met.* The fallback is fixed and verified (§2d). The benchmark ran and
+  **found no model worth switching to** — every `yolo11` variant lost on classes
+  and recall, so the chosen model stays `yolov8n` (§2e). The gate assumed a model
+  would win; the honest outcome is that the measurement says none did, and that the
+  frame set could not have shown a real gain in any case.
 
 ### Phase 3 — Per-class thresholds and label policy
 - Per-class confidence floors (a single global threshold either floods junk —
@@ -313,8 +680,15 @@ measurement can satisfy is a bug in the plan (see §2c).
 
 ## 6. Open questions
 
-1. **Which objects matter most?** The frames available here mostly contain a
-   person, a phone and a remote — a benchmark needs frames containing the
-   objects the system is expected to find.
-2. **Latency budget:** what end-to-end FPS is acceptable at the expo? That
-   decides `imgsz` and which model variant is allowed.
+1. **Which objects matter most?** *Answered by §2e, the hard way.* The frames
+   available here mostly contain a person, a phone and **curtains** — and a
+   benchmark over them ranks models largely by how they handle curtains, which is
+   how four models' worth of measurement ended up inconclusive. New frames showing
+   the objects the system is expected to find are now a precondition for any
+   further detection work, not a nice-to-have.
+2. **Latency budget:** what end-to-end FPS is acceptable at the expo? This decides
+   `imgsz` and which model variant is allowed. Still unanswered, and §2f records that
+   the harness cannot answer it in its current form — it measures detection only,
+   roughly a sixth of the frame. §2e made the question less urgent for *model choice*
+   (no variant earned its cost regardless of the budget), but it remains the gate for
+   Phase 3's end-to-end verification and for any `imgsz` change.

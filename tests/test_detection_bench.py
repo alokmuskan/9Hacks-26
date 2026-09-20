@@ -112,6 +112,111 @@ class SummarizeTests(unittest.TestCase):
         self.assertEqual(detection_bench.summarize_detections([]), {})
 
 
+class PerFrameDetectionStatsTests(unittest.TestCase):
+    """Detection statistics, which are deliberately not precision.
+
+    `summarize_detections` reports "surfboard x45" over 50 frames and nothing else.
+    That is equally consistent with 45 real objects and with one false positive
+    firing in almost every frame. Counting frames does not settle which it is —
+    only labels can — but it replaces one ambiguous number with the rate and the
+    coverage a reader can actually judge.
+    """
+
+    def test_counts_frames_rather_than_boxes(self):
+        stats = detection_bench.summarize_per_frame(
+            [
+                [{"label": "person", "confidence": 0.9}],
+                [{"label": "person", "confidence": 0.8}, {"label": "person", "confidence": 0.7}],
+                [],
+            ]
+        )
+        person = stats["per_class"]["person"]
+
+        self.assertEqual(stats["frames"], 3)
+        self.assertEqual(stats["frames_with_any_detection"], 2)
+        self.assertEqual(person["detections"], 3)
+        self.assertEqual(person["frames_with_detection"], 2)
+        self.assertEqual(person["max_in_one_frame"], 2)
+        self.assertAlmostEqual(person["detections_per_frame"], 1.0)
+        self.assertAlmostEqual(person["frame_coverage"], 0.667, places=3)
+
+    def test_a_spread_class_and_a_burst_are_distinguishable(self):
+        """Same box count, different shape — the distinction this exists for."""
+        spread = detection_bench.summarize_per_frame(
+            [[{"label": "surfboard", "confidence": 0.8}] for _ in range(10)]
+        )["per_class"]["surfboard"]
+        burst = detection_bench.summarize_per_frame(
+            [[{"label": "surfboard", "confidence": 0.8}] * 10] + [[] for _ in range(9)]
+        )["per_class"]["surfboard"]
+
+        self.assertEqual(spread["detections"], burst["detections"])
+        self.assertEqual(spread["frames_with_detection"], 10)
+        self.assertEqual(burst["frames_with_detection"], 1)
+        self.assertEqual(spread["max_in_one_frame"], 1)
+        self.assertEqual(burst["max_in_one_frame"], 10)
+
+    def test_classes_are_ordered_busiest_first(self):
+        stats = detection_bench.summarize_per_frame(
+            [
+                [{"label": "person", "confidence": 0.9}, {"label": "tie", "confidence": 0.3}],
+                [{"label": "person", "confidence": 0.9}],
+                [{"label": "person", "confidence": 0.9}],
+            ]
+        )
+        self.assertEqual([*stats["per_class"]], ["person", "tie"])
+
+    def test_unlabelled_rows_are_ignored_everywhere(self):
+        stats = detection_bench.summarize_per_frame([[{"label": "", "confidence": 0.5}]])
+        self.assertEqual(stats["per_class"], {})
+        self.assertEqual(stats["frames_with_any_detection"], 0)
+
+    def test_empty_input_is_harmless(self):
+        stats = detection_bench.summarize_per_frame([])
+        self.assertEqual(stats["frames"], 0)
+        self.assertEqual(stats["detections_per_frame"], 0.0)
+        self.assertEqual(stats["per_class"], {})
+
+
+class LatencyStatsTests(unittest.TestCase):
+    """A mean alone cannot show drift, and §2e watched one move 15% on fixed input."""
+
+    def test_reports_mean_median_and_spread(self):
+        stats = detection_bench.latency_stats([100.0, 200.0, 300.0, 400.0])
+
+        self.assertEqual(stats["mean_ms"], 250.0)
+        self.assertEqual(stats["median_ms"], 250.0)
+        self.assertEqual(stats["min_ms"], 100.0)
+        self.assertEqual(stats["max_ms"], 400.0)
+        self.assertEqual(stats["frames"], 4.0)
+
+    def test_the_median_is_the_middle_value_for_an_odd_count(self):
+        stats = detection_bench.latency_stats([10.0, 20.0, 90.0])
+
+        self.assertEqual(stats["median_ms"], 20.0)
+
+    def test_the_cold_first_frame_is_kept_in_the_mean_not_dropped(self):
+        """Silently discarding warm-up would flatter every latency the report prints."""
+        stats = detection_bench.latency_stats([1000.0, 100.0, 100.0, 100.0])
+
+        self.assertEqual(stats["first_frame_ms"], 1000.0)
+        self.assertEqual(stats["mean_after_first_ms"], 100.0)
+        self.assertEqual(stats["mean_ms"], 325.0)  # the warm-up frame is still in it
+        self.assertEqual(stats["median_ms"], 100.0)
+
+    def test_a_single_frame_run_is_harmless(self):
+        stats = detection_bench.latency_stats([120.0])
+
+        self.assertEqual(stats["frames"], 1.0)
+        self.assertEqual(stats["mean_after_first_ms"], 120.0)
+        self.assertEqual(stats["max_ms"], 120.0)
+
+    def test_empty_input_is_harmless(self):
+        stats = detection_bench.latency_stats([])
+
+        self.assertEqual(stats["frames"], 0.0)
+        self.assertEqual(stats["mean_ms"], 0.0)
+
+
 class ReferenceMatchingTests(unittest.TestCase):
     def test_recall_uses_expected_counts_and_tolerates_extras(self):
         detail = detection_bench.match_reference(
@@ -173,6 +278,45 @@ class ParamGridTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_report_shows_the_spread_next_to_the_mean(self):
+        """§2e measured one configuration at 438 ms and then 503 ms on fixed input.
+
+        A mean cannot tell that drift apart from a real difference between two models,
+        so the spread has to be printed beside it — and the warm-up frame named rather
+        than quietly dropped.
+        """
+        text = detection_bench.format_report(
+            [
+                {
+                    "label": "conf=0.25 imgsz=768",
+                    "ms_per_frame": 325.0,
+                    "latency": detection_bench.latency_stats([1000.0, 100.0, 100.0, 100.0]),
+                    "classes": {},
+                    "reference_recall": 1.0,
+                }
+            ]
+        )
+
+        self.assertIn("100 median", text)
+        self.assertIn("1000 max", text)
+        self.assertIn("detection only, not end-to-end", text)
+        self.assertIn("warm-up is included in the mean above, not dropped", text)
+
+    def test_report_omits_the_spread_when_no_latency_was_collected(self):
+        text = detection_bench.format_report(
+            [
+                {
+                    "label": "conf=0.25 imgsz=640",
+                    "ms_per_frame": 90.0,
+                    "classes": {},
+                    "reference_recall": 0.0,
+                }
+            ]
+        )
+
+        self.assertNotIn("median", text)
+        self.assertNotIn("first frame", text)
+
     def test_report_shows_latency_classes_and_recall(self):
         results = [
             {
@@ -193,6 +337,80 @@ class ReportTests(unittest.TestCase):
             [{"label": "conf=0.25 imgsz=640", "ms_per_frame": 90.0, "classes": {}, "reference_recall": 0.0}]
         )
         self.assertIn("(no detections)", text)
+
+    def test_report_names_the_reference_labels_that_were_missed(self):
+        """`reference recall=0.80` is not actionable on its own.
+
+        Four of five labels can be recalled by a model that has plainly regressed
+        on the fifth, so the report has to say which one failed.
+        """
+        text = detection_bench.format_report(
+            [
+                {
+                    "label": "conf=0.25 imgsz=768",
+                    "ms_per_frame": 85.0,
+                    "classes": {"person": {"count": 1.0, "max_conf": 0.9, "mean_conf": 0.9}},
+                    "reference_recall": 0.8,
+                    "reference": {
+                        "bus.jpg:bus": {"recalled": 1.0},
+                        "zidane.jpg:tie": {"recalled": 0.0},
+                    },
+                }
+            ]
+        )
+        self.assertIn("missed reference: zidane.jpg:tie", text)
+
+    def test_report_stays_quiet_when_every_reference_label_was_recalled(self):
+        text = detection_bench.format_report(
+            [
+                {
+                    "label": "conf=0.25 imgsz=768",
+                    "ms_per_frame": 85.0,
+                    "classes": {},
+                    "reference_recall": 1.0,
+                    "reference": {"bus.jpg:bus": {"recalled": 1.0}},
+                }
+            ]
+        )
+        self.assertNotIn("missed reference", text)
+
+    def test_report_shows_detection_rates_next_to_the_box_counts(self):
+        """A flooding class must not read as a success.
+
+        "surfboard x45" is the same line whether those are 45 objects or one
+        false positive in most frames; the rate and the coverage say which shape
+        the flood has, and the header says outright that it is not precision.
+        """
+        text = detection_bench.format_report(
+            [
+                {
+                    "label": "conf=0.25 imgsz=768",
+                    "ms_per_frame": 85.0,
+                    "classes": {"surfboard": {"count": 45.0, "max_conf": 0.79, "mean_conf": 0.6}},
+                    "detection_stats": detection_bench.summarize_per_frame(
+                        [[{"label": "surfboard", "confidence": 0.79}] for _ in range(45)]
+                        + [[] for _ in range(5)]
+                    ),
+                    "reference_recall": 0.8,
+                }
+            ]
+        )
+        self.assertIn("0.90/frame", text)
+        self.assertIn("45/50 frames", text)
+        self.assertIn("not precision", text)
+
+    def test_report_omits_rates_when_no_stats_were_collected(self):
+        text = detection_bench.format_report(
+            [
+                {
+                    "label": "conf=0.25 imgsz=640",
+                    "ms_per_frame": 90.0,
+                    "classes": {"person": {"count": 1.0, "max_conf": 0.9, "mean_conf": 0.9}},
+                    "reference_recall": 1.0,
+                }
+            ]
+        )
+        self.assertNotIn("boxes/frame", text)
 
     def test_excluded_frames_are_summarised_by_reason(self):
         rejected = [

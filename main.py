@@ -25,6 +25,7 @@ import numpy as np
 
 import common
 import detection_bench
+import frame_set_validation
 from object_detection import DualYoloDetector, find_latest_custom_model
 from scene_memory import SceneMemoryManager
 
@@ -315,14 +316,49 @@ def _prune_unknown_incidents(keep: int | None = None) -> int:
     return removed
 
 
-def _resolve_general_model_path(path: str | None) -> str:
-    if path:
-        return path
+def _resolve_general_model_path(path: str | None = None) -> str:
+    """Return the checkpoint to load, honouring whatever was configured.
 
-    configured = Path(DEFAULT_GENERAL_MODEL)
-    if configured.exists():
-        return str(configured)
-    return "yolov8n.pt"
+    A bare name such as ``yolo11s.pt`` is a *model name*, not a missing file:
+    Ultralytics downloads it on first use, which is what the README promises. This
+    used to return the configured value only when a file of that name already
+    existed, and otherwise substitute ``yolov8n.pt`` — so
+    ``AI_STUDIO_GENERAL_YOLO_MODEL`` looked like it worked while detection ran on a
+    different model entirely, and `doctor` reported the substitute as if it were
+    the configured one. A silent swap would also quietly corrupt every benchmark
+    number, which would measure one model while printing the name of another.
+    """
+    return str(path) if path else DEFAULT_GENERAL_MODEL
+
+
+def _is_downloadable_model_name(model_path: str) -> bool:
+    """True for a bare checkpoint name (``yolo11s.pt``), false for a real path.
+
+    Ultralytics resolves a bare name against its release assets, but a path such
+    as ``runs/detect/train/weights/best.pt`` it will only ever open from disk.
+    """
+    candidate = Path(model_path)
+    return candidate.parent == Path() and candidate.suffix == ".pt"
+
+
+def _ensure_general_model(model_path: str) -> str:
+    """Make ``model_path`` available, downloading it once if it is a model name.
+
+    Returns ``""`` when the checkpoint is ready to load, or a human-readable reason
+    when it could not be obtained — offline, unknown name, unreadable path. The
+    caller reports that reason and carries on without the model, rather than
+    substituting a checkpoint nobody asked for: the substitution is what made the
+    original bug invisible, since a failed download still printed success.
+    """
+    if Path(model_path).exists():
+        return ""
+    try:
+        from ultralytics import YOLO
+
+        YOLO(model_path)
+        return ""
+    except Exception as exc:  # offline, unknown checkpoint, unusable path
+        return str(exc) or type(exc).__name__
 
 
 def _load_default_custom_model_path() -> str | None:
@@ -4478,15 +4514,22 @@ def collect_environment_report(check_camera: bool = False) -> list[tuple[str, st
             ("ok" if available else "warn", f"module:{name}", f"{detail} - {purpose}")
         )
 
+    # Report the *configured* checkpoint. The old resolver substituted yolov8n.pt
+    # whenever the configured file was absent, so this row could read "yolov8n.pt
+    # present" while the session actually ran on whatever the env var named.
     general_path = _resolve_general_model_path(None)
-    rows.append(
-        (
-            "ok" if Path(general_path).exists() else "warn",
-            "general YOLO",
-            f"{general_path} "
-            + ("present" if Path(general_path).exists() else "missing (Ultralytics downloads it on first run)"),
+    if Path(general_path).exists():
+        rows.append(("ok", "general YOLO", f"{general_path} present"))
+    elif _is_downloadable_model_name(general_path):
+        rows.append(
+            (
+                "warn",
+                "general YOLO",
+                f"{general_path} not downloaded yet (Ultralytics fetches it on first run)",
+            )
         )
-    )
+    else:
+        rows.append(("warn", "general YOLO", f"{general_path} not found"))
 
     custom_path = _load_default_custom_model_path()
     rows.append(
@@ -4601,14 +4644,12 @@ def cmd_bootstrap(download_gaze: bool = True) -> None:
     if Path(general_path).exists():
         print(f"[ ok ] general YOLO already present: {general_path}")
     else:
-        try:
-            from ultralytics import YOLO
-
-            YOLO("yolov8n.pt")
+        problem = _ensure_general_model(general_path)
+        if problem:
+            problems.append(f"general YOLO weights unavailable ({general_path}: {problem})")
+            print(f"[warn] general YOLO could not be prepared: {general_path} ({problem})")
+        else:
             print(f"[ ok ] general YOLO ready: {general_path}")
-        except Exception as exc:
-            problems.append(f"general YOLO weights unavailable ({exc})")
-            print(f"[warn] general YOLO could not be prepared: {exc}")
 
     gaze_weights = Path(GAZE_WEIGHTS_DEFAULT)
     if gaze_weights.exists():
@@ -4677,6 +4718,71 @@ def cmd_bench_detect(
     if json_out:
         Path(json_out).write_text(json.dumps(results, indent=2), encoding="utf-8")
         print(f"\nWrote {json_out}")
+
+
+def cmd_validate_frames(
+    root: str,
+    targets: str | None,
+    vocab: str | None,
+    min_brightness: float,
+    json_out: str | None,
+) -> None:
+    """Check a labelled frame set against the capture spec before measuring on it.
+
+    This validates the *dataset*, not the detector: it exits non-zero only when the
+    frames or labels are malformed, never because of how a model performed. The
+    problems it catches are the silent ones — a missing label file, a class spelled
+    slightly wrong, frames the quality filter will quietly drop.
+    """
+    root_path = Path(root)
+    if not root_path.is_dir():
+        print(f"[FAIL] frame set not found: {root_path}")
+        print("       Expected a directory holding images/ and labels/ (spec §7).")
+        sys.exit(1)
+
+    targets_path = Path(targets) if targets else root_path / "targets.txt"
+    target_names: list[str] = []
+    if targets_path.is_file():
+        target_names = frame_set_validation.load_targets(targets_path)
+    else:
+        print(f"[warn] no target list at {targets_path}")
+        print("       Class-coverage and negative-frame checks will be skipped (spec §2a).")
+
+    classes = (
+        frame_set_validation.load_vocabulary(vocab)
+        if vocab
+        else frame_set_validation.vocabulary()
+    )
+
+    print(f"Frame set  : {root_path}")
+    print(f"Targets    : {len(target_names)} declared" + (f" ({targets_path.name})" if target_names else ""))
+    print(f"Vocabulary : {len(classes)} classes" + (f" ({vocab})" if vocab else " (COCO-80)"))
+    print()
+
+    report = frame_set_validation.validate_frame_set(
+        root_path,
+        targets=target_names,
+        vocab=classes,
+        min_brightness=min_brightness,
+    )
+    print(frame_set_validation.format_validation_report(report))
+
+    if json_out:
+        Path(json_out).write_text(
+            json.dumps(
+                {
+                    "ok": report.ok,
+                    "stats": report.stats,
+                    "findings": [vars(row) for row in report.findings],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"\nWrote {json_out}")
+
+    if not report.ok:
+        sys.exit(1)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -4821,6 +4927,32 @@ def main() -> None:
         help="Frames darker than this are excluded and reported instead of skewing recall",
     )
     p_bd.add_argument("--json", dest="json_out", default=None, help="Also write raw results to this JSON file")
+    p_vf = sub.add_parser(
+        "validate-frames",
+        help="Check a labelled frame set against the capture spec (see OBJECT_DETECTION_FRAME_SET_SPEC.md)",
+    )
+    p_vf.add_argument(
+        "--root",
+        default="frames",
+        help="Frame-set root, holding images/ and labels/ (default: frames)",
+    )
+    p_vf.add_argument(
+        "--targets",
+        default=None,
+        help="File listing the in-scope class names, one per line (default: <root>/targets.txt)",
+    )
+    p_vf.add_argument(
+        "--vocab",
+        default=None,
+        help="File overriding the class vocabulary, one name per line (default: COCO-80)",
+    )
+    p_vf.add_argument(
+        "--min-brightness",
+        type=float,
+        default=detection_bench.DEFAULT_MIN_BRIGHTNESS,
+        help="Frames darker than this are reported, since the benchmark would drop them",
+    )
+    p_vf.add_argument("--json", dest="json_out", default=None, help="Also write the results to this JSON file")
     p_boot = sub.add_parser("bootstrap", help="Create runtime directories and fetch model assets")
     p_boot.add_argument(
         "--no-gaze-download",
@@ -4871,6 +5003,13 @@ def main() -> None:
             args.model,
             args.conf,
             args.imgsz,
+            args.min_brightness,
+            args.json_out,
+        ),
+        "validate-frames": lambda: cmd_validate_frames(
+            args.root,
+            args.targets,
+            args.vocab,
             args.min_brightness,
             args.json_out,
         ),
