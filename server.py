@@ -69,7 +69,10 @@ def _install_shutdown_noise_filter() -> None:
 
 _install_shutdown_noise_filter()
 
-FPS_CAP_DEFAULT = 20
+# Live pacing & capture cadence, env-tunable — see common.py for the rationale.
+FPS_CAP_DEFAULT = common.FPS_CAP_DEFAULT
+ENROLL_FPS_CAP_DEFAULT = common.ENROLL_FPS_CAP_DEFAULT
+SNAPSHOT_INTERVAL_DEFAULT = common.SNAPSHOT_INTERVAL_DEFAULT
 MJPEG_QUALITY = 75
 WS_QUEUE_MAX = 256
 CAMERA_FAILURE_THRESHOLD = 20
@@ -255,7 +258,7 @@ class MonitorStartRequest(BaseModel):
     custom_model: str | None = None
     disable_general: bool = False
     disable_custom: bool = False
-    snapshot_interval: float = Field(default=15.0, ge=1.0, le=3600.0)
+    snapshot_interval: float = Field(default=SNAPSHOT_INTERVAL_DEFAULT, ge=1.0, le=3600.0)
     disable_gaze: bool = False
     gaze_arch: GazeArch = GAZE_ARCH_DEFAULT
     gaze_weights: str = "models/L2CSNet_gaze360.pkl"
@@ -284,7 +287,9 @@ class ChatRequest(BaseModel):
 class EnrollStartRequest(BaseModel):
     name: str
     model: str = "buffalo_sc"
-    fps_cap: int = Field(default=FPS_CAP_DEFAULT, ge=1, le=60)
+    # Enrollment samples at a faster cap than monitoring: more samples per
+    # wall-clock second, and enrollment is brief by design.
+    fps_cap: int = Field(default=ENROLL_FPS_CAP_DEFAULT, ge=1, le=60)
 
 
 @dataclass
@@ -316,6 +321,7 @@ class PipelineManager:
         self._session_id: str | None = None
         self._started_utc: str | None = None
         self._fps_cap = FPS_CAP_DEFAULT
+        self._snapshot_interval = SNAPSHOT_INTERVAL_DEFAULT
         self._degraded = False
         self._degraded_reason: str | None = None
         self._last_error: str | None = None
@@ -435,6 +441,7 @@ class PipelineManager:
                 "session_id": self._session_id,
                 "started_utc": self._started_utc,
                 "fps_cap": self._fps_cap,
+                "snapshot_interval": self._snapshot_interval,
                 "degraded": self._degraded,
                 "degraded_reason": self._degraded_reason,
                 "last_error": self._last_error,
@@ -499,6 +506,7 @@ class PipelineManager:
             self._session_id = _session_id("monitor")
             self._started_utc = _iso()
             self._fps_cap = int(req.fps_cap)
+            self._snapshot_interval = float(req.snapshot_interval)
             self._degraded = False
             self._degraded_reason = None
             self._last_error = None
@@ -1294,7 +1302,7 @@ class PipelineManager:
                 core._hud(
                     frame,
                     [
-                        (f"Faces:{face_count} Objects:{object_count} FPS:{fps_ema:.1f}", (255, 255, 255)),
+                        (f"Faces:{face_count} Objects:{object_count} FPS:{fps_ema:.1f}/{int(fps_cap)}", (255, 255, 255)),
                         (
                             (
                                 f"Known:{known_detections} Unknown:{unknown_detections} "

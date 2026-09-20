@@ -167,7 +167,11 @@ function LiveMonitorPage() {
               </div>
               <div className="count-box">
                 <span>FPS Cap</span>
-                <strong>{status?.fps_cap || 20}</strong>
+                <strong>{status?.fps_cap || 12}</strong>
+              </div>
+              <div className="count-box">
+                <span>Snapshot</span>
+                <strong>{status?.snapshot_interval ? `${status.snapshot_interval}s` : "8s"}</strong>
               </div>
               <div className="count-box">
                 <span>Reconnect</span>

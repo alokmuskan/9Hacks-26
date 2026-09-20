@@ -1,7 +1,10 @@
+import hashlib
 import importlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -27,6 +30,23 @@ class _FakeGDown:
     def download_folder(self, **_kwargs):
         self.calls += 1
         return self.rows
+
+
+def _fake_urlopen_blob(blob):
+    """Stand-in for urllib.request.urlopen serving one static bytes payload."""
+
+    class _FakeResponse(io.BytesIO):
+        def __init__(self, blob):
+            super().__init__(blob)
+            self.headers = {"Content-Length": str(len(blob))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    return lambda _request, timeout=None: _FakeResponse(blob)
 
 
 class GazeL2CSHelperTests(unittest.TestCase):
@@ -293,6 +313,172 @@ class GazeL2CSHelperTests(unittest.TestCase):
         )
         self.assertEqual(gx, 100)
         self.assertEqual(gy, 75)
+
+class GazeMirrorFallbackTests(unittest.TestCase):
+    """The Drive folder is dead upstream; bootstrap must recover via the mirror."""
+
+    def _tiny_safetensors(self, state_dict):
+        """Build a minimal but structurally valid safetensors file in memory."""
+        import json as _json
+        import struct as _struct
+
+        header = {}
+        blobs = []
+        offset = 0
+        for name, array in state_dict.items():
+            raw = np.ascontiguousarray(array).tobytes()
+            dtype = {"float32": "F32", "float16": "F16"}[str(array.dtype)]
+            header[name] = {
+                "dtype": dtype,
+                "shape": list(array.shape),
+                "data_offsets": [offset, offset + len(raw)],
+            }
+            blobs.append(raw)
+            offset += len(raw)
+        header_json = _json.dumps(header).encode("utf-8")
+        pad = (8 - (len(header_json) % 8)) % 8
+        header_json += b" " * pad
+        return _struct.pack("<Q", len(header_json)) + header_json + b"".join(blobs)
+
+    def test_mirror_used_when_gdown_yields_nothing(self):
+        _install_stubs()
+        main = importlib.import_module("main")
+
+        state = {
+            "fc_yaw_gaze.weight": np.zeros((90, 2048), dtype=np.float32),
+            "fc_yaw_gaze.bias": np.zeros(90, dtype=np.float32),
+            "fc_pitch_gaze.weight": np.zeros((90, 2048), dtype=np.float32),
+            "fc_pitch_gaze.bias": np.zeros(90, dtype=np.float32),
+            "fc_finetune.weight": np.zeros((3, 2048), dtype=np.float32),
+            "fc_finetune.bias": np.zeros(3, dtype=np.float32),
+        }
+        blob = self._tiny_safetensors(state)
+        digest = hashlib.sha256(blob).hexdigest()
+
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "models" / "L2CSNet_gaze360.pkl"
+            with (
+                mock.patch.object(main, "GAZE_WEIGHTS_MIRROR_SIZE", len(blob)),
+                mock.patch.object(main, "GAZE_WEIGHTS_MIRROR_SHA256", digest),
+                mock.patch.object(
+                    main,
+                    "_load_safetensors_state_dict",
+                    return_value={k: v.copy() for k, v in state.items()},
+                ) as parse_spy,
+            ):
+                download_spy = mock.patch.object(
+                    main,
+                    "_download_gaze_weights_from_mirror",
+                    wraps=main._download_gaze_weights_from_mirror,
+                )
+                with download_spy as dl:
+                    with mock.patch.object(
+                        main.urllib.request, "urlopen", side_effect=OSError("dead upstream")
+                    ):
+                        # gdown present but the Drive folder returns nothing usable.
+                        result = main._resolve_l2cs_weights_path(
+                            weights_path=target,
+                            weights_source="https://drive.google.com/dead",
+                            auto_download=True,
+                            gdown_module=_FakeGDown([]),
+                        )
+
+            self.assertIsNone(result, "a failed download must not fabricate a path")
+            self.assertFalse(target.exists())
+            self.assertEqual(dl.call_count, 1, "mirror fallback must be attempted")
+            self.assertEqual(parse_spy.call_count, 0)
+
+    def test_mirror_download_writes_loader_compatible_pkl(self):
+        _install_stubs()
+        main = importlib.import_module("main")
+        if not _TORCH_AVAILABLE:
+            self.skipTest("torch is needed to verify the saved checkpoint loads")
+        import torch
+
+        state = {
+            "fc_yaw_gaze.weight": np.arange(90 * 4, dtype=np.float32).reshape(90, 4),
+            "fc_yaw_gaze.bias": np.arange(90, dtype=np.float32),
+            "fc_pitch_gaze.weight": np.zeros((90, 4), dtype=np.float32),
+            "fc_pitch_gaze.bias": np.zeros(90, dtype=np.float32),
+            "fc_finetune.weight": np.zeros((3, 4), dtype=np.float32),
+            "fc_finetune.bias": np.zeros(3, dtype=np.float32),
+        }
+        blob = self._tiny_safetensors(state)
+        digest = hashlib.sha256(blob).hexdigest()
+
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "models" / "L2CSNet_gaze360.pkl"
+            with (
+                mock.patch.object(main, "GAZE_WEIGHTS_MIRROR_SIZE", len(blob)),
+                mock.patch.object(main, "GAZE_WEIGHTS_MIRROR_SHA256", digest),
+                mock.patch.object(
+                    main, "_load_safetensors_state_dict", return_value={k: v.copy() for k, v in state.items()}
+                ),
+                mock.patch.object(
+                    main.urllib.request,
+                    "urlopen",
+                    side_effect=_fake_urlopen_blob(blob),
+                ),
+            ):
+                result = main._download_gaze_weights_from_mirror(target)
+
+            self.assertIsNotNone(result)
+            self.assertTrue(target.exists(), "converted pkl must be written")
+
+            loaded = torch.load(str(target), map_location="cpu", weights_only=True)
+            self.assertIsInstance(loaded, dict)
+            for key, value in loaded.items():
+                self.assertIsInstance(value, torch.Tensor, f"{key} must be a torch tensor")
+                self.assertTrue(np.array_equal(value.numpy(), state[key]), f"{key} values must match")
+
+    def test_checksum_mismatch_rejects_download(self):
+        _install_stubs()
+        main = importlib.import_module("main")
+
+        state = {"fc_yaw_gaze.weight": np.zeros((90, 2048), dtype=np.float32)}
+        blob = self._tiny_safetensors(state)
+        wrong_digest = "0" * 64
+
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "models" / "L2CSNet_gaze360.pkl"
+            with (
+                mock.patch.object(main, "GAZE_WEIGHTS_MIRROR_SIZE", len(blob)),
+                mock.patch.object(main, "GAZE_WEIGHTS_MIRROR_SHA256", wrong_digest),
+                mock.patch.object(main.urllib.request, "urlopen", side_effect=_fake_urlopen_blob(blob)),
+            ):
+                result = main._download_gaze_weights_from_mirror(target)
+
+            self.assertIsNone(result, "checksum mismatch must reject the file")
+            self.assertFalse(target.exists(), "no file may be left behind on rejection")
+
+    def test_existing_weights_are_never_touched(self):
+        _install_stubs()
+        main = importlib.import_module("main")
+
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "models" / "L2CSNet_gaze360.pkl"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"existing weights")
+
+            result = main._download_gaze_weights_from_mirror(target)
+            self.assertIsNone(result, "existing file means no download should run")
+            self.assertEqual(target.read_bytes(), b"existing weights")
+
+    def test_truncated_download_is_rejected(self):
+        _install_stubs()
+        main = importlib.import_module("main")
+
+        blob = b"x" * 1024  # far smaller than the pinned size
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "models" / "L2CSNet_gaze360.pkl"
+            with (
+                mock.patch.object(main, "GAZE_WEIGHTS_MIRROR_SIZE", 10_000_000),
+                mock.patch.object(main.urllib.request, "urlopen", side_effect=_fake_urlopen_blob(blob)),
+            ):
+                result = main._download_gaze_weights_from_mirror(target)
+
+            self.assertIsNone(result)
+            self.assertFalse(target.exists())
 
 
 if __name__ == "__main__":
