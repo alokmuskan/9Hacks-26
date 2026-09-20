@@ -53,6 +53,24 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean knob: unset/garbage keeps the default rather than guessing."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def clamp(value: float, bounds: tuple[float, float]) -> float:
+    low, high = bounds
+    return min(max(value, low), high)
+
+
 # ── Storage lifecycle ─────────────────────────────────────────────────────────
 # The metrics log rotates by size so it cannot grow without bound, and rotated
 # generations stay readable so reports keep their history. All three caps are
@@ -72,21 +90,36 @@ UNKNOWN_INCIDENT_MAX_FILES = max(_env_int("AI_STUDIO_UNKNOWN_INCIDENT_MAX_FILES"
 # offline benchmark (`main.py bench-detect`, see OBJECT_DETECTION_PLAN.md): on
 # this project's own frames, imgsz=768 found 8 classes versus 5 at 640 with
 # reference recall unchanged at 1.00, for ~150 ms versus ~90 ms per frame on a
-# CPU-only box.
+# CPU-only box. The imgsz default was deliberately raised from Ultralytics' 640
+# on that evidence, and the ~1.5x per-frame cost was accepted with it.
 #
 # Confidence and IoU stay at Ultralytics' defaults on purpose: lowering the
 # global threshold adds low-confidence junk (surfboard/tie at 0.17), which is a
 # per-class policy decision rather than a global one.
+#
+# The bounds live here and are applied by `DetectorConfig` in
+# `object_detection.py`, so a value cannot be valid in one place and invalid in
+# the other.
+YOLO_CONF_BOUNDS = (0.01, 0.99)
+YOLO_IOU_BOUNDS = (0.1, 0.95)
+YOLO_IMGSZ_BOUNDS = (320, 1920)
+YOLO_MAX_DET_BOUNDS = (1, 1000)
+
+
 def normalize_imgsz(value: int | float) -> int:
     """Clamp an inference size to what YOLO can use: 320-1920, multiple of 32."""
-    clamped = min(max(int(value), 320), 1920)
+    clamped = clamp(int(value), YOLO_IMGSZ_BOUNDS)
     return int(round(clamped / 32.0) * 32)
 
 
-YOLO_CONF_DEFAULT = min(max(_env_float("AI_STUDIO_YOLO_CONF", 0.25), 0.01), 0.99)
-YOLO_IOU_DEFAULT = min(max(_env_float("AI_STUDIO_YOLO_IOU", 0.7), 0.1), 0.95)
+YOLO_CONF_DEFAULT = clamp(_env_float("AI_STUDIO_YOLO_CONF", 0.25), YOLO_CONF_BOUNDS)
+YOLO_IOU_DEFAULT = clamp(_env_float("AI_STUDIO_YOLO_IOU", 0.7), YOLO_IOU_BOUNDS)
 YOLO_IMGSZ_DEFAULT = normalize_imgsz(_env_int("AI_STUDIO_YOLO_IMGSZ", 768))
-YOLO_MAX_DET_DEFAULT = min(max(_env_int("AI_STUDIO_YOLO_MAX_DET", 300), 1), 1000)
+YOLO_MAX_DET_DEFAULT = int(clamp(_env_int("AI_STUDIO_YOLO_MAX_DET", 300), YOLO_MAX_DET_BOUNDS))
+# Class-agnostic NMS: one shared pool of boxes across classes, so the same object
+# cannot be reported twice under two labels. Off by default because it can also
+# suppress a genuinely distinct overlapping label (a tie inside a person).
+YOLO_AGNOSTIC_NMS_DEFAULT = _env_bool("AI_STUDIO_YOLO_AGNOSTIC_NMS", False)
 
 # ── Live pacing & instance capture ────────────────────────────────────────────
 # The monitor loop targets at most FPS_CAP_DEFAULT frames per second; the cap is

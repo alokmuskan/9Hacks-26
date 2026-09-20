@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
 
@@ -7,30 +8,51 @@ import numpy as np
 import common
 import detection_bench
 
+#: One point in the parameter space. This is the *detector's* type, re-exported
+#: rather than redefined — see `object_detection.DetectorConfig`.
+DetectorConfig = detection_bench.DetectorConfig
 
-def _real_inference_available() -> bool:
-    """True only when real inference can run here.
 
-    Called from `setUp`, never at import time: importing `cv2` during discovery
-    would claim `sys.modules["cv2"]` with the real library before the shared stub
-    gets a chance to install, breaking every test that relies on the stub (see
-    `_stubs` for the contract).
+class _RealInferenceMixin:
+    """Give a test the real OpenCV back, and put the stub back afterwards.
+
+    The suite installs a `cv2` stub into `sys.modules` (see `_stubs`), which is
+    what every other test wants — and precisely what used to make these tests
+    skip. Availability cannot be answered by inspecting `sys.modules`, only by
+    trying to import the real module, so this swaps rather than probes, and
+    restores the stub via `addCleanup` so the rest of the battery is unaffected.
     """
-    if importlib.util.find_spec("ultralytics") is None:
-        return False
-    if not Path("yolov8n.pt").exists():
-        return False
-    try:
-        import cv2
-    except Exception:
-        return False
-    # The stub is a hand-built `types.ModuleType`, so it has no `__file__`; the
-    # real extension module does. (The stub used to be identifiable by missing
-    # functions, but it now mirrors everything the pipeline calls.)
-    return bool(getattr(cv2, "__file__", None)) and hasattr(cv2, "Laplacian")
+
+    def use_real_inference(self) -> None:
+        saved = sys.modules.pop("cv2", None)
+        try:
+            import cv2
+        except Exception:
+            if saved is not None:
+                sys.modules["cv2"] = saved
+            self.skipTest("real OpenCV is not installed")
+
+        if not getattr(cv2, "__file__", None):
+            # Only the stub is importable here, so this machine has no OpenCV.
+            sys.modules["cv2"] = saved if saved is not None else cv2
+            self.skipTest("real OpenCV is not installed")
+
+        def restore() -> None:
+            if saved is None:
+                sys.modules.pop("cv2", None)
+            else:
+                sys.modules["cv2"] = saved
+
+        self.addCleanup(restore)
+
+    def require_ultralytics_and_weights(self) -> None:
+        if importlib.util.find_spec("ultralytics") is None:
+            self.skipTest("ultralytics is not installed")
+        if not Path("yolov8n.pt").exists():
+            self.skipTest("yolov8n.pt weights are not present")
 
 
-class FrameClassificationTests(unittest.TestCase):
+class FrameClassificationTests(_RealInferenceMixin, unittest.TestCase):
     """Frames that cannot be detected in must be excluded, not averaged in."""
 
     def test_dark_frame_is_rejected_with_a_reason(self):
@@ -55,8 +77,9 @@ class FrameClassificationTests(unittest.TestCase):
         self.assertEqual(row.reason, "")
 
     def test_score_image_separates_black_from_textured(self):
-        if not _real_inference_available():
-            self.skipTest("sharpness metrics need real OpenCV")
+        # `Laplacian` is the stub's blind spot: it returns zeros, so sharpness
+        # only means anything with the real library.
+        self.use_real_inference()
         black = np.zeros((64, 64), dtype=np.uint8)
         brightness, sharpness = detection_bench.score_image(black)
         self.assertLess(brightness, 1.0)
@@ -110,11 +133,11 @@ class ParamGridTests(unittest.TestCase):
         grid = detection_bench.default_param_grid()
         labels = [row.label for row in grid]
 
-        self.assertEqual(grid[0], detection_bench.DetectorParams.configured())
+        self.assertEqual(grid[0], DetectorConfig.configured())
         self.assertIn("conf=0.25 imgsz=640", labels, "the baseline to compare against is missing")
 
     def test_default_grid_matches_the_application_defaults(self):
-        configured = detection_bench.DetectorParams.configured()
+        configured = DetectorConfig.configured()
         self.assertEqual(configured.imgsz, common.YOLO_IMGSZ_DEFAULT)
         self.assertEqual(configured.conf, common.YOLO_CONF_DEFAULT)
 
@@ -132,8 +155,21 @@ class ParamGridTests(unittest.TestCase):
         self.assertAlmostEqual(grid[0].as_kwargs()["conf"], 0.2)
 
     def test_params_carry_the_full_kwarg_set(self):
-        kwargs = detection_bench.DetectorParams().as_kwargs()
-        self.assertEqual(set(kwargs), {"conf", "imgsz", "iou", "max_det"})
+        kwargs = DetectorConfig().as_kwargs()
+        self.assertEqual(
+            set(kwargs), {"conf", "imgsz", "iou", "max_det", "agnostic_nms"}
+        )
+
+    def test_a_grid_point_inherits_the_configured_nms_settings(self):
+        """The benchmark and the live detector must not disagree about NMS.
+
+        The benchmark used to carry its own hardcoded iou/max_det defaults, which
+        could drift from `common.py` without anything noticing.
+        """
+        grid = detection_bench.default_param_grid([0.25], [640])
+        self.assertEqual(grid[0].iou, common.YOLO_IOU_DEFAULT)
+        self.assertEqual(grid[0].max_det, common.YOLO_MAX_DET_DEFAULT)
+        self.assertEqual(grid[0].agnostic_nms, common.YOLO_AGNOSTIC_NMS_DEFAULT)
 
 
 class ReportTests(unittest.TestCase):
@@ -170,19 +206,19 @@ class ReportTests(unittest.TestCase):
         self.assertIn("too_small=1", text)
 
 
-class RealInferenceTests(unittest.TestCase):
+class RealInferenceTests(_RealInferenceMixin, unittest.TestCase):
     """Guards the wiring: the kwargs the benchmark passes must actually reach the model."""
 
     def setUp(self):
-        if not _real_inference_available():
-            self.skipTest("needs real cv2, ultralytics and yolov8n.pt")
+        self.use_real_inference()
+        self.require_ultralytics_and_weights()
         self.references = detection_bench.reference_assets()
         if not self.references:
             self.skipTest("bundled ultralytics reference images are unavailable")
 
     def test_reference_images_are_detected(self):
         results = detection_bench.run_benchmark(
-            "yolov8n.pt", [detection_bench.DetectorParams(conf=0.25, imgsz=640)], [], self.references
+            "yolov8n.pt", [DetectorConfig(conf=0.25, imgsz=640)], [], self.references
         )
         detail = results[0]["reference"]
         self.assertGreaterEqual(results[0]["reference_recall"], 0.5)
@@ -191,7 +227,7 @@ class RealInferenceTests(unittest.TestCase):
 
     def test_confidence_parameter_is_honoured(self):
         strict = detection_bench.run_benchmark(
-            "yolov8n.pt", [detection_bench.DetectorParams(conf=0.99, imgsz=640)], [], self.references
+            "yolov8n.pt", [DetectorConfig(conf=0.99, imgsz=640)], [], self.references
         )
         self.assertEqual(strict[0]["reference_recall"], 0.0)
         self.assertEqual(strict[0]["classes"], {})
@@ -203,7 +239,7 @@ class RealInferenceTests(unittest.TestCase):
         (clamping + normalisation), which is what the live loop runs.
         """
         results = detection_bench.run_benchmark(
-            "yolov8n.pt", [detection_bench.DetectorParams(conf=0.25, imgsz=672)], [], self.references
+            "yolov8n.pt", [DetectorConfig(conf=0.25, imgsz=672)], [], self.references
         )
         self.assertEqual(results[0]["params"]["imgsz"], 672)
 

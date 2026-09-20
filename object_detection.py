@@ -1,12 +1,80 @@
 from __future__ import annotations
 
 import glob
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 import common
+
+
+@dataclass(frozen=True)
+class DetectorConfig:
+    """The parameters forwarded to Ultralytics on every inference call.
+
+    One typed definition, shared by the live detector and the offline benchmark,
+    so the two cannot disagree about what inference is using. The field defaults
+    are read from `common` (and therefore from the environment), so there is one
+    source of truth for both the values and the bounds they are clamped to.
+
+    This used to be five loose attributes on the detector plus a second,
+    near-identical dataclass in the benchmark with its own hardcoded numbers —
+    which is exactly how the two paths could drift apart unnoticed.
+    """
+
+    conf: float = common.YOLO_CONF_DEFAULT
+    iou: float = common.YOLO_IOU_DEFAULT
+    imgsz: int = common.YOLO_IMGSZ_DEFAULT
+    max_det: int = common.YOLO_MAX_DET_DEFAULT
+    agnostic_nms: bool = common.YOLO_AGNOSTIC_NMS_DEFAULT
+
+    def as_kwargs(self) -> dict[str, Any]:
+        """The exact kwargs handed to the Ultralytics model call."""
+        return {
+            "conf": self.conf,
+            "iou": self.iou,
+            "imgsz": self.imgsz,
+            "max_det": self.max_det,
+            "agnostic_nms": self.agnostic_nms,
+        }
+
+    @property
+    def label(self) -> str:
+        return f"conf={self.conf:g} imgsz={self.imgsz}"
+
+    @classmethod
+    def configured(cls) -> DetectorConfig:
+        """The configuration the application itself will use (env knobs included)."""
+        return cls()
+
+    def updated(
+        self,
+        *,
+        conf: float | None = None,
+        iou: float | None = None,
+        imgsz: int | None = None,
+        max_det: int | None = None,
+        agnostic_nms: bool | None = None,
+    ) -> DetectorConfig:
+        """Return this configuration with overrides applied, clamped to usable ranges.
+
+        ``None`` leaves a field alone. Clamping lives here rather than at the call
+        sites so a value cannot be valid in the live loop and invalid in the
+        benchmark.
+        """
+        return DetectorConfig(
+            conf=self.conf if conf is None else common.clamp(float(conf), common.YOLO_CONF_BOUNDS),
+            iou=self.iou if iou is None else common.clamp(float(iou), common.YOLO_IOU_BOUNDS),
+            imgsz=self.imgsz if imgsz is None else common.normalize_imgsz(int(imgsz)),
+            max_det=(
+                self.max_det
+                if max_det is None
+                else int(common.clamp(int(max_det), common.YOLO_MAX_DET_BOUNDS))
+            ),
+            agnostic_nms=self.agnostic_nms if agnostic_nms is None else bool(agnostic_nms),
+        )
 
 
 def _to_numpy(value: Any) -> np.ndarray:
@@ -89,6 +157,7 @@ class DualYoloDetector:
         iou: float | None = None,
         imgsz: int | None = None,
         max_det: int | None = None,
+        agnostic_nms: bool | None = None,
     ) -> None:
         self.general_model_path = general_model_path
         self.custom_model_path = custom_model_path
@@ -96,11 +165,9 @@ class DualYoloDetector:
         # Inference parameters are resolved once, here, so the live loop and the
         # offline benchmark cannot drift apart, and so `/monitor/status` can report
         # exactly what inference is using.
-        self.conf: float = common.YOLO_CONF_DEFAULT
-        self.iou: float = common.YOLO_IOU_DEFAULT
-        self.imgsz: int = common.YOLO_IMGSZ_DEFAULT
-        self.max_det: int = common.YOLO_MAX_DET_DEFAULT
-        self.configure(conf=conf, iou=iou, imgsz=imgsz, max_det=max_det)
+        self.config = DetectorConfig.configured().updated(
+            conf=conf, iou=iou, imgsz=imgsz, max_det=max_det, agnostic_nms=agnostic_nms
+        )
 
         self.general_model = general_model_obj
         self.custom_model = custom_model_obj
@@ -126,22 +193,24 @@ class DualYoloDetector:
         iou: float | None = None,
         imgsz: int | None = None,
         max_det: int | None = None,
-    ) -> dict[str, Any]:
+        agnostic_nms: bool | None = None,
+    ) -> DetectorConfig:
         """Apply inference parameters (clamped to usable ranges) and return them.
 
-        One clamping path for the constructor, runtime tuning and the offline
-        benchmark, so a value cannot be valid in one place and invalid in another.
-        ``None`` leaves a parameter at its configured default.
+        One clamping path for the constructor, runtime tuning (see
+        `set_config`) and the offline benchmark, so a value cannot be valid in one
+        place and invalid in another. ``None`` leaves a parameter at its current
+        value.
         """
-        if conf is not None:
-            self.conf = min(max(float(conf), 0.01), 0.99)
-        if iou is not None:
-            self.iou = min(max(float(iou), 0.1), 0.95)
-        if imgsz is not None:
-            self.imgsz = common.normalize_imgsz(int(imgsz))
-        if max_det is not None:
-            self.max_det = min(max(int(max_det), 1), 1000)
-        return self.params()
+        self.config = self.config.updated(
+            conf=conf, iou=iou, imgsz=imgsz, max_det=max_det, agnostic_nms=agnostic_nms
+        )
+        return self.config
+
+    def set_config(self, config: DetectorConfig) -> DetectorConfig:
+        """Replace the whole configuration in one step."""
+        self.config = config
+        return self.config
 
     def _load_model(self, model_path: str) -> Any:
         try:
@@ -208,7 +277,7 @@ class DualYoloDetector:
 
     def params(self) -> dict[str, Any]:
         """The inference kwargs handed to Ultralytics on every call."""
-        return {"conf": self.conf, "iou": self.iou, "imgsz": self.imgsz, "max_det": self.max_det}
+        return self.config.as_kwargs()
 
     def get_state(self) -> dict[str, Any]:
         return {

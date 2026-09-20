@@ -122,6 +122,7 @@ class RunabilityConfigTests(unittest.TestCase):
         self.assertEqual(common.YOLO_CONF_DEFAULT, 0.25)
         self.assertEqual(common.YOLO_IOU_DEFAULT, 0.7)
         self.assertEqual(common.YOLO_MAX_DET_DEFAULT, 300)
+        self.assertEqual(common.YOLO_AGNOSTIC_NMS_DEFAULT, False)
 
     def test_inference_size_is_normalised_and_clamped(self):
         common = importlib.import_module("common")
@@ -134,7 +135,8 @@ class RunabilityConfigTests(unittest.TestCase):
         code = (
             "import common;"
             "print(common.YOLO_CONF_DEFAULT, common.YOLO_IOU_DEFAULT, "
-            "common.YOLO_IMGSZ_DEFAULT, common.YOLO_MAX_DET_DEFAULT)"
+            "common.YOLO_IMGSZ_DEFAULT, common.YOLO_MAX_DET_DEFAULT, "
+            "common.YOLO_AGNOSTIC_NMS_DEFAULT)"
         )
         proc = subprocess.run(
             [sys.executable, "-c", code],
@@ -151,17 +153,33 @@ class RunabilityConfigTests(unittest.TestCase):
             self._probe_yolo_env(
                 AI_STUDIO_YOLO_CONF="0.4", AI_STUDIO_YOLO_IMGSZ="640", AI_STUDIO_YOLO_MAX_DET="50"
             ),
-            ["0.4", "0.7", "640", "50"],
+            ["0.4", "0.7", "640", "50", "False"],
         )
         # Garbage and out-of-range values fall back or clamp instead of exploding.
         self.assertEqual(
             self._probe_yolo_env(AI_STUDIO_YOLO_CONF="5", AI_STUDIO_YOLO_IMGSZ="100"),
-            ["0.99", "0.7", "320", "300"],
+            ["0.99", "0.7", "320", "300", "False"],
         )
         self.assertEqual(
             self._probe_yolo_env(AI_STUDIO_YOLO_IMGSZ="nonsense"),
-            ["0.25", "0.7", "768", "300"],
+            ["0.25", "0.7", "768", "300", "False"],
         )
+
+    def test_agnostic_nms_env_knob_accepts_the_usual_spellings(self):
+        for enabled in ("1", "true", "TRUE", "yes", "on"):
+            self.assertEqual(
+                self._probe_yolo_env(AI_STUDIO_YOLO_AGNOSTIC_NMS=enabled)[-1],
+                "True",
+                f"{enabled!r} should enable agnostic NMS",
+            )
+        for disabled in ("0", "false", "no", "off"):
+            self.assertEqual(
+                self._probe_yolo_env(AI_STUDIO_YOLO_AGNOSTIC_NMS=disabled)[-1],
+                "False",
+                f"{disabled!r} should disable agnostic NMS",
+            )
+        # An unreadable value keeps the default rather than guessing.
+        self.assertEqual(self._probe_yolo_env(AI_STUDIO_YOLO_AGNOSTIC_NMS="maybe")[-1], "False")
 
     def test_pixi_tasks_do_not_hardcode_a_camera_device(self):
         text = (PROJECT_ROOT / "pixi.toml").read_text(encoding="utf-8")

@@ -308,6 +308,7 @@ All variables are optional; the defaults below reflect the code.
 | `AI_STUDIO_YOLO_CONF` | `0.25` | backend | Object-detection confidence threshold (0.01–0.99). Lower finds more at the cost of low-confidence noise |
 | `AI_STUDIO_YOLO_IOU` | `0.7` | backend | NMS IoU threshold (0.1–0.95) |
 | `AI_STUDIO_YOLO_MAX_DET` | `300` | backend | Maximum boxes per frame (1–1000) |
+| `AI_STUDIO_YOLO_AGNOSTIC_NMS` | `false` | backend | Class-agnostic NMS: one box pool across classes, so one object cannot be reported under two labels. Can also drop a genuinely distinct overlapping label |
 | `AI_STUDIO_FPS_CAP` | `12` | backend | Monitor-loop ceiling in frames/s. The cap is a ceiling — slow machines run at whatever they keep up with. Lower = less CPU, higher = snappier detection |
 | `AI_STUDIO_ENROLL_FPS_CAP` | `20` | backend | Same ceiling for enrollment sessions (kept faster on purpose; sample collection wants rate) |
 | `AI_STUDIO_SNAPSHOT_INTERVAL` | `8.0` | backend | Seconds between auto snapshots — the instances reports and chat ground on. Runs on wall-clock time, independent of FPS; clamped to 1–3600 |
@@ -450,11 +451,37 @@ pixi run python main.py chat --question "What happened in the last 10 minutes?"
 
 # ASCII security report -> report.txt
 pixi run python main.py report
+
+# Offline detection benchmark (see "Detection Benchmark" below)
+pixi run python main.py bench-detect
 ```
 
 Global flag: `--model {buffalo_l,buffalo_m,buffalo_s,buffalo_sc,antelopev2}` (default `buffalo_sc`).
 
 `recognize` options: `--general-model`, `--custom-model`, `--disable-general`, `--disable-custom`, `--disable-gaze`, `--snapshot-interval`, `--gaze-arch`, `--gaze-weights`, `--gaze-weights-source`, `--disable-gaze-auto-download`, `--gaze-max-interval`, `--gaze-target-fps-drop`.
+
+### Detection Benchmark
+
+Detection quality is measurably different from detection *working*, and the live loop can only tell you the latter — in a scene nobody can replay. `bench-detect` runs the **real detector** over a fixed frame set (your own saved snapshots, plus the reference images bundled with Ultralytics that have known labels) and reports per-class counts, mean confidence and ms/frame, so a tuning change can be justified with numbers:
+
+```bash
+pixi run python main.py bench-detect
+pixi run python main.py bench-detect --imgsz 640 768 960 --conf 0.25 0.15
+pixi run python main.py bench-detect --json bench.json
+```
+
+```
+excluded frames: 10 (too_dark=9, too_small=1)
+
+conf=0.25 imgsz=768    86 ms/frame   8 classes   reference recall=1.00
+    person x56 (max 0.92)  remote x8 (max 0.48)  cell phone x5 (max 0.45) ...
+conf=0.25 imgsz=640    58 ms/frame   5 classes   reference recall=1.00
+    person x56 (max 0.94)  cell phone x7 (max 0.46)  remote x2 (max 0.29) ...
+```
+
+Frames too dark, blurred or small to detect anything in are **excluded and reported by reason** instead of dragging the recall numbers down — on a real capture set a large fraction of frames are unusable, and averaging those in measures the room's lighting rather than the detector. With no arguments the benchmark compares the *shipping* configuration against the historical 640/0.25 baseline, so the default run answers "did the change I just made help?".
+
+Run it after changing any `AI_STUDIO_YOLO_*` knob. `--frames` accepts globs, `--min-brightness` sets the usable-frame floor, and `--json` writes the raw per-class results.
 
 ### Gaze Scheduling
 
@@ -631,7 +658,9 @@ Waiting is bounded (10 s for writers, 2 s for readers). If a required lock canno
 pixi run python -m unittest discover -s tests -q
 ```
 
-133 tests cover the detection schema and toggles, gaze L2CS helpers and interval scheduling, the shared session aggregate contract, environment readiness and first-run bootstrap, storage lifecycle (metrics rotation, snapshot and incident retention), cross-process locking (real subprocess contention, including control cases proving those tests detect unsynchronised writers), persistence integrity (including concurrent snapshot and metrics writers), behavior tracking and summaries, chat and snapshot actions, metrics schema normalisation, scene memory, the CLI `recognize` loop end-to-end, and the FastAPI surface (status schema, monitor lifecycle, camera recovery, stream generator, WebSocket envelope, chat sessions, and two-step action confirmation).
+The suite prints its own count when it runs, which is the authoritative number — it is deliberately not restated here, because a hardcoded count goes stale the next time a test is added. Coverage: the detection schema and toggles, gaze L2CS helpers and interval scheduling, the shared session aggregate contract, environment readiness and first-run bootstrap, storage lifecycle (metrics rotation, snapshot and incident retention), cross-process locking (real subprocess contention, including control cases proving those tests detect unsynchronised writers), persistence integrity (including concurrent snapshot and metrics writers), behavior tracking and summaries, chat and snapshot actions, metrics schema normalisation, scene memory, the CLI `recognize` loop end-to-end, the offline detection benchmark, and the FastAPI surface (status schema, monitor lifecycle, camera recovery, stream generator, WebSocket envelope, chat sessions, and two-step action confirmation).
+
+> The detection benchmark's inference tests need the real computer-vision stack. The rest of the suite stubs `cv2`, so those tests swap the real module in for the duration and put the stub back afterwards; on a machine without OpenCV or `ultralytics` they report as skipped rather than silently passing.
 
 > The server tests import `server.py` at module scope, which creates `memory/snapshots/` and `unknown_incidents/`. Chat tests append to `metrics_log.jsonl`. These paths are git-ignored.
 
@@ -654,7 +683,7 @@ mypy             # static types (config: mypy.ini)
 
 Install the tools with `pip install ruff mypy` (they are listed in `requirements.txt`). The rule set in `ruff.toml` is listed explicitly rather than inherited from the tool's defaults, so results do not drift when ruff is upgraded. The file also records **which families are deliberately not selected and why** — notably `BLE`/`S` (broad `except Exception` is how the pipeline degrades around optional dependencies, and `try/except/pass` is how best-effort cleanup is written) and `D`/`ANN` (behaviour is documented in the README and the test suite rather than in docstrings). Individual rules within the selected families that would fight the existing style (`SIM117`, `TRY003`, `TRY300`) are ignored in the same file, each with a reason.
 
-`mypy` is **staged, not all-or-nothing**: `common.py`, `object_detection.py`, `scene_memory.py` and `server.py` are enforced and currently clean, while `main.py` is opted out *explicitly* in `mypy.ini` with its remaining finding count recorded there. It reports ~108 issues today, 104 of them possible-`None` dereferences in the long CLI/report/chat helpers; guarding those is a refactor, not a config change. Deleting the one override line is all that is needed to start enforcing it.
+`mypy` is **staged, not all-or-nothing**: `common.py`, `object_detection.py`, `detection_bench.py`, `scene_memory.py` and `server.py` are enforced and currently clean, while `main.py` is opted out *explicitly* in `mypy.ini` with its remaining finding count recorded there. It reports ~108 issues today, 104 of them possible-`None` dereferences in the long CLI/report/chat helpers; guarding those is a refactor, not a config change. Deleting the one override line is all that is needed to start enforcing it.
 
 Formatting is configured (`line-length = 100`, double quotes) but **not applied to the existing code** — running `ruff format .` would rewrite every file at once, so it is left as an opt-in. `ruff format --check` is therefore not yet enforced in CI.
 

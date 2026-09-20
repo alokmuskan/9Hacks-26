@@ -13,6 +13,11 @@ Layering:
 * :func:`load_frames` and :func:`run_benchmark` are the only heavy entry points
   and they import their dependencies lazily.
 
+The parameter space is described by :class:`object_detection.DetectorConfig` — the
+same type the live detector uses — rather than by a local copy of the fields, so a
+benchmark result always describes a configuration the application could actually
+run.
+
 Reference images ship with Ultralytics and have labels verified on the machine
 this was written on; they guard against the detector silently degrading, while
 the project's own saved frames measure real-scene recall.
@@ -29,8 +34,7 @@ from typing import Any
 
 import numpy as np
 
-import common
-from object_detection import DualYoloDetector
+from object_detection import DetectorConfig, DualYoloDetector
 
 #: Labels present in the reference images shipped with Ultralytics. Counts are the
 #: expected *minimum* detections (a stronger model may legitimately find more).
@@ -60,33 +64,6 @@ class FrameQuality:
     @property
     def name(self) -> str:
         return Path(self.path).name
-
-
-@dataclass(frozen=True)
-class DetectorParams:
-    """One point in the parameter space being compared."""
-
-    conf: float = 0.25
-    imgsz: int = 640
-    iou: float = 0.7
-    max_det: int = 300
-
-    @property
-    def label(self) -> str:
-        return f"conf={self.conf:g} imgsz={self.imgsz}"
-
-    def as_kwargs(self) -> dict[str, Any]:
-        return {"conf": self.conf, "imgsz": self.imgsz, "iou": self.iou, "max_det": self.max_det}
-
-    @classmethod
-    def configured(cls) -> DetectorParams:
-        """The parameters the application itself will use (env knobs included)."""
-        return cls(
-            conf=common.YOLO_CONF_DEFAULT,
-            imgsz=common.YOLO_IMGSZ_DEFAULT,
-            iou=common.YOLO_IOU_DEFAULT,
-            max_det=common.YOLO_MAX_DET_DEFAULT,
-        )
 
 
 def score_image(gray: np.ndarray) -> tuple[float, float]:
@@ -170,7 +147,7 @@ def recall_of(matches: dict[str, dict[str, float]]) -> float:
 
 def default_param_grid(
     confs: Sequence[float] | None = None, sizes: Sequence[int] | None = None
-) -> list[DetectorParams]:
+) -> list[DetectorConfig]:
     """The comparison grid used when the caller does not specify one.
 
     With no arguments this measures the *shipping* configuration against the
@@ -178,15 +155,15 @@ def default_param_grid(
     we just made actually help?" rather than an abstract sweep.
     """
     if not confs and not sizes:
-        configured = DetectorParams.configured()
-        baseline = DetectorParams(conf=0.25, imgsz=640)
+        configured = DetectorConfig.configured()
+        baseline = DetectorConfig(conf=0.25, imgsz=640)
         if configured.conf == baseline.conf and configured.imgsz == baseline.imgsz:
             return [configured]
         return [configured, baseline]
 
     conf_values = list(confs) if confs else [0.25, 0.15]
     size_values = list(sizes) if sizes else [640, 960]
-    return [DetectorParams(conf=c, imgsz=s) for s in size_values for c in conf_values]
+    return [DetectorConfig(conf=c, imgsz=s) for s in size_values for c in conf_values]
 
 
 def load_frames(
@@ -255,7 +232,7 @@ def reference_assets() -> list[tuple[str, str, dict[str, int]]]:
 
 def run_benchmark(
     model_path: str,
-    params_list: Sequence[DetectorParams],
+    params_list: Sequence[DetectorConfig],
     frames: Sequence[tuple[str, np.ndarray]] = (),
     references: Sequence[tuple[str, str, dict[str, int]]] = (),
 ) -> list[dict[str, Any]]:
