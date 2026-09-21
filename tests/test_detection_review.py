@@ -6,7 +6,9 @@ say it is a sample, and a miss somebody noticed must not become a recall figure.
 """
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import detection_review as dr
 
@@ -226,6 +228,60 @@ class ReportTests(unittest.TestCase):
         self.assertIn("these frames only", text)
 
 
+class FingerprintTests(unittest.TestCase):
+    """A verdict set must not be scoreable against a list it was not recorded against."""
+
+    def test_the_same_list_always_gives_the_same_id(self):
+        rows = [_detection(1), _detection(2, label="bottle")]
+
+        self.assertEqual(dr.fingerprint(rows), dr.fingerprint(list(rows)))
+
+    def test_a_changed_confidence_changes_the_id(self):
+        self.assertNotEqual(
+            dr.fingerprint([_detection(1, confidence=0.5)]),
+            dr.fingerprint([_detection(1, confidence=0.51)]),
+        )
+
+    def test_a_reordered_list_changes_the_id(self):
+        """Reordering is what a rebuild does, and it silently renumbers every box."""
+        self.assertNotEqual(
+            dr.fingerprint([_detection(1, label="person"), _detection(2, label="bottle")]),
+            dr.fingerprint([_detection(1, label="bottle"), _detection(2, label="person")]),
+        )
+
+    def test_matching_ids_are_accepted(self):
+        rows = [_detection(1)]
+
+        self.assertIsNone(dr.fingerprint_mismatch(dr.fingerprint(rows), {"fingerprint": dr.fingerprint(rows)}))
+
+    def test_verdicts_from_another_list_are_refused_by_name(self):
+        message = dr.fingerprint_mismatch("aaaaaaaaaaaaaaaa", {"fingerprint": "bbbbbbbbbbbbbbbb"})
+
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertIn("different detection list", message)
+
+    def test_verdicts_with_no_id_are_allowed_through(self):
+        """It cannot be checked, and refusing an unchecked file invents a problem."""
+        self.assertIsNone(dr.fingerprint_mismatch("aaaaaaaaaaaaaaaa", {"verdicts": {"1": "y"}}))
+
+    def test_a_list_with_no_id_never_blocks_a_score(self):
+        self.assertIsNone(dr.fingerprint_mismatch(None, {"fingerprint": "zzzz"}))
+
+
+class WriteReviewTests(unittest.TestCase):
+    def test_the_written_list_carries_the_id_the_page_echoes(self):
+        rows = [dr.ReviewRow(detection=_detection(1), thumb_b64="")]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            detections_path, page_path = dr.write_review(rows, out_dir=tmp, source="frames/*.jpg")
+            payload = json.loads(Path(detections_path).read_text(encoding="utf-8"))
+            page = Path(page_path).read_text(encoding="utf-8")
+
+        self.assertEqual(payload["fingerprint"], dr.fingerprint([_detection(1)]))
+        self.assertIn(payload["fingerprint"], page)
+
+
 class RoundTripTests(unittest.TestCase):
     def test_a_detection_survives_the_json_round_trip(self):
         original = _detection(7, label="cell phone", confidence=0.42)
@@ -278,6 +334,13 @@ class PageTests(unittest.TestCase):
         page = self._page()
 
         self.assertIn("reviewed 0 / 2", page)
+
+    def test_the_page_echoes_the_detection_list_id_into_the_payload(self):
+        rows = [dr.ReviewRow(detection=_detection(1), thumb_b64="")]
+
+        page = dr.render_page(rows, source="x", list_id="feedfacefeedface")
+
+        self.assertIn("feedfacefeedface", page)
 
 
 if __name__ == "__main__":

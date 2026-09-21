@@ -4861,11 +4861,31 @@ def cmd_score_detections(review_dir: str, verdicts: str | None) -> None:
         print(f"[FAIL] verdicts file is not valid JSON: {exc}")
         sys.exit(1)
 
+    try:
+        stored = json.loads(detections_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"[FAIL] detection list is not valid JSON: {exc}")
+        sys.exit(1)
+
+    # Box indices only mean anything against the list they were assigned to, and a
+    # rebuild renumbers them: scoring one build's verdicts against another build's
+    # list would report a confident, wrong precision figure and say nothing about it.
+    mismatch = detection_review.fingerprint_mismatch(
+        stored.get("fingerprint") if isinstance(stored, dict) else None, payload
+    )
+    if mismatch:
+        print(f"[FAIL] {mismatch}")
+        print("       Rebuild the page and review again, or point --verdicts at the file")
+        print("       that belongs to this detection list.")
+        sys.exit(1)
+
     detections = detection_review.load_detections(detections_path)
     verdicts = detection_review.parse_verdicts(payload)
     report = detection_review.score(detections, verdicts)
 
     print(f"Verdicts   : {verdicts_path}  ({len(verdicts)} recorded, {len(detections)} detection(s) in the list)")
+    if isinstance(stored, dict) and stored.get("fingerprint"):
+        print(f"List id    : {stored['fingerprint']}  (verdicts must carry the same id)")
     print()
     print(detection_review.format_score(report))
 

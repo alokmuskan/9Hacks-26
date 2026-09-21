@@ -79,6 +79,11 @@ try {
 
   const payload = JSON.parse(await page.evaluate(() => collect()));
   check("the payload records both verdicts", Object.keys(payload.verdicts).length === 2);
+  check(
+    "the payload carries the detection-list id so a stale review cannot be scored",
+    typeof payload.fingerprint === "string" && payload.fingerprint.length === 16,
+    JSON.stringify(payload.fingerprint),
+  );
   check("the payload records the missed-object note", payload.missed[first] === "bottle, cup");
   check("the payload does not invent verdicts for untouched boxes", !(indices[2] in payload.verdicts));
   check(

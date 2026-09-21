@@ -37,6 +37,7 @@ which is git-ignored, and carries ``noindex`` for the same reason.
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import json
 from collections.abc import Sequence
@@ -136,6 +137,46 @@ class ReviewScore:
     @property
     def wrong(self) -> int:
         return self.reviewed - self.correct
+
+
+def fingerprint(detections: Sequence[Detection]) -> str:
+    """A stable id for a detection list.
+
+    Box indices are only meaningful against the list they were assigned to, so a
+    rebuild renumbers them. Scoring one build's verdicts against another build's
+    list would produce a confident, wrong precision figure and say nothing — the
+    exact failure this module exists to prevent — so the list carries an id and the
+    score refuses when they disagree.
+    """
+    payload = json.dumps(
+        [
+            [d.frame, d.label, round(d.confidence, 6), [round(v, 3) for v in d.bbox]]
+            for d in detections
+        ],
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def fingerprint_mismatch(stored: str | None, payload: Any) -> str | None:
+    """Why a verdicts file does not belong to this detection list, or ``None`` if it does.
+
+    An older verdicts file with no id is allowed through: it cannot be checked, and
+    refusing it would be inventing a problem rather than finding one.
+    """
+    if not stored:
+        return None
+    if not isinstance(payload, dict):
+        return "the verdicts file is not a JSON object"
+    claimed = payload.get("fingerprint")
+    if not isinstance(claimed, str) or not claimed:
+        return None
+    if claimed != stored:
+        return (
+            f"these verdicts were recorded against a different detection list "
+            f"({claimed} vs {stored})"
+        )
+    return None
 
 
 def wilson_interval(correct: int, total: int, z: float = Z_95) -> tuple[float, float]:
@@ -360,7 +401,7 @@ def build_rows(
     return rows
 
 
-def render_page(rows: list[ReviewRow], *, source: str) -> str:
+def render_page(rows: list[ReviewRow], *, source: str, list_id: str = "") -> str:
     """The self-contained review page: every row with a yes/no pair and an optional note."""
     cards: list[str] = []
     for row in rows:
@@ -470,7 +511,7 @@ function collect() {{
       delete missed[index];
     }}
   }});
-  return JSON.stringify({{verdicts: verdicts, missed: missed}}, null, 2);
+  return JSON.stringify({{fingerprint: "{list_id}", verdicts: verdicts, missed: missed}}, null, 2);
 }}
 function update() {{
   const n = Object.keys(verdicts).length;
@@ -543,11 +584,13 @@ def write_review(
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
 
+    list_id = fingerprint([row.detection for row in rows])
     detections_path = directory / DETECTIONS_FILENAME
     detections_path.write_text(
         json.dumps(
             {
                 "source": source,
+                "fingerprint": list_id,
                 "detections": [row.detection.to_json() for row in rows],
             },
             indent=2,
@@ -556,7 +599,7 @@ def write_review(
     )
 
     page_path = directory / PAGE_FILENAME
-    page_path.write_text(render_page(rows, source=source), encoding="utf-8")
+    page_path.write_text(render_page(rows, source=source, list_id=list_id), encoding="utf-8")
     return detections_path, page_path
 
 
