@@ -556,6 +556,23 @@ class PipelineManager:
             self._validate_can_start()
             if not req.name.strip():
                 raise HTTPException(status_code=400, detail="Enrollment name cannot be empty")
+            # Reject a name the database already knows, in that spelling. Recognition
+            # merges samples by name (`FaceDB.upsert`), so a second "alok" silently
+            # averaged into the first and two different people became one identity on
+            # the dashboard. `re-enroll` is the documented way to add samples to an
+            # existing identity deliberately.
+            normalized = req.name.strip()
+            existing = {str(n).strip().casefold() for n in _core().FaceDB.load().names}
+            if normalized.casefold() in existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f'"{normalized}" is already enrolled. Re-enrolling would merge '
+                        "samples into that identity. To add more samples to the same "
+                        "person, use a name ending in '-re-enroll' (e.g. "
+                        f'"{normalized}-re-enroll").'
+                    ),
+                )
             self._stop_event.clear()
             self.frame_store.clear()
             self._mode = "enroll"
@@ -599,6 +616,10 @@ class PipelineManager:
             self._stop_event.set()
         if thread and thread.is_alive():
             thread.join(timeout=5.0)
+        # Clear the frame store, or the stream keeps serving the last live frame as a
+        # frozen image after the pipeline is gone. After a successful join the worker
+        # cannot be writing, so nothing can race the clear here.
+        self.frame_store.clear()
         with self._lock:
             self._mode = "idle"
             self._thread = None
@@ -712,6 +733,10 @@ class PipelineManager:
         core = _core()
         capture = self._attempt_camera_recovery()
         if capture is None:
+            # These early exits sit before the try/finally below, so they must clear
+            # the store themselves: the stream serves whatever the store holds, and a
+            # stale frame from a previous session would outlive its session.
+            self.frame_store.clear()
             return
         cap, reader = capture
         db = core.FaceDB.load()
@@ -723,6 +748,7 @@ class PipelineManager:
         app, face_reason = core._try_build_face_app(model)
         if app is None:
             self._mark_startup_failed(f"face_recognition_unavailable:{face_reason}")
+            self.frame_store.clear()
             return
         samples: list[np.ndarray] = []
         interval = 1.0 / max(int(fps_cap), 1)
@@ -855,6 +881,11 @@ class PipelineManager:
                 reader.close()
             with suppress(Exception):
                 cap.release()
+            # Drop the last captured frame. The stream generator serves whatever the
+            # store holds as long as it holds something, so leaving the final
+            # "Enrolling ... 5/5" image there pinned a finished session on screen
+            # indefinitely; the next get() serves the idle placeholder instead.
+            self.frame_store.clear()
             with self._lock:
                 if self._mode == "enroll":
                     self._mode = "idle"
@@ -1628,6 +1659,10 @@ class PipelineManager:
                 self._startup_started_utc = None
                 self._startup_deadline_utc = None
                 self._startup_failure_reason = None
+            # Same as the enroll worker: without this, a monitor that exits on its
+            # own (camera lost, startup failure) leaves its last frame in the store
+            # and the stream serves it as a live-looking image.
+            self.frame_store.clear()
 
             self._set_pipeline_state(mode="idle", running=False, degraded=False)
 

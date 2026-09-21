@@ -538,6 +538,82 @@ class ToggleRefusalTests(unittest.TestCase):
         self.assertTrue(events[0][1]["toggle_update"]["custom"])
 
 
+class EnrollLifecycleTests(unittest.TestCase):
+    """Enrollment must refuse duplicates, and the stream must not pin a dead session."""
+
+    def setUp(self):
+        self.server = importlib.import_module("server")
+
+    def tearDown(self):
+        try:
+            self.server.MANAGER._loop = None
+            self.server.MANAGER.stop()
+        except Exception:
+            pass
+
+    def test_enrolling_a_name_the_db_already_knows_is_refused(self):
+        """`upsert` merges samples by name, so a duplicate silently blurred two people."""
+        db = self.server._core().FaceDB.load()
+        self.assertTrue(db.names, "this test needs at least one enrolled identity")
+        existing = str(db.names[0]).strip()
+
+        # Case and whitespace must not be enough to sneak past the check.
+        variant = "  " + existing.upper() + "  "
+        with TestClient(self.server.app) as client:
+            response = client.post("/api/v1/enroll/start", json={"name": variant})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn(existing.casefold(), response.json()["detail"].casefold())
+
+    def test_a_distinct_name_starts_normally(self):
+        db = self.server._core().FaceDB.load()
+        taken = {str(n).strip().casefold() for n in db.names}
+        fresh = next(f"ci-test-{n}" for n in range(1000) if f"ci-test-{n}".casefold() not in taken)
+
+        def _fake_worker(manager_self, **_kwargs):
+            time.sleep(0.2)
+            with manager_self._lock:
+                if manager_self._mode == "enroll":
+                    manager_self._mode = "idle"
+                    manager_self._thread = None
+
+        with mock.patch.object(self.server.PipelineManager, "_run_enroll_worker", _fake_worker):
+            with TestClient(self.server.app) as client:
+                response = client.post("/api/v1/enroll/start", json={"name": fresh})
+                self.assertEqual(response.status_code, 200)
+            self.server.MANAGER.stop()
+
+    def test_stop_clears_the_last_frame_from_the_stream(self):
+        """A stopped session must not leave its final frame frozen on screen."""
+        manager = self.server.PipelineManager()
+        manager.frame_store.update(b"stale-jpeg-bytes")
+
+        manager.stop()
+
+        frame = manager.get_stream_frame()
+        self.assertNotEqual(frame["frame_bytes"], b"stale-jpeg-bytes")
+        # Idle mode serves the idle placeholder, not the stale or stalled one.
+        self.assertEqual(frame["frame_bytes"], manager._placeholder_idle)
+
+    def test_a_worker_exit_clears_the_last_frame_even_without_stop(self):
+        """Camera loss or a startup failure exits without `stop()` being called.
+
+        The camera path itself is stubbed out: a real recovery attempt would reach
+        for actual hardware and hang the suite.
+        """
+        manager = self.server.PipelineManager()
+        manager.frame_store.update(b"stale-jpeg-bytes")
+
+        with mock.patch.object(
+            self.server.PipelineManager,
+            "_attempt_camera_recovery",
+            return_value=None,
+        ):
+            manager._run_enroll_worker(name="nobody", model="buffalo_sc", fps_cap=20)
+
+        frame = manager.get_stream_frame()
+        self.assertEqual(frame["frame_bytes"], manager._placeholder_idle)
+
+
 class PacingAndCaptureDefaultsTests(unittest.TestCase):
     """Live-FPS pacing and instance-capture cadence are env-tunable defaults.
 
