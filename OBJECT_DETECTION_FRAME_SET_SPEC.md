@@ -196,6 +196,11 @@ cell phone  0.744 0.612 0.058 0.091
 
 - One row per instance. No row for an absent class — absence is expressed by omission.
 - `cx cy w h` normalised to image width/height, not pixels.
+- Class names **may contain spaces** (`cell phone`, `stop sign`, `hair drier` — fifteen
+  COCO names do). The coordinates are read from the end of the line and the class name
+  is everything in front of them, so `cell phone 0.744 0.612 0.058 0.091` is correct as
+  written. Do not rewrite names to remove spaces; a name that no longer matches the
+  model's vocabulary matches nothing at all.
 - Class **index** (0–79) is also acceptable and is what YOLO tooling writes natively;
   if you use indices, ship the index→name mapping alongside so it can be checked.
 - Partial objects at the frame edge **are** labelled, with the visible extent only, and

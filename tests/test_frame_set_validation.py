@@ -4,10 +4,10 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-
-from _stubs import install as _install_stubs
+from unittest import mock
 
 import frame_set_validation as fsv
+from _stubs import install as _install_stubs
 
 #: A filename that satisfies the convention in OBJECT_DETECTION_FRAME_SET_SPEC.md §7:
 #: <timestamp>_<venue>_<lighting>_<distance>_<angle>_<NNN>
@@ -123,6 +123,19 @@ class LabelParsingTests(unittest.TestCase):
         self.assertEqual(rows[0].cls, "cell phone")
         self.assertAlmostEqual(rows[0].cx, 0.744)
 
+    def test_a_multi_word_class_name_is_not_split_into_fields(self):
+        """Fifteen COCO names contain a space, and splitting on whitespace breaks all.
+
+        This was a real bug: `cell phone 0.7 0.6 0.06 0.09` read as six fields and was
+        rejected as malformed, so any frame containing a phone failed validation with a
+        message about field counts rather than about anything being wrong.
+        """
+        for name in ("cell phone", "stop sign", "hair drier", "potted plant", "hot dog"):
+            rows, findings = self.parse(f"{name} 0.5 0.5 0.2 0.2\n")
+
+            self.assertEqual(findings, [], f"{name} should parse")
+            self.assertEqual(rows[0].cls, name)
+
     def test_a_class_index_is_resolved_through_the_vocabulary(self):
         rows, findings = self.parse("0 0.5 0.5 0.2 0.2\n")  # 0 is person
 
@@ -192,11 +205,12 @@ class StructureTests(FrameSetTestCase):
         builder.frame(_stem(1), "person 0.5 0.5 0.2 0.4\n")
         builder.frame(_stem(2), "person 0.4 0.5 0.2 0.4\ncell phone 0.8 0.6 0.05 0.09\n")
         builder.frame(_stem(3), "person 0.6 0.5 0.2 0.4\n")
+        builder.frame(_stem(4), "")
 
         report = builder.validate(targets=["person", "cell phone"])
 
         self.assertTrue(report.ok, builder.errors(report))
-        self.assertEqual(report.stats["frames"], 3)
+        self.assertEqual(report.stats["frames"], 4)
 
     def test_a_missing_label_file_is_a_blocking_error(self):
         """Because it does not fail loudly downstream — it reads as 'nothing here'."""
@@ -242,6 +256,8 @@ class StructureTests(FrameSetTestCase):
         flat.mkdir()
         (flat / f"{_stem(1)}.jpg").write_bytes(b"jpeg-bytes")
         (flat / f"{_stem(1)}.txt").write_text("person 0.5 0.5 0.2 0.4\n", encoding="utf-8")
+        (flat / f"{_stem(2)}.jpg").write_bytes(b"jpeg-bytes")
+        (flat / f"{_stem(2)}.txt").write_text("", encoding="utf-8")
 
         report = fsv.validate_frame_set(flat, targets=["person"], probe=builder.probe)
 
@@ -397,6 +413,27 @@ class NegativeFrameTests(FrameSetTestCase):
         self.assertEqual(report.stats["negative_frames"], 1)
         self.assertEqual(report.stats["empty_label_files"], 1)
 
+    def test_a_missing_label_file_is_not_reported_as_an_empty_one(self):
+        """Both are target-free; only one means anyone labelled anything.
+
+        Found by running the validator over `memory/snapshots`, which has no label
+        files at all. The summary said "59 empty label file(s)" while the findings
+        said "no label file" 59 times -- turning a set with no labels into one that
+        merely looked thoroughly annotated as background. The two need different
+        fixes, so they are counted apart.
+        """
+        builder = self.build()
+        builder.frame(_stem(1), "person 0.5 0.5 0.2 0.4\n")
+        builder.frame(_stem(2), "", label_file=False)
+
+        report = builder.validate(targets=["person"])
+
+        self.assertEqual(report.stats["missing_label_files"], 1)
+        self.assertEqual(report.stats["empty_label_files"], 0)
+        # Still a negative: a missing file reads as "nothing here" too, which is
+        # exactly why it is an error rather than a silent skip.
+        self.assertEqual(report.stats["negative_frames"], 1)
+
     def test_a_distractor_only_frame_counts_as_a_negative(self):
         builder = self.build()
         builder.frame(_stem(1), "person 0.5 0.5 0.2 0.4\n")
@@ -478,10 +515,11 @@ class ReportTests(FrameSetTestCase):
         builder = self.build()
         for n in range(1, 21):
             builder.frame(_stem(n), label_file=False)
-        builder.frame(_stem(99), "")
+        builder.frame(_stem(21), "person 0.5 0.5 0.2 0.4\n")
 
         text = fsv.format_validation_report(builder.validate(targets=["person"]), limit=5)
 
+        self.assertIn("errors (20):", text)
         self.assertIn("... and 15 more", text)
 
 
@@ -504,7 +542,18 @@ class ValidateFramesCommandTests(unittest.TestCase):
             "min_brightness": 90.0,
             "json_out": None,
         }
-        with redirect_stdout(output):
+        # The command uses the real image probe, which needs real JPEGs; the suite's
+        # cv2 stub returns None from `imread`, so every frame would be reported
+        # unreadable. What is under test here is the command -- exit codes and
+        # argument plumbing -- not decoding, which the builder covers separately.
+        with (
+            mock.patch.object(
+                self.main.frame_set_validation,
+                "probe_frame",
+                return_value=(480, 150.0, 200.0),
+            ),
+            redirect_stdout(output),
+        ):
             self.main.cmd_validate_frames(**{**defaults, **kwargs})
         return output.getvalue()
 

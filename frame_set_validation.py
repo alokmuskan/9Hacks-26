@@ -80,6 +80,11 @@ RECOMMENDED_NEGATIVE_FRACTION = 0.33
 #: are labelled to their *visible* extent).
 EDGE_TOLERANCE = 0.01
 
+#: ``cx cy w h``. The class name is everything *before* these, not the first token:
+#: fifteen COCO names contain a space ("cell phone", "stop sign", "hair drier"), and
+#: splitting on whitespace and taking token 0 would reject every one of them.
+COORD_FIELD_COUNT = 4
+
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png")
 
 #: ``.txt`` files that belong to the frame set but are not labels. In the flat
@@ -218,15 +223,20 @@ def parse_label_line(
 ) -> tuple[LabelRow | None, Finding | None]:
     """Parse one ``class cx cy w h`` row, or explain why it cannot be used."""
     tokens = line.split()
-    if len(tokens) != 5:
+    if len(tokens) <= COORD_FIELD_COUNT:
         return None, Finding(
             SEVERITY_ERROR,
             "malformed-label",
             subject,
-            f"line {line_no}: expected 5 fields (class cx cy w h), found {len(tokens)}",
+            f"line {line_no}: expected a class followed by {COORD_FIELD_COUNT} "
+            f"coordinates, found {len(tokens)} field(s)",
         )
 
-    raw_class = tokens[0]
+    # Class names may contain spaces, so the coordinates are taken from the end and
+    # whatever remains in front of them is the name.
+    raw_class = " ".join(tokens[:-COORD_FIELD_COUNT])
+    coordinates = tokens[-COORD_FIELD_COUNT:]
+
     if raw_class.lstrip("-").isdigit():
         index = int(raw_class)
         if index not in vocab:
@@ -250,13 +260,13 @@ def parse_label_line(
         cls = raw_class
 
     try:
-        cx, cy, width, height = (float(value) for value in tokens[1:])
+        cx, cy, width, height = (float(value) for value in coordinates)
     except ValueError:
         return None, Finding(
             SEVERITY_ERROR,
             "malformed-label",
             subject,
-            f"line {line_no}: coordinates are not numbers: {' '.join(tokens[1:])}",
+            f"line {line_no}: coordinates are not numbers: {' '.join(coordinates)}",
         )
 
     if not all(value == value and abs(value) != float("inf") for value in (cx, cy, width, height)):
@@ -350,7 +360,7 @@ def _frame_dirs(root: Path) -> tuple[Path, Path]:
     return root, root
 
 
-def validate_frame_set(  # noqa: C901 - a validator is a list of checks by nature
+def validate_frame_set(
     root: str | Path,
     *,
     targets: Sequence[str] = (),
@@ -418,6 +428,7 @@ def validate_frame_set(  # noqa: C901 - a validator is a list of checks by natur
     lighting_totals: dict[str, int] = dict.fromkeys(LIGHTING_STATES, 0)
     lighting_negatives: dict[str, int] = dict.fromkeys(LIGHTING_STATES, 0)
     empty_label_files: list[str] = []
+    missing_label_files: list[str] = []
     distractor_only: list[str] = []
     labelled_stems: set[str] = set()
     too_small: list[str] = []
@@ -442,7 +453,8 @@ def validate_frame_set(  # noqa: C901 - a validator is a list of checks by natur
 
         label_path = labels_dir / f"{image.stem}.txt"
         rows: list[LabelRow] = []
-        if not label_path.exists():
+        has_label = label_path.exists()
+        if not has_label:
             report.findings.append(
                 Finding(
                     SEVERITY_ERROR,
@@ -475,7 +487,15 @@ def validate_frame_set(  # noqa: C901 - a validator is a list of checks by natur
             if lighting in lighting_negatives:
                 lighting_negatives[lighting] += 1
         else:
-            empty_label_files.append(subject)
+            # Both are target-free, and both are counted as negatives, because a missing
+            # label file reads as "nothing here" too. They are kept apart anyway: "the
+            # labeller called this frame empty" and "there is no label file" need
+            # different fixes, and reporting the second as the first turns a set with no
+            # labels at all into one that merely looks thoroughly annotated.
+            if has_label:
+                empty_label_files.append(subject)
+            else:
+                missing_label_files.append(subject)
             if lighting in lighting_negatives:
                 lighting_negatives[lighting] += 1
 
@@ -543,10 +563,16 @@ def validate_frame_set(  # noqa: C901 - a validator is a list of checks by natur
 
     _check_in_scope(report, targets, target_set, known_names, instances, coverage)
     _check_negatives(
-        report, targets, lighting_totals, lighting_negatives, empty_label_files, distractor_only
+        report,
+        targets,
+        lighting_totals,
+        lighting_negatives,
+        empty_label_files,
+        missing_label_files,
+        distractor_only,
     )
 
-    negatives = len(empty_label_files) + len(distractor_only)
+    negatives = len(empty_label_files) + len(missing_label_files) + len(distractor_only)
     report.stats.update(
         {
             "frames": len(images),
@@ -560,6 +586,7 @@ def validate_frame_set(  # noqa: C901 - a validator is a list of checks by natur
             "negative_frames": negatives,
             "negative_fraction": round(negatives / len(images), 3),
             "empty_label_files": len(empty_label_files),
+            "missing_label_files": len(missing_label_files),
             "distractor_only_frames": len(distractor_only),
             "negatives_by_lighting": lighting_negatives,
             "too_small": too_small,
@@ -632,11 +659,12 @@ def _check_negatives(
     lighting_totals: dict[str, int],
     lighting_negatives: dict[str, int],
     empty_label_files: Sequence[str],
+    missing_label_files: Sequence[str],
     distractor_only: Sequence[str],
 ) -> None:
     """Without target-free frames, precision is not computable — say so loudly."""
     frames = sum(lighting_totals.values())
-    negatives = len(empty_label_files) + len(distractor_only)
+    negatives = len(empty_label_files) + len(missing_label_files) + len(distractor_only)
     if frames == 0 or not targets:
         return
 
@@ -676,9 +704,9 @@ def _check_negatives(
             Finding(
                 SEVERITY_WARNING,
                 "negatives-missing-state",
-                ", ".join(missing),
-                "lighting state(s) with frames but no target-free frames, so precision "
-                "there is unmeasurable (spec §4a)",
+                "frame set",
+                f"lighting state(s) with frames but no target-free frames: "
+                f"{', '.join(missing)} - precision there is unmeasurable (spec §4a)",
             )
         )
 
@@ -703,7 +731,8 @@ def format_validation_report(report: FrameSetReport, *, limit: int = 15) -> str:
         if lighting:
             lines.append(f"lighting: {lighting}")
         lines.append(
-            f"target-free breakdown: {stats['empty_label_files']} empty label file(s), "
+            f"target-free breakdown: {stats['missing_label_files']} missing label file(s), "
+            f"{stats['empty_label_files']} empty label file(s), "
             f"{stats['distractor_only_frames']} distractor-only"
         )
 

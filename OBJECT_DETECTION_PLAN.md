@@ -527,7 +527,12 @@ judgement — whether a label is *correct*, whether the collection is biased, wh
 right objects were chosen. Those stay marked `[human]` in the spec's checklist, and
 they are the ones that let a set pass every automated check and still be worthless.
 
-**Status: written, unit-tested, NOT YET RUN.** See the verification note below.
+**Status: written and unit-tested. Not yet run against a real frame set, because none
+exists** — `frames/` is empty, and `memory/snapshots/` holds 83 unlabelled monitoring
+snapshots whose `snap_<date>_<time>` names are not the spec §7 convention. That is not a
+gap in the validator: those frames have no labels, so there is nothing for it to check
+them against. It runs the day the captured set lands, which is the point of building it
+first.
 
 ### Latency as a distribution
 
@@ -547,29 +552,57 @@ else running. It is roughly a sixth of a live frame (§1 puts gaze at ~433 ms pe
 and the components contend for the same CPU rather than adding. **§6 Q2 is not answered
 by this and is not closer to being answered** — it needs the whole loop.
 
-**Status: written, unit-tested, NOT YET RUN.** See below.
+**Status: written, unit-tested, green.** The distribution itself has not yet been read
+off a live `bench-detect` run; the numbers below are from the existing mean-only runs.
 
-### Verification note — outstanding
+### Verification — first run, and what it found
 
-Both changes were written in a session where the shell could not be reached: every
-`Bash`/`PowerShell` call, and a dispatched subagent, was refused with a harness error
-(`deepseek-v4-flash is temporarily unavailable, so auto mode cannot determine the
-safety of …`). So, recorded plainly:
+`python -m unittest discover -s tests -q` — **267 tests, 5 failures, 4 errors**.
+`ruff check .` — **2 errors**. `mypy` — **`Success: no issues found in 7 source files`**.
 
-- **Not run:** `python -m unittest discover -s tests`, `ruff check .`, `mypy`.
-- **Not run:** `validate-frames` against any frame set, including the existing 50.
-- The only verification performed is inspection, including a manual count of
-  `COCO_CLASSES` (80 entries, `person` at index 0) and three defects fixed by reading:
-  a bad filename double-reporting its label file as an orphan; `targets.txt` being
-  reported as an orphan label in the flat layout; and `_check_negatives` reading
-  `report.stats` before it was populated, which made the check silently dead.
-- `frame_set_validation.py` was added to `mypy.ini`'s enforced `files` list, so the
-  next `mypy` run covers it.
-- `main.py` now imports the new module, so **a defect in it would break the whole
-  battery** — this is the first thing to establish.
+Nine failures from three root causes, all fixed and re-run green (below):
 
-This is the same standard applied to the earlier ruff claim in §2c: a check that has
-not been run is recorded as not run.
+1. **A genuine bug in the label parser.** `parse_label_line` split the line on
+   whitespace and read the class from token 0, which breaks every class name containing
+   a space — and COCO has fifteen (`cell phone`, `stop sign`, `hair drier`, …). So
+   `cell phone 0.744 0.612 0.058 0.091` parsed as six fields and was rejected as
+   malformed. This caused **three** of the nine: the parse test, and
+   `test_a_well_formed_set_passes` via a cascade — a frame whose phone label failed to
+   parse looked empty, which changed the negative-frame count, which wrongly fired
+   `no-negatives`. The coordinates are now read from the end of the line and the class
+   name is whatever precedes them. A regression test covers five multi-word names.
+   Worth noting *how* it surfaced: the file's own format example was rejected by its
+   own parser, which is the sort of contradiction that only a test finds.
+2. **Four CLI tests failed** because `cmd_validate_frames` uses the real image probe and
+   the suite's `cv2` stub returns `None` from `imread`, so every frame was reported
+   unreadable. The probe is now patched in those tests: what they exercise is exit codes
+   and argument plumbing, not decoding.
+3. **Three test-fixture errors of mine**, not module bugs: two fixtures had no
+   target-free frame (so `no-negatives` correctly fired), and one truncation test
+   miscounted its own expected remainder (20 errors, not 21 — the 21st was
+   `target-never-labelled`, which the fixture's own arity created).
+
+Ruff's two: an unused `# noqa: C901` (C901 is not in the selected set) and an unsorted
+import block in the new test file. Both fixed.
+
+**Re-run after the fixes — green:**
+
+```
+python -m unittest discover -s tests -q   →  Ran 268 tests ... OK
+.\.venv-tools\Scripts\ruff.exe check .    →  All checks passed!
+.\.venv-tools\Scripts\mypy.exe            →  Success: no issues found in 7 source files
+```
+
+268 rather than the earlier 267 is the multi-word regression test added with the parser
+fix.
+
+The lesson is the one §2c already records: a check that has not been run is not
+evidence, and running it found a real bug on the first try. The stronger version of that
+lesson is here too — the nine failures were **not** nine problems. They were three, one
+of them a genuine parser defect, and the rest were my own fixtures and my own test
+harness. Fixing symptoms one at a time would have taken nine attempts; the second and
+third root causes were only visible after the first was fixed, because a broken parser
+was manufacturing failures in tests that had nothing wrong with them.
 
 ## 3. Phases
 
