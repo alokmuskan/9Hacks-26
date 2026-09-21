@@ -28,6 +28,8 @@ metrics_log.jsonl
 report.txt
 unknown_incidents/
 custom_model_path.txt
+# Detection review pages embed real camera frames - never commit them.
+reviews/
 # Sidecar lock files for cross-process advisory locking
 *.lock
 

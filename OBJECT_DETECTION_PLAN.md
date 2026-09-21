@@ -4,8 +4,13 @@ Goal: make object detection recognise more real objects, reliably, without
 exceeding the frame budget of a **CPU-only** machine.
 
 Status: **Phases 0, 1 and 2 complete.** Phase 2 fixed the model-name fallback (§2d)
-and then benchmarked `yolo11*` and **rejected** it (§2e); the harness gap that made
-that comparison inconclusive is the next thing to fix.
+and then benchmarked `yolo11*` and **rejected** it (§2e). The harness gap that made that
+comparison inconclusive was partly closed by a dataset validator and a latency
+distribution (§2g), and the frame budget has since been read out of the recorded sessions
+(§2h), which found that the session log records *face* detection latency rather than
+object detection and cannot close a per-frame budget. **Everything from Phase 3 onwards is
+blocked on the labelled frame set** specified in `OBJECT_DETECTION_FRAME_SET_SPEC.md`,
+which does not exist yet — that, not the harness, is the next thing to fix.
 Every number below was measured on this machine (see *Evidence*), not assumed.
 
 Re-verified after Phase 1 landed; that audit found several deliverables that were
@@ -16,7 +21,11 @@ claimed but not actually in place, and they are fixed (see *§2c Re-verification
 | 0 — benchmark harness | ✅ done — `main.py bench-detect`, `detection_bench.py` |
 | 1 — parameterise inference | ✅ done — env knobs, typed `DetectorConfig`, status + HUD reporting, defaults from the benchmark |
 | 2 — model upgrade | ✅ done, gate half met — fallback fixed (§2d), `yolo11*` benchmarked and **rejected** (§2e) |
-| 3–7 | not started |
+| 3 — per-class thresholds / label policy | ⏸ blocked on a labelled frame set; §2i provides a review-based **precision** figure that can be run today |
+| 4 — capture / low-light | ❌ **measured negative** (§2i) — CLAHE recovers nothing on the dark frames and loses two classes on the lit ones. Do not build |
+| 5 — temporal smoothing | ⏸ **unverifiable with the frames on disk** (§2i) — snapshots are 15 s apart, so label flicker cannot be measured. Needs a short burst capture |
+| 6 — cross-source dedupe / tiling | ⏸ dedupe has **nothing to fix** (§2i: 0 duplicate pairs at IoU ≥ 0.7, custom model off). Tiling untested |
+| 7 — surfacing, docs, CI | 🟡 partly done — `frame-budget` (§2h) and `review-detections` (§2i) are the surfacing; the CI benchmark job is still missing |
 
 ---
 
@@ -604,6 +613,151 @@ harness. Fixing symptoms one at a time would have taken nine attempts; the secon
 third root causes were only visible after the first was fixed, because a broken parser
 was manufacturing failures in tests that had nothing wrong with them.
 
+## 2h. The frame budget, read from the recorded sessions
+
+§2f listed two cheap fixes that had not been made: a latency distribution, and "reading
+the *existing* `metrics_log.jsonl` from a real session, which already records `avg_fps`
+and gaze timings". The first landed in §2g. This is the second — `python main.py
+frame-budget` (`frame_budget.py`) — which measures the live loop from data already on
+disk: no camera, no labels, no re-run, and no change to production behaviour.
+
+**Measured over the 12 recorded sessions** (1300 frames, 718.5 s of monitoring):
+
+| Quantity | Measured |
+| --- | --- |
+| median session throughput | **0.83 fps** (range 0.68–9.39) |
+| median EMA frame rate | **2.80 fps** |
+| stall-dominated sessions (EMA above 2× the session average) | **5 of 12** — one reached 178 fps instantaneously against a 0.82 fps mean; another's frame clock is unusable (29,537 fps between frames) |
+| face detection | **3.6%** of the mean period — 41.1 ms/frame, over the 8 sessions that ran it |
+| gaze | **28.3%** — 334.5 ms/frame, over the 6 sessions that ran it |
+| unattributed remainder | **69.1%** — 833.6 ms/frame |
+
+Four findings, each verified in the code or in the record itself:
+
+**1. `avg_detection_latency_ms` measures faces, not objects.** Both loops time
+`core._detect(app, frame)` — face detection (`main.py:2799`, `server.py:1049`) — and call
+`detector.detect(frame)` untimed on the very next lines. **Object detection appears in no
+session record at all.** Every "detection latency" read out of the log so far has been
+face-detection latency, and the field name does not distinguish them; §1's "object
+detection is ~70–106 ms" is the *harness* measurement of the object detector, not this
+field.
+
+**2. A disabled stage reports a number instead of being absent.** With face recognition
+off, `_detect` short-circuits on `app is None` — but the timer around it still runs and
+`detection_calls` still increments. Two sessions record `avg_detection_latency_ms: 0.0`
+with `max_detection_latency_ms: 0.01` and `detection_calls == frames_total` (324 and 362
+frames). Read as `0 ms/frame` that says the stage became free; it is a timer measuring
+nothing. `frame-budget` renders it `off` and never as `0.0`.
+
+The same shape appears in gaze for the opposite reason: gaze is estimated per detected
+face (`server.py:1155` gates it on non-empty face rows), so a session where no face is
+found legitimately has no gaze cost. The report says which of the two it is rather than
+leaving `0.0` to be interpreted either way.
+
+**3. A session average is not a per-frame cost.** Five of the twelve sessions have an EMA
+frame rate more than twice their session average, so their mean period is spread over
+stalls rather than describing an ordinary frame. `bench-detect` already reports a median
+and a max for this reason (§2g); the same distinction has to reach the session records
+before a per-frame budget can be closed from them.
+
+**4. Face recognition is associated with a 6–11× slower session, and the record does not
+explain it.** Within a single revision (2026-09-19): `monitor-20260919-164022`, face
+recognition off, ran **9.39 fps**; `monitor-20260919-185854` and `-213638`, face
+recognition on with gaze never running, ran **0.82** and **0.76 fps**. Their recorded
+face-detection cost is 11.3 and 10.8 ms/frame and their gaze cost is zero, so roughly
+1200 ms/frame is attributed to nothing the log contains. This is stated as an association
+in one revision, not a controlled comparison, and whether the missing time is work, a
+stall, or an artifact of the mean is not answerable from the record — which is finding 3's
+point as well.
+
+**What this means for §6 Q2.** The question stays open, and §2f's claim that the harness
+"sees roughly a sixth of the frame" does not survive the measurement: the detector's 86 ms
+against the 1204 ms median period is about **7%**, nearer a fourteenth. The more useful
+result is *why* neither source can answer it:
+
+- the log records no object-detection timing, so the largest unmeasured share cannot be split;
+- the log records no `fps_cap`, so idle pacing time cannot be told from work even for a
+  session that ran at its configured cap;
+- the log records a mean and an EMA but no per-frame distribution, and the two disagree by
+  more than 2× in five of twelve sessions.
+
+Closing it therefore needs instrumentation rather than analysis: time `detector.detect()`
+into the aggregate, record `fps_cap`, and record a frame-duration distribution. That is a
+separate, small change, and it is **not** made here — this section changes no recorded
+field and no runtime behaviour.
+
+**Status: written, 30 unit tests, full battery green (299 tests, `ruff` clean, `mypy`
+clean across 8 files). No Phase 3 decision is made or implied.**
+
+## 2i. Closing the accuracy question without new data
+
+The plan was blocked on a labelled frame set that cannot be captured or labelled. Before
+building anything else, the three phases that were supposed to improve detection *without*
+labels were measured on the frames already on disk. Two of them must not be built, and the
+blocked one has a practical replacement.
+
+### The three measurements
+
+**Phase 6a (cross-source dedupe) has nothing to fix.** Over 79 usable frames and 101 boxes:
+**0** same-class pairs at IoU ≥ 0.7, 0 degenerate boxes, 0 boxes outside the frame. The 6
+pairs at IoU ≥ 0.5 are all `person` — two people standing close together — and the 2
+cross-class pairs are a carried item overlapping its carrier, which is correct. Ultralytics'
+NMS already merges same-class overlap inside each model call, and the custom model is
+disabled, so cross-source duplication cannot occur at all today. Implementing the phase
+would be fixing a non-problem.
+
+**Phase 4 (low-light) is a measured negative.** CLAHE on the L channel of the LAB image,
+applied to all 79 frames through the production detector:
+
+| Subset | raw | CLAHE |
+| --- | --- | --- |
+| 12 dark frames (< 90 brightness) | 2 boxes on 2 frames | **2 boxes on 2 frames** — nothing recovered |
+| 67 lit frames | 99 boxes, 8 classes | 100 boxes, **6 classes** — loses `refrigerator` and `surfboard` |
+
+Latency is unchanged (81 → 84 ms lit; 96 → 94 ms dark). The dark frames are not dim, they
+are unusable: brightness 11.8 and 13.0 are near-black and 63.7 is a covered lens, so there
+is no detail to recover. On the frames that *are* usable it destroys two classes. The
+phase's own gate anticipated exactly this — "if detection does not measurably recover, ship
+it off by default and document that honestly" — so the recommendation is **do not build it**,
+and retest only if the camera or the venue lighting changes.
+
+**Phase 5 (temporal smoothing) cannot be verified with the frames on disk.** Snapshots are
+**15 s apart** within a session (measured from the filenames: `18-59-02`, `-17`, `-33`,
+`-49`) and hours apart between sessions. A short IoU tracker is meaningless at that
+spacing, so "fewer label flips" has no denominator here. The phase is not wrong; it is
+unverifiable, and its gate cannot be met honestly until someone captures a short burst.
+
+### What replaces it: review the detections that already exist
+
+`review-detections` → `score-detections` (`detection_review.py`). The detector's output on
+frames that already exist is a *finite* list — **102 boxes over 68 usable frames** at the
+time of writing — and a human can confirm or reject that list in a couple of minutes. This
+is the practical alternative: it needs no new capture and no labelling of anything the
+detector did not already propose, and it produces the project's first real **precision**
+figure.
+
+An accuracy number is exactly the kind of thing that gets laundered, so the rules are
+explicit:
+
+| Rule | Why |
+| --- | --- |
+| Unreviewed boxes stay unreviewed | Defaulting them to "correct" is the single change that would inflate the score |
+| An unparseable verdict is skipped, not guessed | Same reason: a missing answer is not a positive one |
+| A partial review prints a Wilson interval and a coverage warning below 80% | A subset picked by hand is not a random sample. `--limit` samples evenly across the confidence range rather than taking the easiest top-N |
+| Noted misses are listed as misses, never as recall | They carry no denominator — the frames they came from were not chosen by any sampling rule |
+| The scope is printed on every run | The number describes the frames under `reviews/` and nothing else |
+| The page is git-ignored and `noindex` | It embeds real camera frames |
+
+**What this does not fix.** Precision alone cannot tell whether detection got *better at
+finding things* — that is recall, and recall needs every object in every frame enumerated.
+So the honest position stays: detection can now be scored for **false boxes** on these
+frames, and for nothing else. Phase 3's per-class policy becomes answerable **for this
+scene** once a review is run; it remains unanswerable for the expo.
+
+**Status: written, 30 unit tests, battery green (329 tests, ruff clean, mypy clean across 9
+files). No production behaviour changed, no Phase 3 policy decided, no claim that the
+sample is representative.**
+
 ## 3. Phases
 
 Every phase ends at a **gate**: new unit tests + the full backend battery
@@ -722,6 +876,9 @@ measurement can satisfy is a bug in the plan (see §2c).
 2. **Latency budget:** what end-to-end FPS is acceptable at the expo? This decides
    `imgsz` and which model variant is allowed. Still unanswered, and §2f records that
    the harness cannot answer it in its current form — it measures detection only,
-   roughly a sixth of the frame. §2e made the question less urgent for *model choice*
+   roughly a sixth of the frame (measured more precisely in §2h: about 7% of the median
+   recorded period, and the recorded period is itself stall-dominated in five of twelve
+   sessions). §2h also establishes that the session log cannot answer it either, and names
+   the three fields whose absence is why. §2e made the question less urgent for *model choice*
    (no variant earned its cost regardless of the budget), but it remains the gate for
    Phase 3's end-to-end verification and for any `imgsz` change.

@@ -15,7 +15,7 @@ import time
 import urllib.request
 from collections import Counter, defaultdict, deque
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,8 @@ import numpy as np
 
 import common
 import detection_bench
+import detection_review
+import frame_budget
 import frame_set_validation
 from object_detection import DualYoloDetector, find_latest_custom_model
 from scene_memory import SceneMemoryManager
@@ -4785,6 +4787,136 @@ def cmd_validate_frames(
         sys.exit(1)
 
 
+def cmd_review_detections(
+    frames: list[str],
+    out_dir: str,
+    limit: int,
+    min_brightness: float,
+) -> None:
+    """Build a review page from the detections on frames that already exist.
+
+    This is the route to a precision figure that needs no new capture and no
+    labelling: the detector proposes boxes, and a person confirms or rejects that
+    finite list. Recall is out of reach this way and is not claimed.
+    """
+    loaded, rejected = detection_bench.load_frames(frames, min_brightness=min_brightness)
+    if not loaded:
+        print(f"[FAIL] no usable frames matched: {', '.join(frames)}")
+        print("       Frames are excluded when they are too dark, blurred or small to detect in.")
+        sys.exit(1)
+
+    reasons: dict[str, int] = {}
+    for row in rejected:
+        reasons[row.reason] = reasons.get(row.reason, 0) + 1
+
+    print(f"Frames     : {len(loaded)} usable" + (f", {len(rejected)} excluded" if rejected else ""))
+    if reasons:
+        rendered = ", ".join(f"{name}={count}" for name, count in sorted(reasons.items()))
+        print(f"             excluded by reason: {rendered}")
+
+    detector = DualYoloDetector()
+    params = detector.get_state()["params"]
+    print(f"Detector   : {detector.general_model_path}  {detection_bench.DetectorConfig(**params).label}")
+
+    rows = detection_review.build_rows(loaded, detector, limit=limit)
+    if not rows:
+        print("[FAIL] the detector found nothing to review in those frames.")
+        sys.exit(1)
+
+    detections_path, page_path = detection_review.write_review(
+        rows, out_dir=out_dir, source=", ".join(frames)
+    )
+
+    print(f"Boxes      : {len(rows)} to review" + (f" (sampled evenly across confidence from {limit})" if limit else " (all of them)"))
+    print()
+    print("Next:")
+    print(f"  1. open  {page_path}")
+    print("  2. mark each box Correct / Wrong (a couple of minutes for the whole list)")
+    print("  3. click 'Download verdicts.json' and save it as:")
+    print(f"       {detections_path.parent / detection_review.VERDICTS_FILENAME}")
+    print(f"  4. pixi run python main.py score-detections --review-dir {out_dir}")
+
+
+def cmd_score_detections(review_dir: str, verdicts: str | None) -> None:
+    """Turn a reviewed detection list into precision, per class and overall."""
+    directory = Path(review_dir)
+    detections_path = directory / detection_review.DETECTIONS_FILENAME
+    verdicts_path = (
+        Path(verdicts) if verdicts else directory / detection_review.VERDICTS_FILENAME
+    )
+
+    if not detections_path.exists():
+        print(f"[FAIL] no detection list at {detections_path}")
+        print("       Run `main.py review-detections` first.")
+        sys.exit(1)
+    if not verdicts_path.exists():
+        print(f"[FAIL] no verdicts at {verdicts_path}")
+        print("       Mark the boxes in review.html, download verdicts.json into that directory,")
+        print("       or pass --verdicts <path>.")
+        sys.exit(1)
+
+    try:
+        payload = json.loads(verdicts_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"[FAIL] verdicts file is not valid JSON: {exc}")
+        sys.exit(1)
+
+    detections = detection_review.load_detections(detections_path)
+    verdicts = detection_review.parse_verdicts(payload)
+    report = detection_review.score(detections, verdicts)
+
+    print(f"Verdicts   : {verdicts_path}  ({len(verdicts)} recorded, {len(detections)} detection(s) in the list)")
+    print()
+    print(detection_review.format_score(report))
+
+    if report.reviewed == 0:
+        sys.exit(1)
+
+
+def cmd_frame_budget(log: str | None, limit: int, json_out: str | None) -> None:
+    """Split each recorded session's frame period into measured stages and a residual.
+
+    `bench-detect` measures object detection alone, on saved frames. This reads the
+    other half of the evidence — the sessions the pipeline has already recorded — so
+    the two can be compared without opening a camera. It decides nothing and changes
+    nothing; it exists so that "what is a live frame made of" has a measured answer
+    instead of an assumed one.
+    """
+    log_path = Path(log) if log else METRICS_LOG_PATH
+    if not log_path.exists():
+        print(f"[FAIL] metrics log not found: {log_path}")
+        print("       Run a monitoring session first, or pass --log <path>.")
+        sys.exit(1)
+
+    rows = common.read_jsonl(log_path)
+    session_rows = sum(1 for row in rows if isinstance(row.get("aggregate"), dict))
+    budget_set = frame_budget.collect_budgets(rows, limit=limit)
+
+    print(f"Metrics log: {log_path}")
+    print(f"Sessions   : {len(budget_set)} accounted for, from {session_rows} row(s) with an aggregate")
+    if limit > 0:
+        print(f"Limit      : newest {limit}")
+    print()
+    print(frame_budget.format_report(budget_set))
+
+    if json_out:
+        Path(json_out).write_text(
+            json.dumps(
+                {
+                    "summary": asdict(frame_budget.summarize(budget_set.budgets)),
+                    "sessions": [asdict(budget) for budget in budget_set.budgets],
+                    "skipped": list(budget_set.skipped),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"\nWrote {json_out}")
+
+    if not budget_set:
+        sys.exit(1)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
     if not hasattr(np, "int"):
@@ -4953,6 +5085,68 @@ def main() -> None:
         help="Frames darker than this are reported, since the benchmark would drop them",
     )
     p_vf.add_argument("--json", dest="json_out", default=None, help="Also write the results to this JSON file")
+    p_fb = sub.add_parser(
+        "frame-budget",
+        help="Split recorded sessions into a per-stage frame budget (see OBJECT_DETECTION_PLAN.md)",
+    )
+    p_fb.add_argument(
+        "--log",
+        default=None,
+        help=f"Metrics JSONL to read (default: {common.METRICS_FILENAME})",
+    )
+    p_fb.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Only the newest N sessions (default: all of them)",
+    )
+    p_fb.add_argument(
+        "--json",
+        dest="json_out",
+        default=None,
+        help="Also write the per-session accounting to this JSON file",
+    )
+    p_rv = sub.add_parser(
+        "review-detections",
+        help="Build a review page for the detections on existing frames (measures precision)",
+    )
+    p_rv.add_argument(
+        "--frames",
+        nargs="+",
+        default=["memory/snapshots/*.jpg", "unknown_incidents/*.jpg"],
+        help="Glob patterns for the frames to review (default: the project's saved frames)",
+    )
+    p_rv.add_argument(
+        "--out-dir",
+        default=detection_review.DEFAULT_REVIEW_DIR,
+        help=f"Where to write the page and detection list (default: {detection_review.DEFAULT_REVIEW_DIR})",
+    )
+    p_rv.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Review only N boxes, spread across the confidence range (default: all of them)",
+    )
+    p_rv.add_argument(
+        "--min-brightness",
+        type=float,
+        default=detection_bench.DEFAULT_MIN_BRIGHTNESS,
+        help="Frames darker than this cannot be detected in and are excluded",
+    )
+    p_sc = sub.add_parser(
+        "score-detections",
+        help="Score reviewed detections into precision, per class and overall",
+    )
+    p_sc.add_argument(
+        "--review-dir",
+        default=detection_review.DEFAULT_REVIEW_DIR,
+        help=f"Directory holding detections.json and verdicts.json (default: {detection_review.DEFAULT_REVIEW_DIR})",
+    )
+    p_sc.add_argument(
+        "--verdicts",
+        default=None,
+        help="Verdicts JSON to score (default: <review-dir>/verdicts.json)",
+    )
     p_boot = sub.add_parser("bootstrap", help="Create runtime directories and fetch model assets")
     p_boot.add_argument(
         "--no-gaze-download",
@@ -5013,6 +5207,14 @@ def main() -> None:
             args.min_brightness,
             args.json_out,
         ),
+        "review-detections": lambda: cmd_review_detections(
+            args.frames,
+            args.out_dir,
+            args.limit,
+            args.min_brightness,
+        ),
+        "score-detections": lambda: cmd_score_detections(args.review_dir, args.verdicts),
+        "frame-budget": lambda: cmd_frame_budget(args.log, args.limit, args.json_out),
         "bootstrap": lambda: cmd_bootstrap(download_gaze=not args.no_gaze_download),
     }.get(args.cmd, parser.print_help)()
 

@@ -167,9 +167,13 @@ Dashboard → backend URL: set `VITE_API_BASE` in `frontend/.env.local` (default
 python -m compileall -q main.py server.py common.py scene_memory.py object_detection.py
 python -m unittest discover -s tests          # the backend battery; the run prints its own count
 python main.py bench-detect                   # detection quality on your own frames
+python main.py frame-budget                   # where a recorded session's frame time went
+python main.py review-detections              # box-by-box review -> a real precision figure
 cd frontend && npm test                       # 7 tests
 ruff check . && mypy                          # lint + types (see ruff.toml / mypy.ini)
 ```
+
+`bench-detect`, `frame-budget` and `review-detections` answer three different questions and none replaces another: the first measures the detector on saved frames (recall against labelled reference images, detection statistics on yours), the second reads the sessions already in `metrics_log.jsonl` and reports what the frame period was made of — including which stages the log does *not* record — and the third turns the detector's own output into a measured **precision** figure with a two-minute review and no new capture. Only the last one measures whether individual detections are *correct*; follow it with `score-detections --review-dir reviews`.
 
 The detection benchmark needs the real computer-vision stack (`ultralytics` + OpenCV). The rest of the battery stubs `cv2`, so its inference tests report as **skipped** on a machine without them — a skip there means "not checked here", not "passing".
 
