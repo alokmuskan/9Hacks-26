@@ -912,7 +912,9 @@ class PipelineManager:
         cap, reader = capture
 
         interval = 1.0 / max(int(fps_cap), 1)
-        t_prev = time.time()
+        # Monotonic, not wall clock: a backwards wall-clock correction mid-session
+        # turns one interval into microseconds and reports an absurd frame rate.
+        t_prev = time.monotonic()
 
         frames_total = 0
         frames_with_faces = 0
@@ -1042,9 +1044,10 @@ class PipelineManager:
                 frames_total += 1
                 now_ts = time.time()
 
-                dt = max(now_ts - t_prev, 1e-6)
+                mono_ts = time.monotonic()
+                dt = max(mono_ts - t_prev, 1e-6)
                 inst_fps = 1.0 / dt
-                t_prev = now_ts
+                t_prev = mono_ts
                 fps_ema = inst_fps if fps_ema == 0.0 else (0.9 * fps_ema + 0.1 * inst_fps)
                 fps_min = min(fps_min, inst_fps)
                 fps_max = max(fps_max, inst_fps)

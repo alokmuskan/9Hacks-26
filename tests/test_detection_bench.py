@@ -1,12 +1,37 @@
+import importlib
 import importlib.util
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 import common
 import detection_bench
+
+#: Set this to turn "the real stack is missing, so skip" into a hard failure. The
+#: CI `detection-smoke` job sets it: `unittest` exits 0 when tests skip, so without
+#: this a job whose entire purpose is to exercise real inference would report green
+#: while testing nothing at all.
+REQUIRE_REAL_INFERENCE = os.getenv("AI_STUDIO_REQUIRE_REAL_INFERENCE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _unavailable(test: unittest.TestCase, reason: str) -> None:
+    """Skip a test that needs the real stack -- or fail, if it was promised.
+
+    The distinction is between "this machine cannot run it" and "this environment
+    said it could, and it cannot": only the first is a legitimate skip.
+    """
+    if REQUIRE_REAL_INFERENCE:
+        raise AssertionError(f"real inference was required but unavailable: {reason}")
+    test.skipTest(reason)
 
 #: One point in the parameter space. This is the *detector's* type, re-exported
 #: rather than redefined — see `object_detection.DetectorConfig`.
@@ -30,12 +55,14 @@ class _RealInferenceMixin:
         except Exception:
             if saved is not None:
                 sys.modules["cv2"] = saved
-            self.skipTest("real OpenCV is not installed")
+            _unavailable(self, "real OpenCV is not installed")
+            return
 
         if not getattr(cv2, "__file__", None):
             # Only the stub is importable here, so this machine has no OpenCV.
             sys.modules["cv2"] = saved if saved is not None else cv2
-            self.skipTest("real OpenCV is not installed")
+            _unavailable(self, "real OpenCV is not installed")
+            return
 
         def restore() -> None:
             if saved is None:
@@ -47,9 +74,42 @@ class _RealInferenceMixin:
 
     def require_ultralytics_and_weights(self) -> None:
         if importlib.util.find_spec("ultralytics") is None:
-            self.skipTest("ultralytics is not installed")
+            _unavailable(self, "ultralytics is not installed")
+            return
         if not Path("yolov8n.pt").exists():
-            self.skipTest("yolov8n.pt weights are not present")
+            _unavailable(self, "yolov8n.pt weights are not present")
+            return
+
+
+class RequireRealInferenceTests(unittest.TestCase):
+    """The flag that turns a skipped guard into a failure.
+
+    CI's `detection-smoke` job sets it, because `unittest` exits 0 when tests skip:
+    a job whose whole purpose is real inference could otherwise report green while
+    exercising nothing. These tests pin both halves of that contract.
+    """
+
+    def test_the_flag_turns_a_missing_dependency_into_a_failure(self):
+        module = sys.modules[__name__]
+        self.addCleanup(importlib.reload, module)
+
+        with mock.patch.dict(os.environ, {"AI_STUDIO_REQUIRE_REAL_INFERENCE": "1"}):
+            reloaded = importlib.reload(module)
+            self.assertTrue(reloaded.REQUIRE_REAL_INFERENCE)
+            with self.assertRaises(AssertionError):
+                reloaded._unavailable(self, "real OpenCV is not installed")
+
+    def test_without_the_flag_a_missing_dependency_skips(self):
+        """The default has to stay a skip: every other machine lacks the stack."""
+        module = sys.modules[__name__]
+        self.addCleanup(importlib.reload, module)
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AI_STUDIO_REQUIRE_REAL_INFERENCE", None)
+            reloaded = importlib.reload(module)
+            self.assertFalse(reloaded.REQUIRE_REAL_INFERENCE)
+            with self.assertRaises(unittest.SkipTest):
+                reloaded._unavailable(self, "ultralytics is not installed")
 
 
 class FrameClassificationTests(_RealInferenceMixin, unittest.TestCase):
@@ -432,7 +492,8 @@ class RealInferenceTests(_RealInferenceMixin, unittest.TestCase):
         self.require_ultralytics_and_weights()
         self.references = detection_bench.reference_assets()
         if not self.references:
-            self.skipTest("bundled ultralytics reference images are unavailable")
+            _unavailable(self, "bundled ultralytics reference images are unavailable")
+            return
 
     def test_reference_images_are_detected(self):
         results = detection_bench.run_benchmark(

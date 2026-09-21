@@ -215,6 +215,9 @@ class SpreadTests(unittest.TestCase):
         assert budget is not None
         self.assertTrue(any("not usable" in note for note in budget.notes))
         self.assertFalse(any("dominated by stalls" in note for note in budget.notes))
+        # The cause is named, because "unreliable" without a reason invites the
+        # reading that the machine is at fault rather than the clock it measured with.
+        self.assertTrue(any("wall clock" in note for note in budget.notes))
 
 
 class PacingTests(unittest.TestCase):

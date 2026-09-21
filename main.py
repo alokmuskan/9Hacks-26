@@ -2749,7 +2749,11 @@ def cmd_recognize(
         else:
             print("Gaze requested but unavailable. Continuing with gaze OFF.")
 
-    t_prev = time.time()
+    # Elapsed time for pacing comes from a clock that cannot step. The wall clock
+    # can be corrected backwards mid-session (NTP), which turns one interval into
+    # microseconds and reports an absurd instantaneous rate - one recorded session
+    # reports 29,537 fps against a 0.68 fps average for exactly that reason.
+    t_prev = time.monotonic()
     fps_ema = 0.0
     fps_min = float("inf")
     fps_max = 0.0
@@ -2840,9 +2844,10 @@ def cmd_recognize(
             frames_total += 1
             now_ts = time.time()
 
-            dt = max(now_ts - t_prev, 1e-6)
+            mono_ts = time.monotonic()
+            dt = max(mono_ts - t_prev, 1e-6)
             inst_fps = 1.0 / dt
-            t_prev = now_ts
+            t_prev = mono_ts
             fps_ema = inst_fps if fps_ema == 0.0 else (0.9 * fps_ema + 0.1 * inst_fps)
             fps_min = min(fps_min, inst_fps)
             fps_max = max(fps_max, inst_fps)

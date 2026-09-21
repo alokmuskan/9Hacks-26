@@ -230,6 +230,35 @@ class CliRecognizeLoopTests(unittest.TestCase):
         self.assertIn("Alok", payload["people"])
         self.assertGreaterEqual(payload["events_total_count"], 0)
 
+    def test_a_backwards_wall_clock_step_cannot_invent_a_frame_rate(self):
+        """One recorded session reports 29,537 fps against a 0.68 fps average.
+
+        Its intervals were measured against the wall clock, which can be corrected
+        backwards mid-session, turning one interval into microseconds. Pacing now
+        reads a monotonic clock, so a backwards step must leave the rates sane.
+        """
+        monotonic_tick = [1000.0]
+        wall_tick = [1_700_000_000.0]
+
+        def monotonic() -> float:
+            monotonic_tick[0] += 0.5
+            return monotonic_tick[0]
+
+        def wall_clock() -> float:
+            wall_tick[0] -= 30.0  # 30 s earlier on every single call
+            return wall_tick[0]
+
+        with mock.patch.object(self.main.time, "monotonic", side_effect=monotonic):
+            with mock.patch.object(self.main.time, "time", side_effect=wall_clock):
+                appended, _gaze, _detector = self._run(frames=4)
+
+        aggregate = self._session(appended)["aggregate"]
+        self.assertGreaterEqual(aggregate["frames_total"], 3)
+        # Half a second between frames is 2 fps. Measured with the stepping wall
+        # clock instead, this reads as tens of thousands of fps.
+        self.assertLess(aggregate["max_fps"], 5.0)
+        self.assertLess(aggregate["moving_avg_fps"], 5.0)
+
     def test_default_gaze_runs_every_frame_and_reports_full_rate(self):
         appended, fake_gaze, _detector = self._run(frames=4, disable_gaze=False)
 

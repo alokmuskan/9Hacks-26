@@ -632,7 +632,7 @@ disk: no camera, no labels, no re-run, and no change to production behaviour.
 | --- | --- |
 | median session throughput | **0.83 fps** (range 0.68–9.39) |
 | median EMA frame rate | **2.80 fps** |
-| stall-dominated sessions (EMA above 2× the session average) | **5 of 12** — one reached 178 fps instantaneously against a 0.82 fps mean; another's frame clock is unusable (29,537 fps between frames) |
+| stall-dominated sessions (EMA above 2× the session average) | **5 of 12** — one reached 178 fps instantaneously against a 0.82 fps mean; another's frame rate statistics are unusable (29,537 fps between frames) |
 | face detection | **3.6%** of the mean period — 41.1 ms/frame, over the 8 sessions that ran it |
 | gaze | **28.3%** — 334.5 ms/frame, over the 6 sessions that ran it |
 | unattributed remainder | **69.1%** — 833.6 ms/frame |
@@ -696,6 +696,17 @@ field and no runtime behaviour.
 
 **Status: written, 30 unit tests, full battery green (299 tests, `ruff` clean, `mypy`
 clean across 8 files). No Phase 3 decision is made or implied.**
+
+**The 29,537 fps session, root-caused.** It is not a broken machine. The session ran with
+face recognition disabled (`face_recognition_enabled: false`, 3 frames, 4.426 s), and the
+interval between two of those frames is recorded as 33.9 µs — shorter than the YOLO pass
+that must have run inside it. `t_prev` was set from `time.time()`, the *wall* clock, which
+NTP can correct backwards mid-session; that subtracts most of an interval and reports the
+remainder as an enormous rate. Both loops now take the pacing interval from
+`time.monotonic()`, which cannot step, and a regression test drives the CLI loop with a
+wall clock that steps 30 s backwards on every call and asserts the reported rate stays at the
+2 fps the monotonic clock implies. The existing record is left as-is and still reports as
+unusable, because that is what it is.
 
 ### 2h follow-up: the three fields the log was missing
 

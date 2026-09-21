@@ -806,15 +806,26 @@ Formatting is configured (`line-length = 100`, double quotes) but **not applied 
 
 ### Continuous Integration
 
-`.github/workflows/ci.yml` runs three jobs on every push to `main` and every pull request:
+`.github/workflows/ci.yml` runs four jobs on every push to `main` and every pull request:
 
 | Job | What it runs |
 | --- | --- |
 | Backend tests | `python -m unittest discover -s tests -q`, then a byte-compile of every module |
+| Detection smoke | The real stack (OpenCV + ultralytics + `yolov8n.pt`), running `test_detection_bench.py` with `AI_STUDIO_REQUIRE_REAL_INFERENCE=1` |
 | Lint and types | `ruff check .` and `mypy` |
 | Frontend | `npm ci`, `npm test`, `npm run build` |
 
 The backend job installs only `numpy`, `pillow`, `fastapi` and `httpx`, because the suite stubs cv2 and insightface — the full computer-vision stack is not needed to run the tests. It also installs a CPU-only `torch` so the one L2CS decoding test executes rather than skipping; remove that step to make the job lighter and that test will report as skipped instead of failing.
+
+The **Detection smoke** job exists because that stubbing has a cost: four tests in `test_detection_bench.py` guard the real inference wiring (that the benchmark drives the shipping detector, and that `conf`/`imgsz` actually reach the model), and without the stack they skip themselves — so CI could not catch a broken wiring while reporting green. They are also the tests that *skipped* in the backend job, so the count there is expected to be higher.
+
+`unittest` exits 0 when tests skip, so that job sets `AI_STUDIO_REQUIRE_REAL_INFERENCE=1`, which turns “the real stack is missing” into a failure rather than a skip. Locally the same knob makes it verifiable:
+
+```bash
+AI_STUDIO_REQUIRE_REAL_INFERENCE=1 python -m unittest discover -s tests -q -p "test_detection_bench.py"
+```
+
+Run it from the repository root — the guard looks for `yolov8n.pt` in the working directory, and from anywhere else it will (correctly) report that the weights are unavailable.
 
 ### End-to-End
 

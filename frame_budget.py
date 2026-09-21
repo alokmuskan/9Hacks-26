@@ -341,7 +341,9 @@ def build_budget(row: Mapping[str, Any]) -> tuple[SessionBudget | None, str]:
     if instant_high > IMPLAUSIBLE_FPS:
         notes.append(
             f"the instantaneous rate reaches {instant_high:.0f} fps, which no stage could produce: "
-            "the frame clock is unreliable in this session, so its rate statistics are not usable"
+            "the interval was measured against the wall clock, which can step backwards "
+            "mid-session, so this session's rate statistics are not usable (intervals are now "
+            "measured with a monotonic clock)"
         )
     elif ema_fps > avg_fps * STALL_FACTOR:
         notes.append(
