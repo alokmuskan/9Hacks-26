@@ -4676,8 +4676,18 @@ def collect_environment_report(check_camera: bool = False) -> list[tuple[str, st
                 status = unavailable_status
                 want = ".".join(str(part) for part in minimum[0])
                 detail = f"{detail} is too old (need >= {want}: {minimum[1]})"
+        # Name the capability either way, but only claim it is disabled when it is.
+        # Appending "... disabled without it" unconditionally made a working install
+        # read as broken -- `module:insightface 2.0 - face recognition disabled
+        # without it` on a machine where face recognition was fine, which is exactly
+        # the wrong signal to send someone staring at a dashboard reporting zero faces.
         if degradable:
-            detail = f"{detail} - {_DEGRADABLE_MODULES[name]} disabled without it"
+            purpose = _DEGRADABLE_MODULES[name]
+            detail = (
+                f"{detail} - {purpose} disabled without it"
+                if status != "ok"
+                else f"{detail} (needed for {purpose})"
+            )
         rows.append((status, f"module:{name}", detail))
 
     for name, purpose in _OPTIONAL_MODULES.items():

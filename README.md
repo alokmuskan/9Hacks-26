@@ -881,6 +881,27 @@ pip install -U "insightface>=0.7.3,<3"
 
 The 0.7.x line is **source-only on PyPI** (needs a C++ toolchain and Cython), but the **2.x line ships a pure-Python wheel** (`py3-none-any`) that installs with no compiler and was verified against this project's API — `FaceAnalysis(providers=..., allowed_modules=...)`, `prepare`, `get` — including on Windows/Python 3.13. `python main.py doctor` reports an unusable insightface as a `warn`, not a `fail`, because an importable module is not necessarily a usable one — and an unusable one no longer blocks the session.
 
+**Check which interpreter you are running first — this is usually the whole problem.** The dependency lives in the project environment, not necessarily in whichever `python` is first on `PATH`. Running `python server.py` with a system Python that carries an old insightface reproduces the symptom above *while the suite passes in `.venv`*:
+
+```bash
+python -c "import sys, insightface; print(sys.executable, insightface.__version__)"
+.venv\Scripts\python.exe -c "import sys, insightface; print(sys.executable, insightface.__version__)"  # Windows
+```
+
+If the first prints a path outside the project, start the app from the project environment instead (`pixi run python server.py`, or `.venv\Scripts\python.exe server.py`). `python main.py doctor` names the interpreter it is describing. The server now also logs `Face recognition DISABLED: <reason>` at startup: it previously only published a dashboard event, so a terminal running the API looked healthy while every frame reported zero faces.
+
+**Enrolment sits on `WAITING FOR FRAMES` and never captures**
+
+That text is a placeholder image the stream serves when there are no frames at all, so it means the enrolment worker is not running — not that it is waiting on you. The usual cause is the insightface problem above: enrolment needs face *detection*, and the worker used to raise on startup and die silently behind the placeholder. It now fails with the reason instead, so check `degraded_reason` in the pipeline status and fix the environment as described above.
+
+**Turning Custom YOLO on does nothing, or the stream stalls and reconnects forever**
+
+Custom YOLO is off because **no checkpoint is configured**: the pipeline looks for a path in `custom_model_path.txt`, then `models/custom_yolo.pt`, then `runs/detect/*/weights/best.pt`. With none present the request cannot be granted, and it now says so in `toggle_refused` rather than looping — the handler used to retry until the reported state matched the request, which never happened without a model, so it spun inside the frame loop and froze the stream. To actually use it, fine-tune on your own classes and point the pipeline at the result:
+
+```bash
+python main.py train-objects --data dataset.yaml --epochs 30 --set-default
+```
+
 **Gaze is unavailable**
 
 The L2CS checkpoint could not be resolved. Place the weights at `models/L2CSNet_gaze360.pkl`. The pipeline continues without gaze.

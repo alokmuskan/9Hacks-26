@@ -195,6 +195,53 @@ class DetectorConfigTests(unittest.TestCase):
         self.assertEqual(detector.params(), config.as_kwargs())
 
 
+class ExplicitEnabledStateTests(unittest.TestCase):
+    """Asking for a state must report the state actually in effect.
+
+    `toggle_*` cannot express a refusal: with no model loaded it always returns
+    ``False``, so a caller looping until the state matched the request never
+    finishes. That loop existed in the server's control handler and froze the
+    frame loop when the dashboard asked to enable a model that is not on disk.
+    """
+
+    def test_a_missing_model_cannot_be_enabled(self):
+        detector = DualYoloDetector(general_model_obj=object(), enable_custom=False)
+
+        self.assertFalse(detector.set_custom_enabled(True))
+        self.assertFalse(detector.custom_enabled)
+
+    def test_a_missing_general_model_cannot_be_enabled(self):
+        detector = DualYoloDetector(general_model_obj=None, enable_general=False)
+
+        self.assertFalse(detector.set_general_enabled(True))
+        self.assertFalse(detector.general_enabled)
+
+    def test_a_loaded_model_can_be_turned_on_and_off(self):
+        detector = DualYoloDetector(
+            general_model_obj=object(), custom_model_obj=object(), enable_custom=False
+        )
+
+        self.assertTrue(detector.set_custom_enabled(True))
+        self.assertTrue(detector.custom_enabled)
+        self.assertFalse(detector.set_custom_enabled(False))
+        self.assertFalse(detector.custom_enabled)
+
+    def test_requesting_the_current_state_is_idempotent(self):
+        detector = DualYoloDetector(general_model_obj=object(), enable_general=True)
+
+        self.assertTrue(detector.set_general_enabled(True))
+        self.assertTrue(detector.general_enabled)
+
+    def test_toggle_still_flips_a_loaded_model(self):
+        """The keyboard toggle keeps its old meaning, now derived from the setter."""
+        detector = DualYoloDetector(
+            general_model_obj=object(), custom_model_obj=object(), enable_custom=True
+        )
+
+        self.assertFalse(detector.toggle_custom())
+        self.assertTrue(detector.toggle_custom())
+
+
 class InScopeClassTests(unittest.TestCase):
     """The detector reports labels this project has no use for.
 

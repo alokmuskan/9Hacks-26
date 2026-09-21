@@ -631,20 +631,37 @@ class PipelineManager:
             if cmd.get("type") != "toggle":
                 continue
 
+            # Ask for the state and report what is actually in effect. These used to
+            # be `while state != desired: state = detector.toggle_*()`, which spins
+            # forever whenever the detector cannot comply -- most easily by asking to
+            # enable a model that is not on disk, since `toggle_custom()` then always
+            # returns False. That froze the frame loop and showed the user a stalled
+            # stream with no explanation.
+            refused: dict[str, str] = {}
             if cmd.get("general_yolo") is not None:
                 desired = bool(cmd["general_yolo"])
-                while bool(state["general"]) != desired:
-                    state["general"] = detector.toggle_general()
+                state["general"] = detector.set_general_enabled(desired)
+                if bool(state["general"]) != desired:
+                    refused["general"] = "no general YOLO model is loaded"
             if cmd.get("custom_yolo") is not None:
                 desired = bool(cmd["custom_yolo"])
-                while bool(state["custom"]) != desired:
-                    state["custom"] = detector.toggle_custom()
+                state["custom"] = detector.set_custom_enabled(desired)
+                if bool(state["custom"]) != desired:
+                    refused["custom"] = (
+                        "no custom YOLO checkpoint is configured; put one at "
+                        "models/custom_yolo.pt or train one into "
+                        "runs/detect/*/weights/best.pt"
+                    )
             if cmd.get("gaze") is not None:
                 state["gaze"] = bool(cmd["gaze"])
 
             self._publish_event(
                 "pipeline_state",
-                {"toggle_update": dict(state), "session_id": self._session_id},
+                {
+                    "toggle_update": dict(state),
+                    "toggle_refused": refused,
+                    "session_id": self._session_id,
+                },
             )
 
     def _attempt_camera_recovery(
@@ -698,7 +715,15 @@ class PipelineManager:
             return
         cap, reader = capture
         db = core.FaceDB.load()
-        app = core._build_app(model)
+        # Enrolment cannot work without face detection, and a worker that raises here
+        # dies silently: no frames are produced, so the dashboard serves the
+        # "WAITING FOR FRAMES" placeholder forever and the user is told nothing. Fail
+        # with the reason instead -- which is what a monitor session already does with
+        # the same helper.
+        app, face_reason = core._try_build_face_app(model)
+        if app is None:
+            self._mark_startup_failed(f"face_recognition_unavailable:{face_reason}")
+            return
         samples: list[np.ndarray] = []
         interval = 1.0 / max(int(fps_cap), 1)
         last_capture = -1e9
@@ -889,6 +914,11 @@ class PipelineManager:
             # dashboard all keep working without it, so a failure here becomes a
             # reported reason rather than a dead monitor.
             app, face_reason = core._try_build_face_app(model)
+            if app is None:
+                # The CLI has always printed this; the API path only published an
+                # event, so a terminal running `python server.py` looked healthy while
+                # every frame reported zero faces.
+                LOGGER.warning("Face recognition DISABLED: %s", face_reason)
             gaze_enabled = not disable_gaze
             gaze_runtime = (
                 core._load_gaze_runtime(

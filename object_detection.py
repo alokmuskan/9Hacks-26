@@ -317,19 +317,39 @@ class DualYoloDetector:
         rows.sort(key=lambda row: row["confidence"], reverse=True)
         return rows
 
-    def toggle_general(self) -> bool:
+    def set_general_enabled(self, enabled: bool) -> bool:
+        """Ask for a state and return the state actually in effect.
+
+        A model that was never loaded cannot be enabled, so this reports the refusal
+        instead of pretending. `toggle_general` cannot express that: with no model it
+        always returns ``False``, so a caller looping until the state matched the
+        request would never finish. That is not hypothetical — the dashboard's
+        "enable custom YOLO" request ran exactly such a loop against a detector with
+        no checkpoint configured, which span forever inside the frame loop and left
+        the user looking at a stalled stream.
+        """
         if self.general_model is None:
             self.general_enabled = False
             return self.general_enabled
-        self.general_enabled = not self.general_enabled
+        self.general_enabled = bool(enabled)
         return self.general_enabled
 
-    def toggle_custom(self) -> bool:
+    def set_custom_enabled(self, enabled: bool) -> bool:
+        """Ask for a state and return the state actually in effect.
+
+        See `set_general_enabled` for why this exists next to `toggle_custom`.
+        """
         if self.custom_model is None:
             self.custom_enabled = False
             return self.custom_enabled
-        self.custom_enabled = not self.custom_enabled
+        self.custom_enabled = bool(enabled)
         return self.custom_enabled
+
+    def toggle_general(self) -> bool:
+        return self.set_general_enabled(not self.general_enabled)
+
+    def toggle_custom(self) -> bool:
+        return self.set_custom_enabled(not self.custom_enabled)
 
     def params(self) -> dict[str, Any]:
         """The inference kwargs handed to Ultralytics on every call."""

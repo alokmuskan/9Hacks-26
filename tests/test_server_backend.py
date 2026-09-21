@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from typing import ClassVar
@@ -11,6 +12,8 @@ from unittest import mock
 
 import numpy as np
 from fastapi.testclient import TestClient
+
+from object_detection import DualYoloDetector
 
 
 class ServerBackendTests(unittest.TestCase):
@@ -457,6 +460,82 @@ class ServerBackendTests(unittest.TestCase):
                 self.assertTrue(row.get("hit"))
                 self.assertIn("2 distinct persons", str(row.get("reply")))
                 self.assertTrue(isinstance(row.get("citations"), list))
+
+
+class ToggleRefusalTests(unittest.TestCase):
+    """A toggle the detector cannot honour must not block the frame loop.
+
+    Enabling a model that is not loaded is the case that bit in practice:
+    `toggle_custom()` always returns ``False`` when no checkpoint is configured, so
+    the previous `while state != desired: state = detector.toggle_custom()` spun
+    forever inside the worker thread. Frames stopped, the dashboard served its
+    stalled placeholder, and the user saw "Reconnecting" with no stated cause.
+    The assertion is therefore a timeout: the handler has to return.
+    """
+
+    def setUp(self):
+        self.server = importlib.import_module("server")
+
+    def _manager(self):
+        manager = self.server.PipelineManager()
+        events: list[tuple[str, dict]] = []
+        manager._publish_event = lambda event_type, payload: events.append((event_type, payload))
+        return manager, events
+
+    def _drain_with_timeout(self, manager, detector, state, command) -> bool:
+        manager._control_q.put(command)
+        finished = threading.Event()
+
+        def drain() -> None:
+            manager._drain_controls(detector, state)
+            finished.set()
+
+        threading.Thread(target=drain, daemon=True).start()
+        return finished.wait(5.0)
+
+    def test_asking_for_a_custom_model_that_is_not_loaded_returns(self):
+        detector = DualYoloDetector(general_model_obj=object(), enable_custom=False)
+        manager, events = self._manager()
+        state = {"general": True, "custom": False, "gaze": False}
+
+        command = {"type": "toggle", "general_yolo": None, "custom_yolo": True, "gaze": None}
+        self.assertTrue(
+            self._drain_with_timeout(manager, detector, state, command),
+            "the toggle handler never returned, so it would have frozen the frame loop",
+        )
+
+        self.assertFalse(state["custom"], "custom must stay off with no checkpoint")
+        payload = events[0][1]
+        self.assertIn("custom", payload["toggle_refused"])
+        self.assertIn("models/custom_yolo.pt", payload["toggle_refused"]["custom"])
+
+    def test_asking_for_a_general_model_that_is_not_loaded_returns(self):
+        detector = DualYoloDetector(general_model_obj=None, enable_general=False)
+        manager, events = self._manager()
+        state = {"general": False, "custom": False, "gaze": False}
+
+        command = {"type": "toggle", "general_yolo": True, "custom_yolo": None, "gaze": None}
+        self.assertTrue(self._drain_with_timeout(manager, detector, state, command))
+
+        self.assertFalse(state["general"])
+        self.assertIn("general", events[0][1]["toggle_refused"])
+
+    def test_a_loaded_model_is_enabled_and_nothing_is_refused(self):
+        detector = DualYoloDetector(
+            general_model_obj=object(),
+            custom_model_obj=object(),
+            enable_general=True,
+            enable_custom=False,
+        )
+        manager, events = self._manager()
+        state = {"general": True, "custom": False, "gaze": False}
+
+        command = {"type": "toggle", "general_yolo": None, "custom_yolo": True, "gaze": None}
+        self.assertTrue(self._drain_with_timeout(manager, detector, state, command))
+
+        self.assertTrue(state["custom"])
+        self.assertEqual(events[0][1]["toggle_refused"], {})
+        self.assertTrue(events[0][1]["toggle_update"]["custom"])
 
 
 class PacingAndCaptureDefaultsTests(unittest.TestCase):
