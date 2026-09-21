@@ -50,8 +50,9 @@ python-dotenv
 # Test suite
 pytest>=9.0.2,<10
 
-# Lint and static types. Configuration lives in ruff.toml and mypy.ini:
-#   ruff check .     # lint
-#   mypy             # types (main.py is currently opted out; see mypy.ini)
+# Lint, formatting and static types. Configuration lives in ruff.toml and mypy.ini:
+#   ruff check .          # lint
+#   ruff format --check .  # formatting (enforced in CI; `ruff format .` fixes it)
+#   mypy                  # types (main.py is currently opted out; see mypy.ini)
 ruff>=0.9
 mypy>=1.13

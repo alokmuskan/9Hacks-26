@@ -283,7 +283,10 @@ def build_budget(row: Mapping[str, Any]) -> tuple[SessionBudget | None, str]:
     frames = _as_int(aggregate.get("frames_total"))
     avg_fps = _as_float(aggregate.get("avg_fps"))
     if frames <= 0 or avg_fps <= 0:
-        return None, f"{session_id}: frames_total={frames}, avg_fps={avg_fps} (no measurable period)"
+        return (
+            None,
+            f"{session_id}: frames_total={frames}, avg_fps={avg_fps} (no measurable period)",
+        )
 
     frame_period_ms = 1000.0 / avg_fps
     notes: list[str] = []
@@ -307,7 +310,11 @@ def build_budget(row: Mapping[str, Any]) -> tuple[SessionBudget | None, str]:
 
     gaze_enabled = bool(aggregate.get("gaze_enabled"))
     gaze = _measure_stage(
-        aggregate, "gaze_inference_calls", "gaze_inference_avg_ms", frames, ran_this_session=gaze_enabled
+        aggregate,
+        "gaze_inference_calls",
+        "gaze_inference_avg_ms",
+        frames,
+        ran_this_session=gaze_enabled,
     )
     if gaze.state == "untimed":
         notes.append("gaze inference ran with no latency recorded")
@@ -563,15 +570,23 @@ def format_report(budget_set: BudgetSet) -> str:
 
     lines.append("")
     lines.append("What the record does and does not contain:")
-    lines.append("  recorded        face detection (`avg_detection_latency_ms`), gaze inference and, from")
-    lines.append("                  schema 8 on, object detection (`avg_object_detection_latency_ms`)")
+    lines.append(
+        "  recorded        face detection (`avg_detection_latency_ms`), gaze inference and, from"
+    )
+    lines.append(
+        "                  schema 8 on, object detection (`avg_object_detection_latency_ms`)"
+    )
     legacy = sum(1 for b in budgets if b.objects.state == "untimed")
     if legacy:
         lines.append(
             f"  NOT recorded    object detection in {legacy} session(s) written before schema 8: it ran"
         )
-        lines.append("                  on every frame but nothing timed it, so it sits in 'unattr_ms'")
-    lines.append("  unattributed    capture, snapshot encoding, memory writes, HUD, idle, and object")
+        lines.append(
+            "                  on every frame but nothing timed it, so it sits in 'unattr_ms'"
+        )
+    lines.append(
+        "  unattributed    capture, snapshot encoding, memory writes, HUD, idle, and object"
+    )
     lines.append("                  detection in any session that carries no timing for it")
     if summary.partial.untimed_stages:
         lines.append(
@@ -586,12 +601,18 @@ def format_report(budget_set: BudgetSet) -> str:
         )
         lines.append("                  from work where the loop was pacing itself")
     else:
-        lines.append("  pacing          `fps_cap` is absent from every record here, so idle time cannot be")
-        lines.append("                  split from work even for a session that ran at its configured cap")
+        lines.append(
+            "  pacing          `fps_cap` is absent from every record here, so idle time cannot be"
+        )
+        lines.append(
+            "                  split from work even for a session that ran at its configured cap"
+        )
 
     if budget_set.skipped:
         lines.append("")
-        lines.append(f"Skipped rows with an aggregate but no measurable period ({len(budget_set.skipped)}):")
+        lines.append(
+            f"Skipped rows with an aggregate but no measurable period ({len(budget_set.skipped)}):"
+        )
         for reason in budget_set.skipped:
             lines.append(f"  - {reason}")
 

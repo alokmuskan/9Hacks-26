@@ -393,8 +393,7 @@ def metric_generations(path: Path | str) -> list[Path]:
     """Existing generations of a rotating JSONL log, oldest first."""
     path = Path(path)
     generations = [
-        path.with_name(f"{path.name}.{index}")
-        for index in range(METRICS_BACKUP_COUNT, 0, -1)
+        path.with_name(f"{path.name}.{index}") for index in range(METRICS_BACKUP_COUNT, 0, -1)
     ]
     return [candidate for candidate in generations if candidate.exists()] + [path]
 

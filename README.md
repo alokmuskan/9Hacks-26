@@ -802,7 +802,7 @@ Install the tools with `pip install ruff mypy` (they are listed in `requirements
 
 `mypy` is **staged, not all-or-nothing**: `common.py`, `object_detection.py`, `detection_bench.py`, `scene_memory.py` and `server.py` are enforced and currently clean, while `main.py` is opted out *explicitly* in `mypy.ini` with its remaining finding count recorded there. It reports ~108 issues today, 104 of them possible-`None` dereferences in the long CLI/report/chat helpers; guarding those is a refactor, not a config change. Deleting the one override line is all that is needed to start enforcing it.
 
-Formatting is configured (`line-length = 100`, double quotes) but **not applied to the existing code** — running `ruff format .` would rewrite every file at once, so it is left as an opt-in. `ruff format --check` is therefore not yet enforced in CI.
+Formatting is applied (`line-length = 100`, double quotes) and enforced: CI runs `ruff format --check .`. Run `ruff format .` before committing Python and it stays clean; the one-time reformat of the existing code is already in the history.
 
 ### Continuous Integration
 
@@ -812,7 +812,7 @@ Formatting is configured (`line-length = 100`, double quotes) but **not applied 
 | --- | --- |
 | Backend tests | `python -m unittest discover -s tests -q`, then a byte-compile of every module |
 | Detection smoke | The real stack (OpenCV + ultralytics + `yolov8n.pt`), running `test_detection_bench.py` with `AI_STUDIO_REQUIRE_REAL_INFERENCE=1` |
-| Lint and types | `ruff check .` and `mypy` |
+| Lint and types | `ruff check .`, `ruff format --check .` and `mypy` |
 | Frontend | `npm ci`, `npm test`, `npm run build` |
 
 The backend job installs only `numpy`, `pillow`, `fastapi` and `httpx`, because the suite stubs cv2 and insightface — the full computer-vision stack is not needed to run the tests. It also installs a CPU-only `torch` so the one L2CS decoding test executes rather than skipping; remove that step to make the job lighter and that test will report as skipped instead of failing.

@@ -21,7 +21,10 @@ class EnvironmentReportTests(unittest.TestCase):
         self.main = importlib.import_module("main")
 
     def _rows(self, **kwargs):
-        return {name: (status, detail) for status, name, detail in self.main.collect_environment_report(**kwargs)}
+        return {
+            name: (status, detail)
+            for status, name, detail in self.main.collect_environment_report(**kwargs)
+        }
 
     def test_every_required_module_is_reported(self):
         rows = self._rows()
@@ -38,7 +41,11 @@ class EnvironmentReportTests(unittest.TestCase):
         # Deliberately does not assume the host has any particular module: the
         # subject is how a missing required import is *classified*.
         with mock.patch.object(
-            self.main, "_check_import", side_effect=lambda name: (False, "not importable") if name == "torch" else (True, "1.0")
+            self.main,
+            "_check_import",
+            side_effect=lambda name: (
+                (False, "not importable") if name == "torch" else (True, "1.0")
+            ),
         ):
             degraded = self._rows()
             report = self.main.collect_environment_report()
@@ -48,7 +55,9 @@ class EnvironmentReportTests(unittest.TestCase):
 
     def test_missing_optional_module_is_only_a_warning(self):
         with mock.patch.object(
-            self.main, "_check_import", side_effect=lambda name: (False, "not importable") if name == "groq" else (True, "1.0")
+            self.main,
+            "_check_import",
+            side_effect=lambda name: (False, "not importable") if name == "groq" else (True, "1.0"),
         ):
             report = self.main.collect_environment_report()
 
@@ -217,7 +226,9 @@ class RunabilityConfigTests(unittest.TestCase):
 
     def test_pixi_tasks_do_not_hardcode_a_camera_device(self):
         text = (PROJECT_ROOT / "pixi.toml").read_text(encoding="utf-8")
-        self.assertNotIn("/dev/video42", text, "a hardcoded device makes the task unable to target a webcam")
+        self.assertNotIn(
+            "/dev/video42", text, "a hardcoded device makes the task unable to target a webcam"
+        )
         self.assertIn('doctor = "python main.py doctor"', text)
         self.assertIn('bootstrap = "python main.py bootstrap"', text)
 
@@ -264,7 +275,9 @@ class RunabilityConfigTests(unittest.TestCase):
             with (
                 mock.patch.object(self.main, "MEMORY_DIR", memory_dir),
                 mock.patch.object(self.main, "UNKNOWN_INCIDENTS_DIR", incidents_dir),
-                mock.patch.object(self.main, "_resolve_general_model_path", return_value=str(weights)),
+                mock.patch.object(
+                    self.main, "_resolve_general_model_path", return_value=str(weights)
+                ),
                 mock.patch.object(self.main.FaceDB, "load", return_value=self.main.FaceDB.empty()),
             ):
                 self.main.cmd_bootstrap(download_gaze=False)
@@ -311,7 +324,9 @@ class RunabilityConfigTests(unittest.TestCase):
             with (
                 mock.patch.object(self.main, "MEMORY_DIR", Path(td) / "memory"),
                 mock.patch.object(self.main, "UNKNOWN_INCIDENTS_DIR", Path(td) / "incidents"),
-                mock.patch.object(self.main, "_resolve_general_model_path", return_value=configured),
+                mock.patch.object(
+                    self.main, "_resolve_general_model_path", return_value=configured
+                ),
                 mock.patch.dict(sys.modules, {"ultralytics": module}),
                 mock.patch.object(self.main.FaceDB, "load", return_value=self.main.FaceDB.empty()),
             ):
@@ -325,7 +340,9 @@ class RunabilityConfigTests(unittest.TestCase):
                 mock.patch.object(self.main, "MEMORY_DIR", Path(td) / "memory"),
                 mock.patch.object(self.main, "UNKNOWN_INCIDENTS_DIR", Path(td) / "incidents"),
                 mock.patch.object(
-                    self.main, "_resolve_general_model_path", return_value=str(Path(td) / "absent.pt")
+                    self.main,
+                    "_resolve_general_model_path",
+                    return_value=str(Path(td) / "absent.pt"),
                 ),
                 self._fake_ultralytics(),
                 mock.patch.object(self.main, "_load_gaze_runtime") as gaze_loader,

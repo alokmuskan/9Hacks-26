@@ -345,13 +345,17 @@ class PipelineManager:
         self._enroll = EnrollStatus()
         self._manual_snapshots = 0
 
-    def _set_startup_phase(self, phase: str, failure_reason: str | None = None, publish: bool = True) -> None:
+    def _set_startup_phase(
+        self, phase: str, failure_reason: str | None = None, publish: bool = True
+    ) -> None:
         with self._lock:
             self._startup_phase = str(phase)
             if phase == "starting":
                 now = _iso()
                 self._startup_started_utc = now
-                self._startup_deadline_utc = _iso(datetime.now(UTC) + timedelta(seconds=STARTUP_TIMEOUT_SEC))
+                self._startup_deadline_utc = _iso(
+                    datetime.now(UTC) + timedelta(seconds=STARTUP_TIMEOUT_SEC)
+                )
                 self._startup_failure_reason = None
             elif phase == "failed":
                 self._startup_failure_reason = failure_reason or "startup_failed"
@@ -377,7 +381,9 @@ class PipelineManager:
     def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
 
-    def _event(self, event_type: str, payload: dict[str, Any], session_id: str | None = None) -> dict[str, Any]:
+    def _event(
+        self, event_type: str, payload: dict[str, Any], session_id: str | None = None
+    ) -> dict[str, Any]:
         return {
             "type": event_type,
             "timestamp": _iso(),
@@ -389,7 +395,9 @@ class PipelineManager:
     def _compute_sleep_duration(frame_interval_sec: float, processing_sec: float) -> float:
         return max(0.0, float(frame_interval_sec) - float(processing_sec))
 
-    def _publish_event(self, event_type: str, payload: dict[str, Any], session_id: str | None = None) -> None:
+    def _publish_event(
+        self, event_type: str, payload: dict[str, Any], session_id: str | None = None
+    ) -> None:
         event = self._event(event_type, payload, session_id=session_id)
         self._recent_events.append(event)
         if self._loop is None:
@@ -489,7 +497,9 @@ class PipelineManager:
 
     def _validate_can_start(self) -> None:
         if self._thread and self._thread.is_alive():
-            raise HTTPException(status_code=409, detail=f"Pipeline already running in '{self._mode}' mode")
+            raise HTTPException(
+                status_code=409, detail=f"Pipeline already running in '{self._mode}' mode"
+            )
 
     def note_manual_snapshot(self) -> int:
         """Count a snapshot saved outside the worker (API request or chat action)."""
@@ -512,7 +522,9 @@ class PipelineManager:
             self._last_error = None
             self._startup_phase = "starting"
             self._startup_started_utc = _iso()
-            self._startup_deadline_utc = _iso(datetime.now(UTC) + timedelta(seconds=STARTUP_TIMEOUT_SEC))
+            self._startup_deadline_utc = _iso(
+                datetime.now(UTC) + timedelta(seconds=STARTUP_TIMEOUT_SEC)
+            )
             self._startup_failure_reason = None
             self._enroll = EnrollStatus()
             self._latest_session_summary = None
@@ -856,13 +868,16 @@ class PipelineManager:
         try:
             db = core.FaceDB.load()
             if not db.names:
-                LOGGER.warning("No enrolled identities found. Monitoring will run with Unknown-only matches.")
+                LOGGER.warning(
+                    "No enrolled identities found. Monitoring will run with Unknown-only matches."
+                )
 
             detector = core.DualYoloDetector(
                 general_model_path=core._resolve_general_model_path(general_model),
                 custom_model_path=custom_model or core._load_default_custom_model_path(),
                 enable_general=not disable_general,
-                enable_custom=(not disable_custom) and bool(custom_model or core._load_default_custom_model_path()),
+                enable_custom=(not disable_custom)
+                and bool(custom_model or core._load_default_custom_model_path()),
             )
             memory = core.SceneMemoryManager(
                 snapshot_interval_sec=float(snapshot_interval),
@@ -904,7 +919,9 @@ class PipelineManager:
         behavior_tracker = core._BehaviorTracker()
         startup_deadline_monotonic = time.monotonic() + STARTUP_TIMEOUT_SEC
         self._set_startup_phase("camera_opening")
-        capture = self._attempt_camera_recovery(startup=True, deadline_monotonic=startup_deadline_monotonic)
+        capture = self._attempt_camera_recovery(
+            startup=True, deadline_monotonic=startup_deadline_monotonic
+        )
         if capture is None:
             startup_failed_reason = "startup_timeout_camera_opening"
             self._mark_startup_failed(startup_failed_reason)
@@ -1005,7 +1022,11 @@ class PipelineManager:
                 if not ok or frame is None:
                     frames_dropped += 1
                     camera_failures += 1
-                    fail_threshold = STARTUP_CAMERA_FAILURE_THRESHOLD if not startup_ready else CAMERA_FAILURE_THRESHOLD
+                    fail_threshold = (
+                        STARTUP_CAMERA_FAILURE_THRESHOLD
+                        if not startup_ready
+                        else CAMERA_FAILURE_THRESHOLD
+                    )
                     if camera_failures >= fail_threshold:
                         with suppress(Exception):
                             reader.close()
@@ -1013,7 +1034,9 @@ class PipelineManager:
                             cap.release()
                         capture = self._attempt_camera_recovery(
                             startup=not startup_ready,
-                            deadline_monotonic=startup_deadline_monotonic if not startup_ready else None,
+                            deadline_monotonic=startup_deadline_monotonic
+                            if not startup_ready
+                            else None,
                         )
                         if capture is None:
                             if not startup_ready:
@@ -1086,8 +1109,12 @@ class PipelineManager:
                 object_count = len(object_rows)
                 peak_simultaneous_faces = max(peak_simultaneous_faces, face_count)
                 timeline_key = datetime.now(UTC).astimezone().strftime("%H:%M:%S")
-                detection_timeline[timeline_key] = detection_timeline.get(timeline_key, 0) + face_count
-                object_detection_timeline[timeline_key] = object_detection_timeline.get(timeline_key, 0) + object_count
+                detection_timeline[timeline_key] = (
+                    detection_timeline.get(timeline_key, 0) + face_count
+                )
+                object_detection_timeline[timeline_key] = (
+                    object_detection_timeline.get(timeline_key, 0) + object_count
+                )
 
                 if face_count:
                     frames_with_faces += 1
@@ -1152,7 +1179,10 @@ class PipelineManager:
                         add_event("exit", f"{name} left view")
                 visible_prev = visible_now
 
-                if unknown_in_frame and (now_ts - last_unknown_alert_ts) >= core.UNKNOWN_ALERT_COOLDOWN_SEC:
+                if (
+                    unknown_in_frame
+                    and (now_ts - last_unknown_alert_ts) >= core.UNKNOWN_ALERT_COOLDOWN_SEC
+                ):
                     unknown_alert_count += 1
                     last_unknown_alert_ts = now_ts
                     snap = core._save_unknown_snapshot(frame, unknown_bboxes, datetime.now(UTC))
@@ -1199,7 +1229,9 @@ class PipelineManager:
                 for i, (bbox, _landmarks, label, score) in enumerate(render_rows):
                     color = (0, 210, 80) if label != core.UNKNOWN_LABEL else (0, 140, 255)
                     core._bracket_box(frame, bbox, color)
-                    core._label_tag(frame, f"{label} {score:.2f}", int(bbox[0]), int(bbox[1]) - 6, color)
+                    core._label_tag(
+                        frame, f"{label} {score:.2f}", int(bbox[0]), int(bbox[1]) - 6, color
+                    )
 
                     target_info: dict[str, Any] | None = None
                     gaze_payload: dict[str, Any] | None = None
@@ -1235,7 +1267,9 @@ class PipelineManager:
                                     "name": label,
                                     "target_object": str(target_info.get("label")),
                                     "method": target_info.get("method"),
-                                    "distance_px": round(_safe_float(target_info.get("distance_px"), 0.0), 3),
+                                    "distance_px": round(
+                                        _safe_float(target_info.get("distance_px"), 0.0), 3
+                                    ),
                                 }
                             )
 
@@ -1245,7 +1279,9 @@ class PipelineManager:
                             "confidence": round(float(score), 6),
                             "bbox": core._bbox_to_list(bbox),
                             "gaze": gaze_payload,
-                            "target_object": str(target_info.get("label")) if isinstance(target_info, dict) else None,
+                            "target_object": str(target_info.get("label"))
+                            if isinstance(target_info, dict)
+                            else None,
                         }
                     )
 
@@ -1323,7 +1359,10 @@ class PipelineManager:
                 core._hud(
                     frame,
                     [
-                        (f"Faces:{face_count} Objects:{object_count} FPS:{fps_ema:.1f}/{int(fps_cap)}", (255, 255, 255)),
+                        (
+                            f"Faces:{face_count} Objects:{object_count} FPS:{fps_ema:.1f}/{int(fps_cap)}",
+                            (255, 255, 255),
+                        ),
                         (
                             (
                                 f"Known:{known_detections} Unknown:{unknown_detections} "
@@ -1332,7 +1371,10 @@ class PipelineManager:
                             ),
                             (180, 180, 180),
                         ),
-                        (f"Gaze:{gaze_status} Seq:{self.frame_store.get().get('sequence', 0)}", (170, 170, 170)),
+                        (
+                            f"Gaze:{gaze_status} Seq:{self.frame_store.get().get('sequence', 0)}",
+                            (170, 170, 170),
+                        ),
                         (
                             # What object inference is actually using: the values used
                             # to be unreachable, so they were worth showing. Tolerant of
@@ -1564,7 +1606,9 @@ class PipelineManager:
         if frame["frame_bytes"]:
             return frame
         return {
-            "frame_bytes": self._placeholder_idle if self._mode == "idle" else self._placeholder_stalled,
+            "frame_bytes": self._placeholder_idle
+            if self._mode == "idle"
+            else self._placeholder_stalled,
             "timestamp_utc": _iso(),
             "sequence": 0,
         }
@@ -1583,7 +1627,9 @@ class PipelineManager:
             context["people"] = []
         if "attention_rows" not in context:
             context["attention_rows"] = []
-        context["memory"] = _core().SceneMemoryManager(base_dir=_core().MEMORY_DIR, enable_vectors=False)
+        context["memory"] = _core().SceneMemoryManager(
+            base_dir=_core().MEMORY_DIR, enable_vectors=False
+        )
         return context
 
 
@@ -1644,7 +1690,9 @@ class ChatSessionState:
 
 
 class ChatSessionStore:
-    def __init__(self, ttl_sec: int = CHAT_SESSION_TTL_SEC, history_max_turns: int = CHAT_HISTORY_MAX_TURNS) -> None:
+    def __init__(
+        self, ttl_sec: int = CHAT_SESSION_TTL_SEC, history_max_turns: int = CHAT_HISTORY_MAX_TURNS
+    ) -> None:
         self.ttl_sec = int(ttl_sec)
         self.history_max_turns = int(history_max_turns)
         self._lock = threading.RLock()
@@ -1701,7 +1749,9 @@ class ChatSessionStore:
             state.last_seen_monotonic = time.monotonic()
             return list(state.history)
 
-    def propose_action(self, session_id: str, action: dict[str, Any], ttl_sec: int = CHAT_CONFIRM_TTL_SEC) -> str:
+    def propose_action(
+        self, session_id: str, action: dict[str, Any], ttl_sec: int = CHAT_CONFIRM_TTL_SEC
+    ) -> str:
         with self._lock:
             state = self._sessions.get(session_id)
             if state is None:
@@ -1778,7 +1828,8 @@ def _build_chat_grounding(question: str, runtime_context: dict[str, Any]) -> dic
         citations_raw.append(
             {
                 "source": "recognize_session",
-                "timestamp_utc": latest_session.get("end_utc") or latest_session.get("timestamp_utc"),
+                "timestamp_utc": latest_session.get("end_utc")
+                or latest_session.get("timestamp_utc"),
                 "detail": (
                     f"known={_safe_int(agg.get('known_detections'))}, "
                     f"unknown={_safe_int(agg.get('unknown_detections'))}, "
@@ -1878,9 +1929,7 @@ def _query_groq_grounded(
             ],
         )
     except Exception as exc:
-        LOGGER.warning(
-            "Groq chat call failed (%s); falling back to deterministic answer.", exc
-        )
+        LOGGER.warning("Groq chat call failed (%s); falling back to deterministic answer.", exc)
         return None, False
     if not response.choices:
         return None, False
@@ -1916,7 +1965,11 @@ def _collect_recent_people_signal(
     events = _load_metric_events()
     names: set[str] = set()
     max_unique = 0
-    unknown_tokens = {"unknown", "unknown person", str(getattr(core, "UNKNOWN_LABEL", "unknown")).lower()}
+    unknown_tokens = {
+        "unknown",
+        "unknown person",
+        str(getattr(core, "UNKNOWN_LABEL", "unknown")).lower(),
+    }
 
     for event in events:
         dt = _parse_iso(event.get("timestamp_utc"))
@@ -2083,7 +2136,9 @@ def _execute_confirmed_action(action: dict[str, Any]) -> dict[str, Any]:
     raise HTTPException(status_code=400, detail=f"Unsupported action '{action_type}'")
 
 
-def _deterministic_chat_response(question: str, runtime_context: dict[str, Any]) -> dict[str, Any] | None:
+def _deterministic_chat_response(
+    question: str, runtime_context: dict[str, Any]
+) -> dict[str, Any] | None:
     core = _core()
     q = question.strip().lower()
     if not q:
@@ -2091,7 +2146,9 @@ def _deterministic_chat_response(question: str, runtime_context: dict[str, Any])
     memory = runtime_context.get("memory")
     if memory is None:
         memory = core.SceneMemoryManager(base_dir=core.MEMORY_DIR, enable_vectors=False)
-    if re.fullmatch(r"(hi+|hello+|hey+|yo+|namaste|good\s+(?:morning|afternoon|evening))(?:[!.?,\s]*)", q):
+    if re.fullmatch(
+        r"(hi+|hello+|hey+|yo+|namaste|good\s+(?:morning|afternoon|evening))(?:[!.?,\s]*)", q
+    ):
         status = MANAGER.status()
         mode = str(status.get("mode", "idle"))
         phase = str(status.get("startup_phase", "idle"))
@@ -2105,7 +2162,11 @@ def _deterministic_chat_response(question: str, runtime_context: dict[str, Any])
             "hit": True,
             "include_citations": False,
         }
-    if ("what happened" in q and "minute" in q) or "recent activity" in q or "situation summary" in q:
+    if (
+        ("what happened" in q and "minute" in q)
+        or "recent activity" in q
+        or "situation summary" in q
+    ):
         minutes = _extract_minutes_from_query(q, default=5)
         summary = core._build_situation_summary(minutes=minutes)
         rendered = core._render_situation_summary(summary)
@@ -2115,12 +2176,13 @@ def _deterministic_chat_response(question: str, runtime_context: dict[str, Any])
             "hit": True,
             "summary": summary,
         }
-    if (
-        ("how many" in q or "number of" in q or "count" in q)
-        and any(tok in q for tok in ["person", "people", "face", "faces", "individual"])
+    if ("how many" in q or "number of" in q or "count" in q) and any(
+        tok in q for tok in ["person", "people", "face", "faces", "individual"]
     ):
         minutes = _extract_minutes_from_query(q, default=5)
-        people_count, people_names = _collect_recent_people_signal(minutes=minutes, runtime_context=runtime_context, memory=memory)
+        people_count, people_names = _collect_recent_people_signal(
+            minutes=minutes, runtime_context=runtime_context, memory=memory
+        )
         if people_count <= 0:
             return {
                 "reply": f"I could not find person detections in the last {minutes} minutes.",
@@ -2157,11 +2219,19 @@ def _deterministic_chat_response(question: str, runtime_context: dict[str, Any])
                 "intent": "memory_recent",
                 "hit": True,
             }
-        return {"reply": f"No recent snapshots found in the last {minutes} minutes.", "intent": "memory_recent", "hit": False}
+        return {
+            "reply": f"No recent snapshots found in the last {minutes} minutes.",
+            "intent": "memory_recent",
+            "hit": False,
+        }
     if "last see" in q or "last seen" in q:
         target = core._extract_last_seen_target(question)
         if not target:
-            return {"reply": "Please specify who or what you want to look up.", "intent": "last_seen", "hit": False}
+            return {
+                "reply": "Please specify who or what you want to look up.",
+                "intent": "last_seen",
+                "hit": False,
+            }
         db = core.FaceDB.load()
         known = {n.lower() for n in db.names}
         if target.lower() in known:
@@ -2175,7 +2245,11 @@ def _deterministic_chat_response(question: str, runtime_context: dict[str, Any])
                     "intent": "person_last_seen",
                     "hit": True,
                 }
-            return {"reply": f"I could not find recent sightings for '{target}'.", "intent": "person_last_seen", "hit": False}
+            return {
+                "reply": f"I could not find recent sightings for '{target}'.",
+                "intent": "person_last_seen",
+                "hit": False,
+            }
         row = memory.find_object_last_seen(target)
         if row:
             return {
@@ -2186,13 +2260,21 @@ def _deterministic_chat_response(question: str, runtime_context: dict[str, Any])
                 "intent": "object_last_seen",
                 "hit": True,
             }
-        return {"reply": f"I could not find object '{target}' in memory.", "intent": "object_last_seen", "hit": False}
+        return {
+            "reply": f"I could not find object '{target}' in memory.",
+            "intent": "object_last_seen",
+            "hit": False,
+        }
     if "who is present" in q or "who was present" in q:
         people = runtime_context.get("people", [])
         if people:
             names = sorted({str(p) for p in people if str(p).strip()})
             if names:
-                return {"reply": "Currently visible: " + ", ".join(names), "intent": "presence", "hit": True}
+                return {
+                    "reply": "Currently visible: " + ", ".join(names),
+                    "intent": "presence",
+                    "hit": True,
+                }
         return {"reply": core._answer_current_presence(), "intent": "presence", "hit": True}
     if "looking at" in q or "look at" in q:
         db = core.FaceDB.load()
@@ -2226,14 +2308,22 @@ def _queue_chat_summary_events(result: dict[str, Any]) -> None:
     if isinstance(result.get("summary"), dict):
         summary_payload = result.get("summary")
     executed = result.get("executed_action")
-    if summary_payload is None and isinstance(executed, dict) and isinstance(executed.get("summary"), dict):
+    if (
+        summary_payload is None
+        and isinstance(executed, dict)
+        and isinstance(executed.get("summary"), dict)
+    ):
         summary_payload = executed.get("summary")
     if isinstance(summary_payload, dict):
         MANAGER._publish_event("summary_result", summary_payload)
     snapshot_payload = None
     if isinstance(result.get("snapshot"), dict):
         snapshot_payload = result.get("snapshot")
-    if snapshot_payload is None and isinstance(executed, dict) and isinstance(executed.get("snapshot"), dict):
+    if (
+        snapshot_payload is None
+        and isinstance(executed, dict)
+        and isinstance(executed.get("snapshot"), dict)
+    ):
         snapshot_payload = executed.get("snapshot")
     if isinstance(snapshot_payload, dict):
         MANAGER._publish_event(
@@ -2506,7 +2596,9 @@ def api_chat_query(req: ChatRequest) -> dict[str, Any]:
     else:
         requested_action = _parse_requested_action(q)
         if requested_action is not None:
-            confirm_action_id = CHAT_SESSIONS.propose_action(session_id, requested_action, ttl_sec=CHAT_CONFIRM_TTL_SEC)
+            confirm_action_id = CHAT_SESSIONS.propose_action(
+                session_id, requested_action, ttl_sec=CHAT_CONFIRM_TTL_SEC
+            )
             proposed_action = {
                 **requested_action,
                 "confirm_action_id": confirm_action_id,
@@ -2514,10 +2606,7 @@ def api_chat_query(req: ChatRequest) -> dict[str, Any]:
             }
             intent = "action_proposal"
             action = str(requested_action.get("type", "none"))
-            reply = (
-                f"I can {_proposal_text(requested_action)}. "
-                f"Please confirm to proceed."
-            )
+            reply = f"I can {_proposal_text(requested_action)}. Please confirm to proceed."
             core._append_metric(
                 "chat_action_proposed",
                 {
@@ -2587,7 +2676,10 @@ def api_chat_query(req: ChatRequest) -> dict[str, Any]:
                 "source": "chat",
                 "minutes": _safe_int(summary_payload.get("minutes"), 5),
                 "result_lines": str(reply).count("\n") + 1,
-                "hit": bool(summary_payload.get("top_attention_pairs") or summary_payload.get("snapshots_total")),
+                "hit": bool(
+                    summary_payload.get("top_attention_pairs")
+                    or summary_payload.get("snapshots_total")
+                ),
             },
         )
     result = {

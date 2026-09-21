@@ -54,7 +54,9 @@ class ServerBackendTests(unittest.TestCase):
 
     def test_stream_generator_uses_frame_store_only(self):
         # If stream path accidentally touches core inference stack, this will fail.
-        with mock.patch.object(self.server, "_core", side_effect=AssertionError("core should not be called")):
+        with mock.patch.object(
+            self.server, "_core", side_effect=AssertionError("core should not be called")
+        ):
             gen = self.server.build_video_stream_generator()
             data = asyncio.run(gen.__anext__())
             asyncio.run(gen.aclose())
@@ -103,12 +105,19 @@ class ServerBackendTests(unittest.TestCase):
 
         def rec(level, exc=None, msg="ok"):
             return logging.LogRecord(
-                name="uvicorn.error", level=level, pathname=__file__, lineno=0,
-                args=(), msg=msg, exc_info=exc,
+                name="uvicorn.error",
+                level=level,
+                pathname=__file__,
+                lineno=0,
+                args=(),
+                msg=msg,
+                exc_info=exc,
             )
 
         cancelled = asyncio.CancelledError("queue.get cancelled during shutdown")
-        benign = rec(logging.ERROR, exc=(asyncio.CancelledError, cancelled, cancelled.__traceback__))
+        benign = rec(
+            logging.ERROR, exc=(asyncio.CancelledError, cancelled, cancelled.__traceback__)
+        )
         self.assertFalse(flt.filter(benign), "benign CancelledError record must be dropped")
 
         real_fail = rec(logging.ERROR, exc=(RuntimeError, RuntimeError("camera exploded"), None))
@@ -118,19 +127,33 @@ class ServerBackendTests(unittest.TestCase):
         self.assertFalse(flt.filter(plain_msg), "formatted CancelledError text must be dropped")
 
         cancelled_msg = asyncio.CancelledError("queue.get cancelled during shutdown")
-        with_message = rec(logging.ERROR, exc=(asyncio.CancelledError, cancelled_msg, cancelled_msg.__traceback__))
-        self.assertFalse(flt.filter(with_message), "CancelledError with a message must also be dropped")
+        with_message = rec(
+            logging.ERROR, exc=(asyncio.CancelledError, cancelled_msg, cancelled_msg.__traceback__)
+        )
+        self.assertFalse(
+            flt.filter(with_message), "CancelledError with a message must also be dropped"
+        )
 
         kb = rec(logging.ERROR, exc=(KeyboardInterrupt, KeyboardInterrupt(), None))
         self.assertFalse(flt.filter(kb), "bare KeyboardInterrupt record must be dropped")
 
-        mentions = rec(logging.ERROR, msg="upload failed after CancelledError occurred mid-transfer")
+        mentions = rec(
+            logging.ERROR, msg="upload failed after CancelledError occurred mid-transfer"
+        )
         self.assertTrue(flt.filter(mentions), "text that merely mentions the name must pass")
 
-        looks_cancelled = rec(logging.ERROR, msg="Exception in ASGI application\nTraceback ...\nasyncio.exceptions.CancelledError")
-        self.assertFalse(flt.filter(looks_cancelled), "message-embedded traceback ending in CancelledError must be dropped")
+        looks_cancelled = rec(
+            logging.ERROR,
+            msg="Exception in ASGI application\nTraceback ...\nasyncio.exceptions.CancelledError",
+        )
+        self.assertFalse(
+            flt.filter(looks_cancelled),
+            "message-embedded traceback ending in CancelledError must be dropped",
+        )
 
-        info_rec = rec(logging.INFO, exc=(asyncio.CancelledError, cancelled, cancelled.__traceback__))
+        info_rec = rec(
+            logging.INFO, exc=(asyncio.CancelledError, cancelled, cancelled.__traceback__)
+        )
         self.assertTrue(flt.filter(info_rec), "non-ERROR records must always pass")
 
     def test_api_status_schema(self):
@@ -157,7 +180,9 @@ class ServerBackendTests(unittest.TestCase):
                     manager_self._thread = None
             manager_self._set_pipeline_state(mode="idle", running=False, degraded=False)
 
-        with mock.patch.object(self.server.PipelineManager, "_run_monitor_worker", _fake_monitor_worker):
+        with mock.patch.object(
+            self.server.PipelineManager, "_run_monitor_worker", _fake_monitor_worker
+        ):
             with TestClient(self.server.app) as client:
                 started = client.post("/api/v1/monitor/start", json={})
                 self.assertEqual(started.status_code, 200)
@@ -183,7 +208,9 @@ class ServerBackendTests(unittest.TestCase):
         self.server.MANAGER.frame_store.clear()
         self.server.MANAGER.frame_store.update(jpeg)
 
-        with mock.patch.object(self.server, "_core", side_effect=AssertionError("core should not be called")):
+        with mock.patch.object(
+            self.server, "_core", side_effect=AssertionError("core should not be called")
+        ):
             g1 = self.server.build_video_stream_generator()
             g2 = self.server.build_video_stream_generator()
             c1 = asyncio.run(g1.__anext__())
@@ -199,7 +226,9 @@ class ServerBackendTests(unittest.TestCase):
         self.server.MANAGER.frame_store.clear()
         self.server.MANAGER.frame_store.update(raw)
 
-        with mock.patch.object(self.server, "_encode_jpeg", side_effect=AssertionError("should not encode in stream")):
+        with mock.patch.object(
+            self.server, "_encode_jpeg", side_effect=AssertionError("should not encode in stream")
+        ):
             gen = self.server.build_video_stream_generator()
             chunk = asyncio.run(gen.__anext__())
             asyncio.run(gen.aclose())
@@ -210,8 +239,9 @@ class ServerBackendTests(unittest.TestCase):
         self.server.MANAGER.frame_store.clear()
         self.server.MANAGER.frame_store.update(raw)
 
-        with mock.patch.object(self.server, "MJPEG_KEEPALIVE_SEC", 0.0), mock.patch.object(
-            self.server, "FRAME_WAIT_IDLE_SEC", 0.0
+        with (
+            mock.patch.object(self.server, "MJPEG_KEEPALIVE_SEC", 0.0),
+            mock.patch.object(self.server, "FRAME_WAIT_IDLE_SEC", 0.0),
         ):
             gen = self.server.build_video_stream_generator()
             first = asyncio.run(gen.__anext__())
@@ -233,7 +263,9 @@ class ServerBackendTests(unittest.TestCase):
             time.sleep(0.02)
             manager_self._mark_startup_failed("startup_timeout_no_frames")
 
-        with mock.patch.object(self.server.PipelineManager, "_run_monitor_worker", _fake_monitor_worker):
+        with mock.patch.object(
+            self.server.PipelineManager, "_run_monitor_worker", _fake_monitor_worker
+        ):
             with TestClient(self.server.app) as client:
                 started = client.post("/api/v1/monitor/start", json={})
                 self.assertEqual(started.status_code, 200)
@@ -307,8 +339,11 @@ class ServerBackendTests(unittest.TestCase):
                 }
             ]
         }
-        with mock.patch.object(self.server, "_build_chat_grounding", return_value=fake_grounding), mock.patch.object(
-            self.server, "_query_groq_grounded", return_value=("Grounded answer [C1].", True)
+        with (
+            mock.patch.object(self.server, "_build_chat_grounding", return_value=fake_grounding),
+            mock.patch.object(
+                self.server, "_query_groq_grounded", return_value=("Grounded answer [C1].", True)
+            ),
         ):
             with TestClient(self.server.app) as client:
                 first = client.post("/api/v1/chat/query", json={"message": "hello"}).json()
@@ -343,8 +378,17 @@ class ServerBackendTests(unittest.TestCase):
             self.assertFalse(invalid.get("hit"))
 
     def test_chat_greeting_is_deterministic_without_groq(self):
-        with mock.patch.object(self.server, "_query_groq_grounded", side_effect=AssertionError("Groq should not be called")), mock.patch.object(
-            self.server, "_build_chat_grounding", side_effect=AssertionError("Grounding should not be called for greeting")
+        with (
+            mock.patch.object(
+                self.server,
+                "_query_groq_grounded",
+                side_effect=AssertionError("Groq should not be called"),
+            ),
+            mock.patch.object(
+                self.server,
+                "_build_chat_grounding",
+                side_effect=AssertionError("Grounding should not be called for greeting"),
+            ),
         ):
             with TestClient(self.server.app) as client:
                 row = client.post("/api/v1/chat/query", json={"message": "Hi"}).json()
@@ -392,10 +436,17 @@ class ServerBackendTests(unittest.TestCase):
             "face_rows": [],
         }
 
-        with mock.patch.object(self.server, "_load_metric_events", return_value=fake_events), mock.patch.object(
-            self.server.MANAGER, "build_chat_runtime_context", return_value=fake_context
-        ), mock.patch.object(self.server, "_build_chat_grounding", return_value=fake_grounding), mock.patch.object(
-            self.server, "_query_groq_grounded", side_effect=AssertionError("Groq should not be called")
+        with (
+            mock.patch.object(self.server, "_load_metric_events", return_value=fake_events),
+            mock.patch.object(
+                self.server.MANAGER, "build_chat_runtime_context", return_value=fake_context
+            ),
+            mock.patch.object(self.server, "_build_chat_grounding", return_value=fake_grounding),
+            mock.patch.object(
+                self.server,
+                "_query_groq_grounded",
+                side_effect=AssertionError("Groq should not be called"),
+            ),
         ):
             with TestClient(self.server.app) as client:
                 row = client.post(

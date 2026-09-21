@@ -109,9 +109,7 @@ class DetectorParameterTests(unittest.TestCase):
         detector.detect(np.zeros((8, 8, 3), dtype=np.uint8))
 
         kwargs = model.call_kwargs[-1]
-        self.assertEqual(
-            set(kwargs), {"conf", "iou", "imgsz", "max_det", "agnostic_nms"}
-        )
+        self.assertEqual(set(kwargs), {"conf", "iou", "imgsz", "max_det", "agnostic_nms"})
         self.assertEqual(kwargs["conf"], common.YOLO_CONF_DEFAULT)
         self.assertEqual(kwargs["iou"], common.YOLO_IOU_DEFAULT)
         self.assertEqual(kwargs["imgsz"], common.YOLO_IMGSZ_DEFAULT)
@@ -302,9 +300,7 @@ class InScopeClassTests(unittest.TestCase):
         A denylist is the smallest change that acts on that evidence, and it
         cannot hide a class nobody named.
         """
-        detector = self._detector(
-            ["person", "surfboard", "remote"], excluded_classes="surfboard"
-        )
+        detector = self._detector(["person", "surfboard", "remote"], excluded_classes="surfboard")
         rows = detector.detect(np.zeros((8, 8, 3), dtype=np.uint8))
 
         self.assertEqual({r["label"] for r in rows}, {"person", "remote"})
@@ -313,7 +309,9 @@ class InScopeClassTests(unittest.TestCase):
 
     def test_exclusion_wins_over_inclusion(self):
         detector = self._detector(
-            ["person", "surfboard"], in_scope_classes="person,surfboard", excluded_classes="surfboard"
+            ["person", "surfboard"],
+            in_scope_classes="person,surfboard",
+            excluded_classes="surfboard",
         )
         rows = detector.detect(np.zeros((8, 8, 3), dtype=np.uint8))
 
@@ -348,9 +346,7 @@ class InScopeParsingTests(unittest.TestCase):
         self.assertEqual(common.normalize_in_scope_classes(["Person", " CELL PHONE "]), expected)
 
     def test_reads_the_environment_knob(self):
-        with mock.patch.dict(
-            os.environ, {"AI_STUDIO_YOLO_IN_SCOPE_CLASSES": "person, Bottle"}
-        ):
+        with mock.patch.dict(os.environ, {"AI_STUDIO_YOLO_IN_SCOPE_CLASSES": "person, Bottle"}):
             self.assertEqual(
                 common._env_class_list("AI_STUDIO_YOLO_IN_SCOPE_CLASSES"),
                 frozenset({"person", "bottle"}),

@@ -179,18 +179,14 @@ class CliRecognizeLoopTests(unittest.TestCase):
         )
         patches = [
             mock.patch.object(self.main, "cv2", self._fake_cv2(frames)),
-            mock.patch.object(
-                self.main, "FaceDB", _FakeEmptyFaceDB if empty_db else _FakeFaceDB
-            ),
+            mock.patch.object(self.main, "FaceDB", _FakeEmptyFaceDB if empty_db else _FakeFaceDB),
             mock.patch.object(self.main, "_try_build_face_app", return_value=face_app),
             mock.patch.object(self.main, "DualYoloDetector", return_value=fake_detector),
             mock.patch.object(self.main, "SceneMemoryManager", _FakeMemory),
             mock.patch.object(self.main, "_build_app", return_value=object()),
             mock.patch.object(self.main, "_open_camera", return_value=_FakeCap()),
             mock.patch.object(self.main, "_AsyncCameraReader", return_value=reader),
-            mock.patch.object(
-                self.main, "_detect", side_effect=lambda _app, _frame: [face]
-            ),
+            mock.patch.object(self.main, "_detect", side_effect=lambda _app, _frame: [face]),
             mock.patch.object(self.main, "_estimate_gaze_points", new=fake_gaze),
             mock.patch.object(self.main, "_load_gaze_runtime", return_value=gaze_return),
             mock.patch.object(self.main, "_print_runtime_help", return_value=None),
@@ -220,7 +216,9 @@ class CliRecognizeLoopTests(unittest.TestCase):
 
         payload = self._session(appended)
         self.assertIsNotNone(payload, "the CLI never reached its session summary")
-        self.assertEqual(payload["schema_version"], importlib.import_module("common").SESSION_SCHEMA_VERSION)
+        self.assertEqual(
+            payload["schema_version"], importlib.import_module("common").SESSION_SCHEMA_VERSION
+        )
 
         aggregate = payload["aggregate"]
         self.assertEqual(set(aggregate), set(self.main.SESSION_AGGREGATE_KEYS))

@@ -255,7 +255,9 @@ def parse_verdicts(payload: Any) -> list[Verdict]:
         decided = _as_bool(value)
         if decided is None:
             continue
-        verdicts.append(Verdict(index=index, correct=decided, missed=tuple(missed_by_index.get(index, ()))))
+        verdicts.append(
+            Verdict(index=index, correct=decided, missed=tuple(missed_by_index.get(index, ())))
+        )
     verdicts.sort(key=lambda v: v.index)
     return verdicts
 
@@ -704,18 +706,26 @@ def format_score(score: ReviewScore) -> str:
     lines: list[str] = []
     if score.reviewed == 0:
         lines.append("Nothing reviewed yet: no verdicts recorded.")
-        lines.append("  Open the review page, mark boxes Correct/Wrong, then Download verdicts.json.")
+        lines.append(
+            "  Open the review page, mark boxes Correct/Wrong, then Download verdicts.json."
+        )
         return "\n".join(lines)
 
-    lines.append(f"Reviewed {score.reviewed} of {score.total} detection(s)  (coverage {score.coverage * 100:.0f}%)")
-    lines.append(f"Precision: {score.precision:.3f}  ({score.correct} correct, {score.wrong} wrong)")
+    lines.append(
+        f"Reviewed {score.reviewed} of {score.total} detection(s)  (coverage {score.coverage * 100:.0f}%)"
+    )
+    lines.append(
+        f"Precision: {score.precision:.3f}  ({score.correct} correct, {score.wrong} wrong)"
+    )
     if score.interval is not None:
         low, high = score.interval
         lines.append(
             f"  95% Wilson interval {low:.3f}-{high:.3f}  (a subset was reviewed, so this is a sample)"
         )
     else:
-        lines.append("  every detection was reviewed, so this is a census of these frames - no sampling error")
+        lines.append(
+            "  every detection was reviewed, so this is a census of these frames - no sampling error"
+        )
 
     lines.append("")
     lines.append(f"{'label':<18}{'reviewed':>9}{'correct':>9}{'wrong':>7}{'precision':>11}")
@@ -735,7 +745,9 @@ def format_score(score: ReviewScore) -> str:
 
     if score.misses:
         lines.append("")
-        lines.append(f"Objects the reviewer saw but nothing was boxed around ({len(score.misses)}):")
+        lines.append(
+            f"Objects the reviewer saw but nothing was boxed around ({len(score.misses)}):"
+        )
         for frame, note in score.misses[:20]:
             lines.append(f"  {Path(frame).name}: {note}")
         if len(score.misses) > 20:

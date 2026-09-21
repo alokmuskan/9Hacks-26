@@ -161,7 +161,9 @@ class SceneMemoryManager:
             self._torch = torch
 
             clip_arch = "ViT-B-32-quickgelu"
-            model, _, preprocess = open_clip.create_model_and_transforms(clip_arch, pretrained="openai")
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                clip_arch, pretrained="openai"
+            )
             device = "cuda" if torch.cuda.is_available() else "cpu"
             self._clip_model = model.to(device)
             self._clip_model.eval()
@@ -342,8 +344,7 @@ class SceneMemoryManager:
                 {
                     str(row.get("name"))
                     for row in face_rows
-                    if str(row.get("name", "")).strip()
-                    and str(row.get("name")) != "Unknown"
+                    if str(row.get("name", "")).strip() and str(row.get("name")) != "Unknown"
                 }
             )
 

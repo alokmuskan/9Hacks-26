@@ -22,7 +22,9 @@ class SceneMemoryWriteIntegrityTests(unittest.TestCase):
     def test_entry_from_another_instance_survives_worker_write(self):
         with tempfile.TemporaryDirectory() as td:
             frame = np.zeros((16, 16, 3), dtype=np.uint8)
-            worker = SceneMemoryManager(base_dir=td, snapshot_interval_sec=15.0, enable_vectors=False)
+            worker = SceneMemoryManager(
+                base_dir=td, snapshot_interval_sec=15.0, enable_vectors=False
+            )
             worker.save_snapshot(frame, [{"label": "laptop"}], current_time=1.0, manual=False)
 
             # A per-request handler instance, exactly as the API layer builds one.
@@ -56,7 +58,9 @@ class SceneMemoryWriteIntegrityTests(unittest.TestCase):
     def test_long_lived_instance_picks_up_entries_written_elsewhere(self):
         with tempfile.TemporaryDirectory() as td:
             frame = np.zeros((16, 16, 3), dtype=np.uint8)
-            worker = SceneMemoryManager(base_dir=td, snapshot_interval_sec=15.0, enable_vectors=False)
+            worker = SceneMemoryManager(
+                base_dir=td, snapshot_interval_sec=15.0, enable_vectors=False
+            )
             worker.save_snapshot(frame, [{"label": "laptop"}], current_time=1.0)
 
             other = SceneMemoryManager(base_dir=td, enable_vectors=False)
@@ -131,6 +135,7 @@ class MetricsLogWriteIntegrityTests(unittest.TestCase):
             original = self.main.METRICS_LOG_PATH
             self.main.METRICS_LOG_PATH = path
             try:
+
                 def write_rows(worker_id):
                     for index in range(25):
                         self.main._append_metric(

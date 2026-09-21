@@ -159,9 +159,7 @@ class IncidentCaptureRaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             directory = Path(td)
             with mock.patch.object(self.core, "UNKNOWN_INCIDENTS_DIR", directory):
-                path = self.core._save_unknown_snapshot(
-                    self.frame, self.bboxes, datetime.now(UTC)
-                )
+                path = self.core._save_unknown_snapshot(self.frame, self.bboxes, datetime.now(UTC))
 
             self.assertTrue(Path(path).exists())
             self.assertEqual(Path(path).parent, directory)

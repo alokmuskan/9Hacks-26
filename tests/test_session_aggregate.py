@@ -144,9 +144,13 @@ class SessionAggregateContractTests(unittest.TestCase):
         self.assertAlmostEqual(aggregate["behavior_attention_total_sec"], 30.0, places=6)
         self.assertEqual(aggregate["behavior_events_count"], 7)
         self.assertEqual(aggregate["behavior_top_objects"], [["laptop", 20.0]])
-        self.assertAlmostEqual(aggregate["behavior_activity_patterns"]["transitions_per_min"], 4.0, places=6)
+        self.assertAlmostEqual(
+            aggregate["behavior_activity_patterns"]["transitions_per_min"], 4.0, places=6
+        )
         self.assertEqual(aggregate["behavior_activity_patterns"]["unique_attended_objects"], 1)
-        self.assertAlmostEqual(aggregate["behavior_activity_patterns"]["focus_ratio"], 0.5, places=6)
+        self.assertAlmostEqual(
+            aggregate["behavior_activity_patterns"]["focus_ratio"], 0.5, places=6
+        )
 
     def test_timelines_are_truncated_to_the_last_twenty_buckets(self):
         timeline = {f"10:00:{index:02d}": index for index in range(30)}

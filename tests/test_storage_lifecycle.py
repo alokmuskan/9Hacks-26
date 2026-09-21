@@ -141,9 +141,7 @@ class SnapshotRetentionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             manager = self._manager(td, 1)
             for index in range(4):
-                manager.save_snapshot(
-                    self._frame(), [], current_time=200.0 + index, manual=True
-                )
+                manager.save_snapshot(self._frame(), [], current_time=200.0 + index, manual=True)
             manager.save_snapshot(self._frame(), [], current_time=300.0)
 
             rows = json.loads((Path(td) / "metadata.json").read_text(encoding="utf-8"))
@@ -158,9 +156,7 @@ class SnapshotRetentionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             writer = self._manager(td, 2)
             for index in range(3):
-                self._manager(td, 2).save_snapshot(
-                    self._frame(), [], current_time=400.0 + index
-                )
+                self._manager(td, 2).save_snapshot(self._frame(), [], current_time=400.0 + index)
 
             rows = json.loads((Path(td) / "metadata.json").read_text(encoding="utf-8"))
             images = sorted((Path(td) / "snapshots").glob("*.jpg"))
@@ -230,7 +226,14 @@ class IncidentRetentionTests(unittest.TestCase):
             self.assertEqual(removed, 6)
             self.assertEqual(len(remaining), 4)
             self.assertTrue(
-                all("05" in path.name or "06" in path.name or "07" in path.name or "08" in path.name or "09" in path.name for path in remaining)
+                all(
+                    "05" in path.name
+                    or "06" in path.name
+                    or "07" in path.name
+                    or "08" in path.name
+                    or "09" in path.name
+                    for path in remaining
+                )
             )
 
     def test_prune_is_a_noop_below_the_cap(self):

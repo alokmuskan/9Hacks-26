@@ -13,7 +13,9 @@ from pathlib import Path
 import detection_review as dr
 
 
-def _detection(index: int, label: str = "person", confidence: float = 0.5, frame: str = "frames/a.jpg") -> dr.Detection:
+def _detection(
+    index: int, label: str = "person", confidence: float = 0.5, frame: str = "frames/a.jpg"
+) -> dr.Detection:
     return dr.Detection(
         index=index,
         frame=frame,
@@ -252,7 +254,9 @@ class FingerprintTests(unittest.TestCase):
     def test_matching_ids_are_accepted(self):
         rows = [_detection(1)]
 
-        self.assertIsNone(dr.fingerprint_mismatch(dr.fingerprint(rows), {"fingerprint": dr.fingerprint(rows)}))
+        self.assertIsNone(
+            dr.fingerprint_mismatch(dr.fingerprint(rows), {"fingerprint": dr.fingerprint(rows)})
+        )
 
     def test_verdicts_from_another_list_are_refused_by_name(self):
         message = dr.fingerprint_mismatch("aaaaaaaaaaaaaaaa", {"fingerprint": "bbbbbbbbbbbbbbbb"})

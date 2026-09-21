@@ -101,7 +101,9 @@ def find_latest_custom_model() -> str | None:
     if not candidates:
         return None
 
-    return str(max((Path(p) for p in candidates if Path(p).exists()), key=lambda p: p.stat().st_mtime))
+    return str(
+        max((Path(p) for p in candidates if Path(p).exists()), key=lambda p: p.stat().st_mtime)
+    )
 
 
 def normalize_yolo_boxes(

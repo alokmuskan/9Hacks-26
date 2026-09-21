@@ -15,8 +15,18 @@ class BehaviorSummaryChatTests(unittest.TestCase):
         main = importlib.import_module("main")
 
         rows = [
-            {"label": "laptop", "confidence": 0.7, "bbox": np.array([40, 40, 80, 80]), "source": "general"},
-            {"label": "phone", "confidence": 0.9, "bbox": np.array([100, 100, 120, 120]), "source": "custom"},
+            {
+                "label": "laptop",
+                "confidence": 0.7,
+                "bbox": np.array([40, 40, 80, 80]),
+                "source": "general",
+            },
+            {
+                "label": "phone",
+                "confidence": 0.9,
+                "bbox": np.array([100, 100, 120, 120]),
+                "source": "custom",
+            },
         ]
         inside = main._infer_gaze_target((50, 50, 0.1, 0.2), rows)
         self.assertIsNotNone(inside)
@@ -36,7 +46,9 @@ class BehaviorSummaryChatTests(unittest.TestCase):
     def test_behavior_tracker_emits_transitions_and_durations(self):
         _install_stubs()
         main = importlib.import_module("main")
-        tracker = main._BehaviorTracker(smoothing_window=3, switch_confirmation=2, lost_timeout_sec=1.0)
+        tracker = main._BehaviorTracker(
+            smoothing_window=3, switch_confirmation=2, lost_timeout_sec=1.0
+        )
 
         emitted = []
         emitted.extend(tracker.update({"Your Name": "laptop"}, 0.0))
@@ -71,7 +83,12 @@ class BehaviorSummaryChatTests(unittest.TestCase):
             main.METRICS_LOG_PATH = metrics_path
             main.MEMORY_DIR = memory_dir
             main.DB_PATH = base / "face_db.npz"
-            np.savez_compressed(main.DB_PATH, names=np.array(["Your Name"]), centroids=np.zeros((1, 4), np.float32), counts=np.array([1], np.int32))
+            np.savez_compressed(
+                main.DB_PATH,
+                names=np.array(["Your Name"]),
+                centroids=np.zeros((1, 4), np.float32),
+                counts=np.array([1], np.int32),
+            )
 
             try:
                 now = main._now_utc().isoformat()
@@ -113,7 +130,11 @@ class BehaviorSummaryChatTests(unittest.TestCase):
                 self.assertIn("In the last 5 minutes", result["answer"])
                 self.assertFalse(result["used_llm"])
 
-                logs = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                logs = [
+                    json.loads(line)
+                    for line in metrics_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
                 event_types = [row.get("event_type") for row in logs]
                 self.assertIn("chat_query", event_types)
                 self.assertIn("summary_query", event_types)
@@ -134,7 +155,12 @@ class BehaviorSummaryChatTests(unittest.TestCase):
             main.METRICS_LOG_PATH = base / "metrics.jsonl"
             main.MEMORY_DIR = base / "memory"
             main.DB_PATH = base / "face_db.npz"
-            np.savez_compressed(main.DB_PATH, names=np.array([]), centroids=np.empty((0, 4), np.float32), counts=np.empty((0,), np.int32))
+            np.savez_compressed(
+                main.DB_PATH,
+                names=np.array([]),
+                centroids=np.empty((0, 4), np.float32),
+                counts=np.empty((0,), np.int32),
+            )
             try:
                 blocked = main._handle_chat_query("take snapshot")
                 self.assertEqual(blocked["intent"], "snapshot")
@@ -147,10 +173,32 @@ class BehaviorSummaryChatTests(unittest.TestCase):
                     runtime_context={
                         "memory": memory,
                         "frame": frame,
-                        "object_rows": [{"label": "laptop", "confidence": 0.9, "bbox": [0, 0, 8, 8], "source": "general"}],
-                        "face_rows": [{"name": "Your Name", "confidence": 0.7, "bbox": [1, 1, 10, 10], "gaze": None, "target_object": None}],
+                        "object_rows": [
+                            {
+                                "label": "laptop",
+                                "confidence": 0.9,
+                                "bbox": [0, 0, 8, 8],
+                                "source": "general",
+                            }
+                        ],
+                        "face_rows": [
+                            {
+                                "name": "Your Name",
+                                "confidence": 0.7,
+                                "bbox": [1, 1, 10, 10],
+                                "gaze": None,
+                                "target_object": None,
+                            }
+                        ],
                         "people": ["Your Name"],
-                        "attention_rows": [{"name": "Your Name", "target_object": "laptop", "method": "inside", "distance_px": 0.0}],
+                        "attention_rows": [
+                            {
+                                "name": "Your Name",
+                                "target_object": "laptop",
+                                "method": "inside",
+                                "distance_px": 0.0,
+                            }
+                        ],
                     },
                 )
                 self.assertEqual(result["action"], "snapshot")

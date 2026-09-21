@@ -33,6 +33,7 @@ def _unavailable(test: unittest.TestCase, reason: str) -> None:
         raise AssertionError(f"real inference was required but unavailable: {reason}")
     test.skipTest(reason)
 
+
 #: One point in the parameter space. This is the *detector's* type, re-exported
 #: rather than redefined — see `object_detection.DetectorConfig`.
 DetectorConfig = detection_bench.DetectorConfig
@@ -122,17 +123,23 @@ class FrameClassificationTests(_RealInferenceMixin, unittest.TestCase):
         self.assertEqual(row.name, "dark.jpg")
 
     def test_small_frame_is_rejected(self):
-        row = detection_bench.classify_frame("thumb.jpg", height=64, brightness=120.0, sharpness=90.0)
+        row = detection_bench.classify_frame(
+            "thumb.jpg", height=64, brightness=120.0, sharpness=90.0
+        )
         self.assertFalse(row.usable)
         self.assertEqual(row.reason, "too_small")
 
     def test_blurred_frame_is_rejected(self):
-        row = detection_bench.classify_frame("blur.jpg", height=480, brightness=120.0, sharpness=3.0)
+        row = detection_bench.classify_frame(
+            "blur.jpg", height=480, brightness=120.0, sharpness=3.0
+        )
         self.assertFalse(row.usable)
         self.assertEqual(row.reason, "blurred")
 
     def test_well_lit_textured_frame_is_usable(self):
-        row = detection_bench.classify_frame("good.jpg", height=480, brightness=168.5, sharpness=254.4)
+        row = detection_bench.classify_frame(
+            "good.jpg", height=480, brightness=168.5, sharpness=254.4
+        )
         self.assertTrue(row.usable)
         self.assertEqual(row.reason, "")
 
@@ -321,9 +328,7 @@ class ParamGridTests(unittest.TestCase):
 
     def test_params_carry_the_full_kwarg_set(self):
         kwargs = DetectorConfig().as_kwargs()
-        self.assertEqual(
-            set(kwargs), {"conf", "imgsz", "iou", "max_det", "agnostic_nms"}
-        )
+        self.assertEqual(set(kwargs), {"conf", "imgsz", "iou", "max_det", "agnostic_nms"})
 
     def test_a_grid_point_inherits_the_configured_nms_settings(self):
         """The benchmark and the live detector must not disagree about NMS.
@@ -394,7 +399,14 @@ class ReportTests(unittest.TestCase):
 
     def test_report_states_when_nothing_was_detected(self):
         text = detection_bench.format_report(
-            [{"label": "conf=0.25 imgsz=640", "ms_per_frame": 90.0, "classes": {}, "reference_recall": 0.0}]
+            [
+                {
+                    "label": "conf=0.25 imgsz=640",
+                    "ms_per_frame": 90.0,
+                    "classes": {},
+                    "reference_recall": 0.0,
+                }
+            ]
         )
         self.assertIn("(no detections)", text)
 

@@ -236,11 +236,7 @@ def latency_stats(frame_ms: Sequence[float]) -> dict[str, float]:
 
     ordered = sorted(values)
     middle = len(ordered) // 2
-    median = (
-        ordered[middle]
-        if len(ordered) % 2
-        else (ordered[middle - 1] + ordered[middle]) / 2.0
-    )
+    median = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2.0
     rest = values[1:]
     return {
         "frames": float(len(values)),

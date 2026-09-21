@@ -119,9 +119,7 @@ class UntimedStageTests(unittest.TestCase):
         self.assertEqual(budget.objects.cell, fb.DISABLED)
 
     def test_face_detection_with_no_recorded_latency_is_not_zero(self):
-        budget, _ = fb.build_budget(
-            _row(detection_calls=100, avg_detection_latency_ms=0.0)
-        )
+        budget, _ = fb.build_budget(_row(detection_calls=100, avg_detection_latency_ms=0.0))
 
         assert budget is not None
         self.assertIsNone(budget.face.ms)
@@ -319,7 +317,9 @@ class CollectionTests(unittest.TestCase):
 
         budget_set = fb.collect_budgets(rows, limit=2)
 
-        self.assertEqual([b.session_id for b in budget_set.budgets], ["monitor-test-03", "monitor-test-04"])
+        self.assertEqual(
+            [b.session_id for b in budget_set.budgets], ["monitor-test-03", "monitor-test-04"]
+        )
 
     def test_an_unmeasured_session_is_named_in_the_report(self):
         rows = [_row(), _row(session_id="monitor-test-empty", frames_total=0)]

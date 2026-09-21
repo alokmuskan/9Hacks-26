@@ -103,6 +103,11 @@ jobs:
       - name: Ruff
         run: ruff check .
 
+      # The codebase was reformatted in one commit so this could be turned on; a
+      # future edit that is not formatted now fails here instead of drifting.
+      - name: Ruff format
+        run: ruff format --check .
+
       # Configuration lives in mypy.ini. main.py is currently opted out there, with
       # the reason and the remaining finding count documented in that file.
       - name: Mypy

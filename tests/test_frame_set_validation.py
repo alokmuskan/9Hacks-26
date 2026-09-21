@@ -227,7 +227,9 @@ class StructureTests(FrameSetTestCase):
     def test_a_label_without_an_image_is_an_orphan(self):
         builder = self.build()
         builder.frame(_stem(1), "person 0.5 0.5 0.2 0.4\n")
-        (builder.labels / f"{_stem(2)}.txt").write_text("person 0.5 0.5 0.2 0.4\n", encoding="utf-8")
+        (builder.labels / f"{_stem(2)}.txt").write_text(
+            "person 0.5 0.5 0.2 0.4\n", encoding="utf-8"
+        )
 
         report = builder.validate(targets=["person"])
 

@@ -101,9 +101,7 @@ GAZE_WEIGHTS_MIRROR_URL = (
     "https://huggingface.co/py-feat/l2cs/resolve/main/l2cs_gaze360_resnet50.safetensors"
 )
 GAZE_WEIGHTS_MIRROR_SIZE = 95_773_960
-GAZE_WEIGHTS_MIRROR_SHA256 = (
-    "75405bdc01f7086b3887280fe50c28a14bc62463a53fa749781e4a3cf98eca0e"
-)
+GAZE_WEIGHTS_MIRROR_SHA256 = "75405bdc01f7086b3887280fe50c28a14bc62463a53fa749781e4a3cf98eca0e"
 GAZE_EMA_ALPHA = 0.10
 GAZE_RECOVERY_STREAK_MIN = common.GAZE_RECOVERY_STREAK_MIN
 GAZE_OBJECT_HIT_PADDING_PX = 8.0
@@ -777,9 +775,7 @@ def _download_gaze_weights_from_mirror(destination: Path) -> Path | None:
         return None
 
     if len(buffer) != GAZE_WEIGHTS_MIRROR_SIZE:
-        print(
-            f"[GAZE] Mirror download truncated ({len(buffer)} != {GAZE_WEIGHTS_MIRROR_SIZE})"
-        )
+        print(f"[GAZE] Mirror download truncated ({len(buffer)} != {GAZE_WEIGHTS_MIRROR_SIZE})")
         return None
     digest = hashlib.sha256(bytes(buffer)).hexdigest()
     if digest != GAZE_WEIGHTS_MIRROR_SHA256:
@@ -892,7 +888,9 @@ def _resolve_l2cs_weights_path(
 
     # Fast local fallback: discover nested gaze360 checkpoints under the same base directory.
     if not force_download:
-        local_candidates = list(weights_path.parent.rglob("*.pkl")) if weights_path.parent.exists() else []
+        local_candidates = (
+            list(weights_path.parent.rglob("*.pkl")) if weights_path.parent.exists() else []
+        )
         local_selected = _select_gaze360_weight_path(
             [str(p) for p in local_candidates], preferred_arch=preferred_arch
         )
@@ -927,7 +925,9 @@ def _resolve_l2cs_weights_path(
 
     if not candidate_paths:
         candidate_paths = list(weights_path.parent.rglob("*.pkl"))
-    selected = _select_gaze360_weight_path([str(p) for p in candidate_paths], preferred_arch=preferred_arch)
+    selected = _select_gaze360_weight_path(
+        [str(p) for p in candidate_paths], preferred_arch=preferred_arch
+    )
     if selected is not None and selected.exists():
         return selected.resolve()
 
@@ -985,7 +985,9 @@ def _align_face_from_landmarks(face_crop: np.ndarray, landmarks: np.ndarray | No
     try:
         mat = cv2.getRotationMatrix2D(center, angle, 1.0)
         border_mode = int(getattr(cv2, "BORDER_REPLICATE", 1))
-        return cv2.warpAffine(face_crop, mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=border_mode)
+        return cv2.warpAffine(
+            face_crop, mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=border_mode
+        )
     except Exception:
         return face_crop
 
@@ -1104,7 +1106,12 @@ def _load_gaze_runtime(
         inferred_arch = _infer_l2cs_arch_from_state_dict(state_dict)
 
         # If local/default weights don't match requested arch, try a forced arch-specific download once.
-        if inferred_arch is not None and inferred_arch != gaze_arch and gaze_auto_download and gdown_module is not None:
+        if (
+            inferred_arch is not None
+            and inferred_arch != gaze_arch
+            and gaze_auto_download
+            and gdown_module is not None
+        ):
             alt_path = _resolve_l2cs_weights_path(
                 weights_path=weights_path,
                 weights_source=gaze_weights_source,
@@ -1114,9 +1121,15 @@ def _load_gaze_runtime(
                 preferred_arch=gaze_arch,
                 force_download=True,
             )
-            if alt_path is not None and alt_path.exists() and alt_path.resolve() != resolved_path.resolve():
+            if (
+                alt_path is not None
+                and alt_path.exists()
+                and alt_path.resolve() != resolved_path.resolve()
+            ):
                 resolved_path = alt_path.resolve()
-                state_dict = _normalize_l2cs_state_dict(torch.load(str(resolved_path), map_location=device))
+                state_dict = _normalize_l2cs_state_dict(
+                    torch.load(str(resolved_path), map_location=device)
+                )
                 inferred_arch = _infer_l2cs_arch_from_state_dict(state_dict)
 
         if inferred_arch is not None and inferred_arch != gaze_arch:
@@ -1340,7 +1353,7 @@ class GazeScheduler:
 
 
 def _best_face(
-    faces: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None]]
+    faces: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None]],
 ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray | None] | None:
     return max(
         faces,
@@ -1711,8 +1724,7 @@ class _BehaviorTracker:
             "events_count": int(self.events_count),
             "attention_total_sec": round(float(sum(self.attention_sec.values())), 3),
             "interaction_counts": {
-                f"{person}|{obj}": int(count)
-                for (person, obj), count in self.interactions.items()
+                f"{person}|{obj}": int(count) for (person, obj), count in self.interactions.items()
             },
         }
 
@@ -1810,8 +1822,7 @@ def _build_situation_summary(minutes: int = 5, now_utc: datetime | None = None) 
             for (person, obj), sec in top_pairs[:10]
         ],
         "interaction_counts": {
-            f"{person}|{obj}": int(count)
-            for (person, obj), count in interaction_counts.items()
+            f"{person}|{obj}": int(count) for (person, obj), count in interaction_counts.items()
         },
         "snapshots_total": snapshots_total,
         "snapshots_manual": snapshots_manual,
@@ -1973,7 +1984,9 @@ def _answer_current_presence() -> str:
         agg = event.get("aggregate") if isinstance(event.get("aggregate"), dict) else {}
         active = agg.get("active_subjects")
         if isinstance(active, list) and active:
-            names = [str(row.get("name", UNKNOWN_LABEL)) for row in active[:8] if isinstance(row, dict)]
+            names = [
+                str(row.get("name", UNKNOWN_LABEL)) for row in active[:8] if isinstance(row, dict)
+            ]
             if names:
                 return "Currently visible: " + ", ".join(names)
         return "No known people are currently visible in the latest session state."
@@ -2033,7 +2046,11 @@ def _handle_chat_query(
     db = FaceDB.load()
     known_people = {n.lower() for n in db.names}
 
-    if ("what happened" in q and "minute" in q) or "recent activity" in q or "situation summary" in q:
+    if (
+        ("what happened" in q and "minute" in q)
+        or "recent activity" in q
+        or "situation summary" in q
+    ):
         intent = "session_summary"
         summary_minutes = _parse_minutes_from_text(q, default=5)
         summary_payload = _build_situation_summary(summary_minutes)
@@ -2044,7 +2061,10 @@ def _handle_chat_query(
                 "source": "chat",
                 "minutes": summary_minutes,
                 "result_lines": answer.count("\n") + 1,
-                "hit": bool(summary_payload.get("top_attention_pairs") or summary_payload.get("snapshots_total")),
+                "hit": bool(
+                    summary_payload.get("top_attention_pairs")
+                    or summary_payload.get("snapshots_total")
+                ),
             },
         )
     elif "memory status" in q or "memory stats" in q:
@@ -2180,7 +2200,9 @@ def _handle_chat_query(
 
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
-def _bracket_box(frame: np.ndarray, bbox: np.ndarray, color: tuple[int, int, int], thickness: int = 2) -> None:
+def _bracket_box(
+    frame: np.ndarray, bbox: np.ndarray, color: tuple[int, int, int], thickness: int = 2
+) -> None:
     x1, y1, x2, y2 = (int(v) for v in bbox)
     arm = max(12, int((x2 - x1) * 0.18))
     for pts in [
@@ -2451,7 +2473,8 @@ class SessionAggregateInput:
             "frame_period_p95_ms": round(percentile(periods, 0.95), 2),
             "faces_per_sec": round(ratio(detections_total, duration), 3),
             "avg_detection_latency_ms": round(
-                ratio(_safe_float(self.detection_latency_sum_ms), _safe_int(self.detection_calls)), 2
+                ratio(_safe_float(self.detection_latency_sum_ms), _safe_int(self.detection_calls)),
+                2,
             ),
             "min_detection_latency_ms": round(real_min(self.detection_latency_min_ms), 2),
             "max_detection_latency_ms": round(_safe_float(self.detection_latency_max_ms), 2),
@@ -2468,12 +2491,8 @@ class SessionAggregateInput:
                 _safe_float(self.object_detection_latency_max_ms), 2
             ),
             "avg_confidence": round(ratio(_safe_float(self.confidence_sum), detections_total), 4),
-            "recognition_rate": round(
-                ratio(_safe_int(self.known_detections), detections_total), 6
-            ),
-            "unknown_rate": round(
-                ratio(_safe_int(self.unknown_detections), detections_total), 6
-            ),
+            "recognition_rate": round(ratio(_safe_int(self.known_detections), detections_total), 6),
+            "unknown_rate": round(ratio(_safe_int(self.unknown_detections), detections_total), 6),
             "unknown_alert_events": _safe_int(self.unknown_alert_count),
             "unknown_alert_density_per_min": round(
                 ratio(_safe_int(self.unknown_alert_count), minutes), 3
@@ -2513,7 +2532,10 @@ class SessionAggregateInput:
             "gaze_target_fps_drop": _safe_float(self.gaze_target_fps_drop, 0.0),
             "gaze_inference_calls": _safe_int(self.gaze_inference_calls),
             "gaze_inference_avg_ms": round(
-                ratio(_safe_float(self.gaze_inference_sum_ms), _safe_int(self.gaze_inference_calls)), 2
+                ratio(
+                    _safe_float(self.gaze_inference_sum_ms), _safe_int(self.gaze_inference_calls)
+                ),
+                2,
             ),
             "gaze_inference_min_ms": round(real_min(self.gaze_inference_min_ms), 2),
             "gaze_inference_max_ms": round(_safe_float(self.gaze_inference_max_ms), 2),
@@ -2601,7 +2623,10 @@ def cmd_enroll(name: str, model: str) -> None:
                     status, sc = f"Hold still... {wait_left:.2f}s", TEAL
 
             _progress_bar(frame, len(samples), ENROLL_SAMPLES)
-            _hud(frame, [(f"Enrolling: {name}", WHITE), (status, sc), ("Q  quit early", (160, 160, 160))])
+            _hud(
+                frame,
+                [(f"Enrolling: {name}", WHITE), (status, sc), ("Q  quit early", (160, 160, 160))],
+            )
             cv2.imshow(win, frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
@@ -2740,7 +2765,11 @@ def cmd_recognize(
         print("Custom YOLO model: not configured")
     if gaze_enabled:
         if gaze_model_loaded:
-            loaded_path = str(gaze_runtime.get("weights_path", gaze_weights)) if gaze_runtime else gaze_weights
+            loaded_path = (
+                str(gaze_runtime.get("weights_path", gaze_weights))
+                if gaze_runtime
+                else gaze_weights
+            )
             loaded_arch = str(gaze_runtime.get("arch", gaze_arch)) if gaze_runtime else gaze_arch
             print(
                 f"Gaze active: model=L2CS-Net {loaded_arch} weights={loaded_path} "
@@ -3050,7 +3079,9 @@ def cmd_recognize(
                                 "name": label,
                                 "target_object": str(target_info.get("label")),
                                 "method": target_info.get("method"),
-                                "distance_px": round(_safe_float(target_info.get("distance_px"), 0.0), 3),
+                                "distance_px": round(
+                                    _safe_float(target_info.get("distance_px"), 0.0), 3
+                                ),
                             }
                         )
 
@@ -3060,7 +3091,9 @@ def cmd_recognize(
                         "confidence": round(float(score), 6),
                         "bbox": _bbox_to_list(bbox),
                         "gaze": gaze_payload,
-                        "target_object": str(target_info.get("label")) if isinstance(target_info, dict) else None,
+                        "target_object": str(target_info.get("label"))
+                        if isinstance(target_info, dict)
+                        else None,
                     }
                 )
 
@@ -3180,11 +3213,15 @@ def cmd_recognize(
             if key == ord("g"):
                 enabled = detector.toggle_general()
                 print(f"General YOLO: {'ON' if enabled else 'OFF'}")
-                add_event("toggle_general_yolo", f"General YOLO {'enabled' if enabled else 'disabled'}")
+                add_event(
+                    "toggle_general_yolo", f"General YOLO {'enabled' if enabled else 'disabled'}"
+                )
             elif key == ord("o"):
                 enabled = detector.toggle_custom()
                 print(f"Custom YOLO: {'ON' if enabled else 'OFF'}")
-                add_event("toggle_custom_yolo", f"Custom YOLO {'enabled' if enabled else 'disabled'}")
+                add_event(
+                    "toggle_custom_yolo", f"Custom YOLO {'enabled' if enabled else 'disabled'}"
+                )
             elif key == ord("c"):
                 query = input("Chat query: ").strip()
                 if query:
@@ -3212,7 +3249,9 @@ def cmd_recognize(
                             "used_llm": result.get("used_llm"),
                         },
                     )
-                    if result.get("action") == "snapshot" and isinstance(result.get("snapshot"), dict):
+                    if result.get("action") == "snapshot" and isinstance(
+                        result.get("snapshot"), dict
+                    ):
                         memory_manual_snapshots += 1
                         snap = result["snapshot"]
                         add_event(
@@ -3257,7 +3296,9 @@ def cmd_recognize(
                     memory_query_hits["recent"] += 1
                     print(f"Recent snapshots (last 5 min): {len(rows)}")
                     for row in rows[-8:]:
-                        print(f"  {row.get('timestamp_local')} | {row.get('objects')} | {row.get('snapshot')}")
+                        print(
+                            f"  {row.get('timestamp_local')} | {row.get('objects')} | {row.get('snapshot')}"
+                        )
                 else:
                     memory_query_misses["recent"] += 1
                     print("No recent snapshots in the last 5 minutes.")
@@ -3546,10 +3587,7 @@ def cmd_memory_recent(minutes: int) -> None:
 
     print(f"Recent snapshots in the last {minutes} minutes: {len(rows)}")
     for row in rows:
-        print(
-            f"  {row.get('timestamp_local')} | {row.get('objects')} | "
-            f"{row.get('snapshot')}"
-        )
+        print(f"  {row.get('timestamp_local')} | {row.get('objects')} | {row.get('snapshot')}")
 
 
 def cmd_memory_find(object_name: str) -> None:
@@ -3623,8 +3661,7 @@ def cmd_memory_search(text: str) -> None:
             else ""
         )
         print(
-            f"  {row.get('timestamp_local')} | {row.get('objects')} | "
-            f"{row.get('snapshot')}{extra}"
+            f"  {row.get('timestamp_local')} | {row.get('objects')} | {row.get('snapshot')}{extra}"
         )
 
 
@@ -3723,14 +3760,20 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
     fps_cap = _safe_int(raw_aggregate.get("fps_cap"), 0)
     frame_period_p50_ms = _safe_float(raw_aggregate.get("frame_period_p50_ms"), 0.0)
     frame_period_p95_ms = _safe_float(raw_aggregate.get("frame_period_p95_ms"), 0.0)
-    frames_empty = _safe_int(raw_aggregate.get("frames_empty"), max(frames_total - frames_with_faces, 0))
+    frames_empty = _safe_int(
+        raw_aggregate.get("frames_empty"), max(frames_total - frames_with_faces, 0)
+    )
 
     aggregate = {
-        "session_id": raw_aggregate.get("session_id") or event.get("session_id") or f"legacy-recognize-{idx}",
+        "session_id": raw_aggregate.get("session_id")
+        or event.get("session_id")
+        or f"legacy-recognize-{idx}",
         "frames_total": frames_total,
         "frames_with_faces": frames_with_faces,
         "frames_empty": frames_empty,
-        "frames_dropped": _safe_int(raw_aggregate.get("frames_dropped", event.get("frames_dropped", 0)), 0),
+        "frames_dropped": _safe_int(
+            raw_aggregate.get("frames_dropped", event.get("frames_dropped", 0)), 0
+        ),
         "average_faces_per_frame": _safe_float(
             raw_aggregate.get("average_faces_per_frame"),
             (detections_total / frames_total) if frames_total > 0 else 0.0,
@@ -3751,18 +3794,26 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
         "frame_period_p95_ms": frame_period_p95_ms,
         "faces_per_sec": faces_per_sec,
         "avg_detection_latency_ms": _safe_float(
-            raw_aggregate.get("avg_detection_latency_ms", event.get("avg_detection_latency_ms", 0.0)),
+            raw_aggregate.get(
+                "avg_detection_latency_ms", event.get("avg_detection_latency_ms", 0.0)
+            ),
             0.0,
         ),
         "min_detection_latency_ms": _safe_float(
-            raw_aggregate.get("min_detection_latency_ms", event.get("min_detection_latency_ms", 0.0)),
+            raw_aggregate.get(
+                "min_detection_latency_ms", event.get("min_detection_latency_ms", 0.0)
+            ),
             0.0,
         ),
         "max_detection_latency_ms": _safe_float(
-            raw_aggregate.get("max_detection_latency_ms", event.get("max_detection_latency_ms", 0.0)),
+            raw_aggregate.get(
+                "max_detection_latency_ms", event.get("max_detection_latency_ms", 0.0)
+            ),
             0.0,
         ),
-        "detection_calls": _safe_int(raw_aggregate.get("detection_calls", event.get("detection_calls", 0)), 0),
+        "detection_calls": _safe_int(
+            raw_aggregate.get("detection_calls", event.get("detection_calls", 0)), 0
+        ),
         "object_detection_calls": _safe_int(raw_aggregate.get("object_detection_calls"), 0),
         "avg_object_detection_latency_ms": _safe_float(
             raw_aggregate.get("avg_object_detection_latency_ms"), 0.0
@@ -3798,14 +3849,18 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
             0,
         ),
         "active_subjects": raw_aggregate.get("active_subjects", event.get("active_subjects", [])),
-        "detection_timeline": raw_aggregate.get("detection_timeline", event.get("detection_timeline", [])),
+        "detection_timeline": raw_aggregate.get(
+            "detection_timeline", event.get("detection_timeline", [])
+        ),
         "active_objects": raw_aggregate.get("active_objects", event.get("active_objects", [])),
         "object_detections_total": _safe_int(
             raw_aggregate.get("object_detections_total", event.get("object_detections_total", 0)),
             0,
         ),
         "object_general_detections": _safe_int(
-            raw_aggregate.get("object_general_detections", event.get("object_general_detections", 0)),
+            raw_aggregate.get(
+                "object_general_detections", event.get("object_general_detections", 0)
+            ),
             0,
         ),
         "object_custom_detections": _safe_int(
@@ -3833,11 +3888,15 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
             raw_aggregate.get("gaze_model_loaded", event.get("gaze_model_loaded", False))
         ),
         "gaze_base_interval_frames": _safe_int(
-            raw_aggregate.get("gaze_base_interval_frames", event.get("gaze_base_interval_frames", 0)),
+            raw_aggregate.get(
+                "gaze_base_interval_frames", event.get("gaze_base_interval_frames", 0)
+            ),
             0,
         ),
         "gaze_interval_frames_final": _safe_int(
-            raw_aggregate.get("gaze_interval_frames_final", event.get("gaze_interval_frames_final", 0)),
+            raw_aggregate.get(
+                "gaze_interval_frames_final", event.get("gaze_interval_frames_final", 0)
+            ),
             0,
         ),
         "gaze_target_fps_drop": _safe_float(
@@ -3872,8 +3931,12 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
         "object_detection_timeline": raw_aggregate.get(
             "object_detection_timeline", event.get("object_detection_timeline", [])
         ),
-        "yolo_state_final": raw_aggregate.get("yolo_state_final", event.get("yolo_state_final", {})),
-        "yolo_model_paths": raw_aggregate.get("yolo_model_paths", event.get("yolo_model_paths", {})),
+        "yolo_state_final": raw_aggregate.get(
+            "yolo_state_final", event.get("yolo_state_final", {})
+        ),
+        "yolo_model_paths": raw_aggregate.get(
+            "yolo_model_paths", event.get("yolo_model_paths", {})
+        ),
         "memory_snapshots_auto": _safe_int(
             raw_aggregate.get("memory_snapshots_auto", event.get("memory_snapshots_auto", 0)),
             0,
@@ -3889,17 +3952,29 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
             0,
         ),
         "memory_snapshot_total_store": _safe_int(
-            raw_aggregate.get("memory_snapshot_total_store", event.get("memory_snapshot_total_store", 0)),
+            raw_aggregate.get(
+                "memory_snapshot_total_store", event.get("memory_snapshot_total_store", 0)
+            ),
             0,
         ),
-        "memory_query_counts": raw_aggregate.get("memory_query_counts", event.get("memory_query_counts", {})),
-        "memory_query_hits": raw_aggregate.get("memory_query_hits", event.get("memory_query_hits", {})),
-        "memory_query_misses": raw_aggregate.get("memory_query_misses", event.get("memory_query_misses", {})),
+        "memory_query_counts": raw_aggregate.get(
+            "memory_query_counts", event.get("memory_query_counts", {})
+        ),
+        "memory_query_hits": raw_aggregate.get(
+            "memory_query_hits", event.get("memory_query_hits", {})
+        ),
+        "memory_query_misses": raw_aggregate.get(
+            "memory_query_misses", event.get("memory_query_misses", {})
+        ),
         "chat_queries_total": _safe_int(raw_aggregate.get("chat_queries_total"), 0),
         "chat_queries_hit": _safe_int(raw_aggregate.get("chat_queries_hit"), 0),
         "chat_queries_llm": _safe_int(raw_aggregate.get("chat_queries_llm"), 0),
-        "behavior_interactions_total": _safe_int(raw_aggregate.get("behavior_interactions_total"), 0),
-        "behavior_attention_total_sec": _safe_float(raw_aggregate.get("behavior_attention_total_sec"), 0.0),
+        "behavior_interactions_total": _safe_int(
+            raw_aggregate.get("behavior_interactions_total"), 0
+        ),
+        "behavior_attention_total_sec": _safe_float(
+            raw_aggregate.get("behavior_attention_total_sec"), 0.0
+        ),
         "behavior_top_objects": raw_aggregate.get("behavior_top_objects", []),
         "behavior_attention_map": raw_aggregate.get("behavior_attention_map", {}),
         "behavior_events_count": _safe_int(raw_aggregate.get("behavior_events_count"), 0),
@@ -3959,7 +4034,9 @@ def _normalize_enroll_event(event: dict[str, Any], idx: int) -> dict[str, Any] |
         "duration_sec": duration_sec,
         "samples_captured": _safe_int(event.get("samples_captured"), 0),
         "total_samples_for_name": _safe_int(event.get("total_samples_for_name"), 0),
-        "frame_metrics": event.get("frame_metrics") if isinstance(event.get("frame_metrics"), dict) else {},
+        "frame_metrics": event.get("frame_metrics")
+        if isinstance(event.get("frame_metrics"), dict)
+        else {},
         "raw_timestamp_utc": event.get("timestamp_utc"),
     }
 
@@ -4415,7 +4492,9 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
 
     if events:
         for e in events[-10:]:
-            lines.append(f"{_local_hms(e.get('timestamp_utc')):<10} | {e.get('message', 'Unknown event')}")
+            lines.append(
+                f"{_local_hms(e.get('timestamp_utc')):<10} | {e.get('message', 'Unknown event')}"
+            )
     else:
         lines.append("--:--:--   | No recent events")
 
@@ -4520,7 +4599,10 @@ _DEGRADABLE_MODULES = {"insightface": "face recognition"}
 # Only lower bounds are enforced here -- falling below a pinned minimum is a proven
 # break, whereas exceeding an upper bound is a forward-looking risk.
 _MIN_MODULE_VERSIONS: dict[str, tuple[tuple[int, ...], str]] = {
-    "insightface": (INSIGHTFACE_MIN_VERSION, "FaceAnalysis(providers=...) requires 0.7+ (2.x supported)"),
+    "insightface": (
+        INSIGHTFACE_MIN_VERSION,
+        "FaceAnalysis(providers=...) requires 0.7+ (2.x supported)",
+    ),
     "numpy": ((1, 26), "pixi.toml pins numpy >=1.26,<3"),
     "torch": ((2, 5), "pixi.toml pins torch >=2.5,<3"),
     "ultralytics": ((8, 4), "pixi.toml pins ultralytics >=8.4,<9"),
@@ -4534,6 +4616,8 @@ def _parse_version(value: Any) -> tuple[int, ...]:
     if not match:
         return ()
     return tuple(int(part) for part in match.group(1).split("."))
+
+
 _OPTIONAL_MODULES = {
     "l2cs": "gaze estimation",
     "gdown": "gaze weight auto-download",
@@ -4576,9 +4660,7 @@ def collect_environment_report(check_camera: bool = False) -> list[tuple[str, st
         (
             "ok" if pinned else "warn",
             "Python",
-            f"{python_version} (pixi workspace pins 3.11)"
-            if not pinned
-            else python_version,
+            f"{python_version} (pixi workspace pins 3.11)" if not pinned else python_version,
         )
     )
 
@@ -4600,9 +4682,7 @@ def collect_environment_report(check_camera: bool = False) -> list[tuple[str, st
 
     for name, purpose in _OPTIONAL_MODULES.items():
         available, detail = _check_import(name)
-        rows.append(
-            ("ok" if available else "warn", f"module:{name}", f"{detail} - {purpose}")
-        )
+        rows.append(("ok" if available else "warn", f"module:{name}", f"{detail} - {purpose}"))
 
     # Report the *configured* checkpoint. The old resolver substituted yolov8n.pt
     # whenever the configured file was absent, so this row could read "yolov8n.pt
@@ -4705,7 +4785,9 @@ def cmd_doctor(check_camera: bool = False) -> None:
     failures = [name for status, name, _ in rows if status == "fail"]
     warnings = [name for status, name, _ in rows if status == "warn"]
     print("-" * 72)
-    print(f"{len(rows) - len(failures) - len(warnings)} ok, {len(warnings)} warning(s), {len(failures)} failure(s)")
+    print(
+        f"{len(rows) - len(failures) - len(warnings)} ok, {len(warnings)} warning(s), {len(failures)} failure(s)"
+    )
 
     if failures:
         print("Blocking: " + ", ".join(failures))
@@ -4839,13 +4921,14 @@ def cmd_validate_frames(
         print("       Class-coverage and negative-frame checks will be skipped (spec §2a).")
 
     classes = (
-        frame_set_validation.load_vocabulary(vocab)
-        if vocab
-        else frame_set_validation.vocabulary()
+        frame_set_validation.load_vocabulary(vocab) if vocab else frame_set_validation.vocabulary()
     )
 
     print(f"Frame set  : {root_path}")
-    print(f"Targets    : {len(target_names)} declared" + (f" ({targets_path.name})" if target_names else ""))
+    print(
+        f"Targets    : {len(target_names)} declared"
+        + (f" ({targets_path.name})" if target_names else "")
+    )
     print(f"Vocabulary : {len(classes)} classes" + (f" ({vocab})" if vocab else " (COCO-80)"))
     print()
 
@@ -4898,14 +4981,18 @@ def cmd_review_detections(
     for row in rejected:
         reasons[row.reason] = reasons.get(row.reason, 0) + 1
 
-    print(f"Frames     : {len(loaded)} usable" + (f", {len(rejected)} excluded" if rejected else ""))
+    print(
+        f"Frames     : {len(loaded)} usable" + (f", {len(rejected)} excluded" if rejected else "")
+    )
     if reasons:
         rendered = ", ".join(f"{name}={count}" for name, count in sorted(reasons.items()))
         print(f"             excluded by reason: {rendered}")
 
     detector = DualYoloDetector()
     params = detector.get_state()["params"]
-    print(f"Detector   : {detector.general_model_path}  {detection_bench.DetectorConfig(**params).label}")
+    print(
+        f"Detector   : {detector.general_model_path}  {detection_bench.DetectorConfig(**params).label}"
+    )
 
     rows = detection_review.build_rows(loaded, detector, limit=limit)
     if not rows:
@@ -4935,7 +5022,10 @@ def cmd_review_detections(
         rows, out_dir=out_dir, source=", ".join(frames), existing=existing
     )
 
-    print(f"Boxes      : {len(rows)} to review" + (f" (sampled evenly across confidence from {limit})" if limit else " (all of them)"))
+    print(
+        f"Boxes      : {len(rows)} to review"
+        + (f" (sampled evenly across confidence from {limit})" if limit else " (all of them)")
+    )
     print()
     print("Next:")
     print(f"  1. open  {page_path}")
@@ -4949,9 +5039,7 @@ def cmd_score_detections(review_dir: str, verdicts: str | None) -> None:
     """Turn a reviewed detection list into precision, per class and overall."""
     directory = Path(review_dir)
     detections_path = directory / detection_review.DETECTIONS_FILENAME
-    verdicts_path = (
-        Path(verdicts) if verdicts else directory / detection_review.VERDICTS_FILENAME
-    )
+    verdicts_path = Path(verdicts) if verdicts else directory / detection_review.VERDICTS_FILENAME
 
     if not detections_path.exists():
         print(f"[FAIL] no detection list at {detections_path}")
@@ -4991,7 +5079,9 @@ def cmd_score_detections(review_dir: str, verdicts: str | None) -> None:
     verdicts = detection_review.parse_verdicts(payload)
     report = detection_review.score(detections, verdicts)
 
-    print(f"Verdicts   : {verdicts_path}  ({len(verdicts)} recorded, {len(detections)} detection(s) in the list)")
+    print(
+        f"Verdicts   : {verdicts_path}  ({len(verdicts)} recorded, {len(detections)} detection(s) in the list)"
+    )
     if isinstance(stored, dict) and stored.get("fingerprint"):
         print(f"List id    : {stored['fingerprint']}  (verdicts must carry the same id)")
     print()
@@ -5021,7 +5111,9 @@ def cmd_frame_budget(log: str | None, limit: int, json_out: str | None) -> None:
     budget_set = frame_budget.collect_budgets(rows, limit=limit)
 
     print(f"Metrics log: {log_path}")
-    print(f"Sessions   : {len(budget_set)} accounted for, from {session_rows} row(s) with an aggregate")
+    print(
+        f"Sessions   : {len(budget_set)} accounted for, from {session_rows} row(s) with an aggregate"
+    )
     if limit > 0:
         print(f"Limit      : newest {limit}")
     print()
@@ -5150,7 +5242,9 @@ def main() -> None:
     p_ms = sub.add_parser("memory-search", help="Search similar scenes")
     p_ms.add_argument("--text", required=True, help="Natural language scene query")
     p_ss = sub.add_parser("session-summary", help="Generate narrative summary of recent activity")
-    p_ss.add_argument("--minutes", type=int, default=5, help="Lookback window in minutes (default: 5)")
+    p_ss.add_argument(
+        "--minutes", type=int, default=5, help="Lookback window in minutes (default: 5)"
+    )
     p_ss.add_argument("--json", action="store_true", help="Output raw summary JSON")
     p_chat = sub.add_parser("chat", help="Interactive chat over memory and logs")
     p_chat.add_argument("--question", default=None, help="Single-turn question (optional)")
@@ -5178,15 +5272,21 @@ def main() -> None:
         default=None,
         help="Detector checkpoint, or a name for Ultralytics to download (default: configured general model)",
     )
-    p_bd.add_argument("--conf", type=float, nargs="+", default=None, help="Confidence thresholds to compare")
-    p_bd.add_argument("--imgsz", type=int, nargs="+", default=None, help="Inference sizes to compare")
+    p_bd.add_argument(
+        "--conf", type=float, nargs="+", default=None, help="Confidence thresholds to compare"
+    )
+    p_bd.add_argument(
+        "--imgsz", type=int, nargs="+", default=None, help="Inference sizes to compare"
+    )
     p_bd.add_argument(
         "--min-brightness",
         type=float,
         default=detection_bench.DEFAULT_MIN_BRIGHTNESS,
         help="Frames darker than this are excluded and reported instead of skewing recall",
     )
-    p_bd.add_argument("--json", dest="json_out", default=None, help="Also write raw results to this JSON file")
+    p_bd.add_argument(
+        "--json", dest="json_out", default=None, help="Also write raw results to this JSON file"
+    )
     p_vf = sub.add_parser(
         "validate-frames",
         help="Check a labelled frame set against the capture spec (see OBJECT_DETECTION_FRAME_SET_SPEC.md)",
@@ -5212,7 +5312,9 @@ def main() -> None:
         default=detection_bench.DEFAULT_MIN_BRIGHTNESS,
         help="Frames darker than this are reported, since the benchmark would drop them",
     )
-    p_vf.add_argument("--json", dest="json_out", default=None, help="Also write the results to this JSON file")
+    p_vf.add_argument(
+        "--json", dest="json_out", default=None, help="Also write the results to this JSON file"
+    )
     p_fb = sub.add_parser(
         "frame-budget",
         help="Split recorded sessions into a per-stage frame budget (see OBJECT_DETECTION_PLAN.md)",
