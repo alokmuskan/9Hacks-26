@@ -4792,6 +4792,7 @@ def cmd_review_detections(
     out_dir: str,
     limit: int,
     min_brightness: float,
+    verdicts: str | None = None,
 ) -> None:
     """Build a review page from the detections on frames that already exist.
 
@@ -4823,8 +4824,27 @@ def cmd_review_detections(
         print("[FAIL] the detector found nothing to review in those frames.")
         sys.exit(1)
 
+    # A correction pass starts from the previous answers, but only if they belong to
+    # this exact list: preloading another build's verdicts would paint the wrong boxes.
+    existing: dict[int, bool] | None = None
+    if verdicts:
+        try:
+            previous = json.loads(Path(verdicts).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[warn] could not read {verdicts}: {exc}")
+            print("       Starting from a blank page.")
+        else:
+            list_id = detection_review.fingerprint([row.detection for row in rows])
+            mismatch = detection_review.fingerprint_mismatch(list_id, previous)
+            if mismatch:
+                print(f"[warn] {mismatch}")
+                print("       Starting from a blank page rather than preloading the wrong boxes.")
+            else:
+                existing = detection_review.load_existing(verdicts)
+                print(f"Preloaded  : {len(existing)} verdict(s) from {verdicts}")
+
     detections_path, page_path = detection_review.write_review(
-        rows, out_dir=out_dir, source=", ".join(frames)
+        rows, out_dir=out_dir, source=", ".join(frames), existing=existing
     )
 
     print(f"Boxes      : {len(rows)} to review" + (f" (sampled evenly across confidence from {limit})" if limit else " (all of them)"))
@@ -5153,6 +5173,11 @@ def main() -> None:
         default=detection_bench.DEFAULT_MIN_BRIGHTNESS,
         help="Frames darker than this cannot be detected in and are excluded",
     )
+    p_rv.add_argument(
+        "--verdicts",
+        default=None,
+        help="Preload earlier verdicts so a re-review is only the corrections",
+    )
     p_sc = sub.add_parser(
         "score-detections",
         help="Score reviewed detections into precision, per class and overall",
@@ -5232,6 +5257,7 @@ def main() -> None:
             args.out_dir,
             args.limit,
             args.min_brightness,
+            args.verdicts,
         ),
         "score-detections": lambda: cmd_score_detections(args.review_dir, args.verdicts),
         "frame-budget": lambda: cmd_frame_budget(args.log, args.limit, args.json_out),

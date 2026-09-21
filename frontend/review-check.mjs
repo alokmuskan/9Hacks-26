@@ -7,7 +7,12 @@
 //   - the page states what it measures and what it does not
 //
 //   node review-check.mjs      # against ../reviews/review.html
+//
+// The page can be either blank or built with --verdicts (a correction pass). The blank
+// assertions run against a copy whose only difference is an emptied verdict seed, so the
+// same checks hold either way; the preload assertions run against the page as it is.
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import puppeteer from "puppeteer-core";
 
@@ -22,6 +27,8 @@ if (!fs.existsSync(PAGE)) {
   process.exit(1);
 }
 
+const fileUrl = (p) => `file://${p.replace(/\\/g, "/")}`;
+
 let failures = 0;
 const check = (label, ok, detail = "") => {
   if (ok) {
@@ -32,6 +39,28 @@ const check = (label, ok, detail = "") => {
   }
 };
 
+// The page seeds its answers in one place, which is what makes a blank copy faithful.
+const html = fs.readFileSync(PAGE, "utf8");
+const seedMatch = html.match(/const verdicts = (\{[^;]*\});/);
+if (!seedMatch) {
+  console.error(`could not find the verdict seed in ${PAGE} — regenerate it with:\n` +
+    "  python main.py review-detections");
+  process.exit(1);
+}
+const seeded = JSON.parse(seedMatch[1]);
+const preloadedCount = Object.keys(seeded).length;
+const wrongWhenBuilt = Object.values(seeded).filter((value) => value === false).length;
+
+const blankPath = path.join(os.tmpdir(), `review-check-blank-${process.pid}.html`);
+fs.writeFileSync(blankPath, html.replace(seedMatch[0], "const verdicts = {};"), "utf8");
+
+console.log(`page: ${PAGE}`);
+console.log(
+  preloadedCount > 0
+    ? `built with --verdicts: ${preloadedCount} answer(s) already recorded\n`
+    : "built blank: every box starts unanswered\n",
+);
+
 const browser = await puppeteer.launch({
   executablePath: CHROME,
   headless: true,
@@ -39,8 +68,9 @@ const browser = await puppeteer.launch({
 });
 
 try {
+  // --- Blank-page path, against the emptied seed ---
   const page = await browser.newPage();
-  await page.goto(`file://${PAGE.replace(/\\/g, "/")}`, { waitUntil: "load" });
+  await page.goto(fileUrl(blankPath), { waitUntil: "load" });
 
   const rows = await page.$$(".row");
   check("every box is rendered as a row", rows.length > 0, `rows=${rows.length}`);
@@ -74,6 +104,16 @@ try {
   const unmarked = await page.$eval(`#state-${indices[2]}`, (n) => n.textContent);
   check("an untouched box stays unreviewed", unmarked.trim() === "unreviewed", unmarked);
 
+  // A click must move the cursor too. Otherwise the next keystroke lands on whichever
+  // box the cursor was left on, not the one being judged — which is how a review ends
+  // up with opposite answers on identical boxes.
+  const cursor = await page.$eval(".row.active", (n) => n.dataset.index);
+  check(
+    "clicking moves the cursor to the next unreviewed box",
+    cursor === indices[2],
+    `${cursor} vs ${indices[2]}`,
+  );
+
   // The optional miss note has to reach the payload, or the diagnostic list is empty.
   await page.type(`#missed-${first}`, "bottle, cup");
 
@@ -91,7 +131,7 @@ try {
     payload.verdicts[first] === true && payload.verdicts[second] === false,
   );
 
-  // --- Keyboard path, on a fresh page so the counters start clean ---
+  // --- Keyboard path, on a fresh blank page so the counters start clean ---
   await page.reload({ waitUntil: "load" });
   const keys = await page.$$eval(".row", (nodes) => nodes.map((n) => n.dataset.index));
 
@@ -140,7 +180,58 @@ try {
 
   const noindex = await page.$eval('meta[name="robots"]', (n) => n.content);
   check("the page is noindex because it shows a camera", /noindex/.test(noindex), noindex);
+
+  // --- Correction pass, against the page as generated when it carries earlier answers ---
+  if (preloadedCount > 0) {
+    const pre = await browser.newPage();
+    await pre.goto(fileUrl(PAGE), { waitUntil: "load" });
+
+    const start = await pre.$eval(".progress", (n) => n.textContent);
+    check(
+      "a preloaded page opens at the previous answers",
+      new RegExp(`reviewed ${preloadedCount} /`).test(start) &&
+        new RegExp(`wrong ${wrongWhenBuilt}`).test(
+          await pre.$eval(".wrongcount", (n) => n.textContent),
+        ),
+      start,
+    );
+
+    const painted = await pre.$$eval(".row.done", (nodes) => nodes.length);
+    check(
+      "preloaded verdicts are painted, not merely counted",
+      painted === preloadedCount,
+      `painted=${painted} of ${preloadedCount}`,
+    );
+
+    const stillActive = await pre.$eval(".row.active", (n) => n.dataset.index);
+    const open = await pre.$$eval(".row:not(.done)", (nodes) =>
+      nodes.length ? nodes[0].dataset.index : null,
+    );
+    check(
+      "the cursor opens on the first box still unanswered",
+      open === null || stillActive === open,
+      `${stillActive} vs ${open}`,
+    );
+
+    // Correcting a box must replace that box's answer, not add a second one for it.
+    const target = Object.keys(seeded)[0];
+    const flipTo = seeded[target] === true ? "no" : "yes";
+    await pre.click(`.row[data-index="${target}"] button.${flipTo}`);
+    const corrected = await pre.$eval(".progress", (n) => n.textContent);
+    check(
+      "correcting a box replaces its answer rather than adding one",
+      new RegExp(`reviewed ${preloadedCount} /`).test(corrected),
+      corrected,
+    );
+    const flipped = await pre.$eval(`#state-${target}`, (n) => n.textContent);
+    check(
+      "the correction shows on the box it was made on",
+      flipped.trim() === (flipTo === "yes" ? "correct" : "wrong"),
+      flipped,
+    );
+  }
 } finally {
+  fs.rmSync(blankPath, { force: true });
   await browser.close();
 }
 

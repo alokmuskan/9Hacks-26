@@ -463,6 +463,8 @@ pixi run python main.py review-detections
 pixi run python main.py score-detections --review-dir reviews
 ```
 
+`review-detections` options: `--frames`, `--out-dir`, `--limit`, `--min-brightness`, `--verdicts`.
+
 Global flag: `--model {buffalo_l,buffalo_m,buffalo_s,buffalo_sc,antelopev2}` (default `buffalo_sc`).
 
 `recognize` options: `--general-model`, `--custom-model`, `--disable-general`, `--disable-custom`, `--disable-gaze`, `--snapshot-interval`, `--gaze-arch`, `--gaze-weights`, `--gaze-weights-source`, `--disable-gaze-auto-download`, `--gaze-max-interval`, `--gaze-target-fps-drop`.
@@ -531,22 +533,43 @@ pixi run python main.py review-detections          # writes reviews/review.html 
 pixi run python main.py score-detections --review-dir reviews
 ```
 
+To revisit a previous run — for example to correct answers after reading the rubric —
+pass the recorded verdicts back in and the page opens with them already marked, so a
+correction pass is only the boxes you want to change:
+
+```bash
+pixi run python main.py review-detections --verdicts reviews/verdicts.json
+```
+
 ```
 Reviewed 102 of 102 detection(s)  (coverage 100%)
-Precision: 0.971  (99 correct, 3 wrong)
+Precision: 0.686  (70 correct, 32 wrong)
   every detection was reviewed, so this is a census of these frames - no sampling error
 
 label              reviewed  correct  wrong  precision
-person                   76       76      0      1.000
+person                   76       49     27      0.645
+remote                    8        7      1      0.875
+cell phone                7        5      2      0.714
+toothbrush                5        5      0      1.000
 surfboard                 2        0      2      0.000
-refrigerator              1        0      1      0.000
+tie                       2        2      0      1.000
+bottle                    1        1      0      1.000
+refrigerator              1        1      0      1.000
 ```
+
+That table is a real run over this repository's saved snapshots, not an illustration.
+`surfboard` at 0.000 and `person` at 0.645 are the findings that matter, and both point
+the same way: the model proposes classes the scene does not contain, and it splits one
+person into more than one box. Re-running `review-detections` into the same directory is
+safe — the detection list is fingerprinted, and `score-detections` refuses a verdict file
+recorded against a different list rather than scoring it against the wrong boxes.
 
 At the time of writing that is **102 boxes over 68 usable frames** — a couple of minutes of clicking, not a labelling project. Three things it is careful about:
 
 - **Unreviewed boxes are reported as unreviewed, never as correct.** A verdict it cannot parse is skipped rather than guessed, because assuming "correct" is the one thing that would inflate the number it exists to produce.
 - **A partial review is reported as a sample.** `--limit N` picks evenly across the confidence range (not the easiest top-N boxes) and the score prints a Wilson interval; below 80% coverage it says the interval is optimistic, because a subset picked by hand is not a random sample.
 - **It measures precision, not recall.** Recall needs every object in every frame enumerated — the "extensive labelling" this exists to avoid. The optional per-row note records objects you *noticed* were missed; those are printed as concrete misses with no denominator, never as a recall figure.
+- **A correction pass cannot drift onto the wrong boxes.** `--verdicts` only preloads a file carrying the same list id; anything else prints a warning and starts blank, and `score-detections` refuses a mismatch outright.
 
 The number describes **the frames in `reviews/`** and nothing else; every run says so. The page embeds real camera frames, so it lives in the git-ignored `reviews/` directory and carries `noindex`.
 

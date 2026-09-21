@@ -282,6 +282,48 @@ class WriteReviewTests(unittest.TestCase):
         self.assertIn(payload["fingerprint"], page)
 
 
+class PreloadTests(unittest.TestCase):
+    """A correction pass must start from the earlier answers, never from a guess."""
+
+    def _page(self, existing: dict[int, bool]) -> str:
+        rows = [dr.ReviewRow(detection=_detection(1), thumb_b64="")]
+        return dr.render_page(rows, source="x", existing=existing)
+
+    def test_recorded_verdicts_are_read_back_with_both_answers(self):
+        payload = {"verdicts": {"1": "y", "2": "n", "3": "skip"}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "verdicts.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            existing = dr.load_existing(path)
+
+        self.assertEqual(existing, {1: True, 2: False})
+
+    def test_a_missing_or_broken_file_preloads_nothing_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(dr.load_existing(Path(tmp) / "absent.json"), {})
+            broken = Path(tmp) / "broken.json"
+            broken.write_text("{not json", encoding="utf-8")
+            self.assertEqual(dr.load_existing(broken), {})
+
+    def test_the_page_starts_with_the_previous_answers_already_marked(self):
+        page = self._page({1: False})
+
+        self.assertIn('const verdicts = {"1": false}', page)
+
+    def test_a_blank_page_is_the_default_when_nothing_was_recorded(self):
+        self.assertIn("const verdicts = {};", self._page({}))
+
+    def test_write_review_passes_the_earlier_answers_through(self):
+        rows = [dr.ReviewRow(detection=_detection(1), thumb_b64="")]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, page_path = dr.write_review(rows, out_dir=tmp, source="x", existing={1: True})
+            page = Path(page_path).read_text(encoding="utf-8")
+
+        self.assertIn('const verdicts = {"1": true}', page)
+
+
 class RoundTripTests(unittest.TestCase):
     def test_a_detection_survives_the_json_round_trip(self):
         original = _detection(7, label="cell phone", confidence=0.42)

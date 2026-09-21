@@ -401,8 +401,28 @@ def build_rows(
     return rows
 
 
-def render_page(rows: list[ReviewRow], *, source: str, list_id: str = "") -> str:
-    """The self-contained review page: every row with a yes/no pair and an optional note."""
+def load_existing(path: str | Path) -> dict[int, bool]:
+    """Verdicts already recorded, so a correction pass does not repeat 100 decisions."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {verdict.index: verdict.correct for verdict in parse_verdicts(payload)}
+
+
+def render_page(
+    rows: list[ReviewRow],
+    *,
+    source: str,
+    list_id: str = "",
+    existing: dict[int, bool] | None = None,
+) -> str:
+    """The self-contained review page: every row with a yes/no pair and an optional note.
+
+    ``existing`` preloads verdicts so a correction pass starts from the previous
+    answers instead of a blank page.
+    """
+    initial = json.dumps({str(index): bool(value) for index, value in (existing or {}).items()})
     cards: list[str] = []
     for row in rows:
         detection = row.detection
@@ -419,8 +439,8 @@ def render_page(rows: list[ReviewRow], *, source: str, list_id: str = "") -> str
       <img alt="frame {html.escape(frame_name)} with box #{detection.index}"
            src="data:image/jpeg;base64,{row.thumb_b64}">
       <div class="controls">
-        <button class="yes" type="button" onclick="mark({detection.index}, true, event)">Correct</button>
-        <button class="no" type="button" onclick="mark({detection.index}, false, event)">Wrong</button>
+        <button class="yes" type="button" onclick="mark({detection.index}, true, true)">Correct</button>
+        <button class="no" type="button" onclick="mark({detection.index}, false, true)">Wrong</button>
         <span class="state" id="state-{detection.index}">unreviewed</span>
       </div>
       <input class="missed" id="missed-{detection.index}" type="text"
@@ -532,16 +552,40 @@ def render_page(rows: list[ReviewRow], *, source: str, list_id: str = "") -> str
   </div>
 </footer>
 <script>
-const verdicts = {{}};
+const verdicts = {initial};
 const missed = {{}};
-function mark(index, correct, event) {{
-  verdicts[index] = correct;
+function paint(index) {{
   const row = document.querySelector('.row[data-index="' + index + '"]');
-  row.querySelector('button.yes').classList.toggle('on', correct);
-  row.querySelector('button.no').classList.toggle('on', !correct);
-  document.getElementById('state-' + index).textContent = correct ? 'correct' : 'wrong';
+  const answer = verdicts[index];
+  if (!row || answer === undefined) {{ return; }}
+  row.querySelector('button.yes').classList.toggle('on', answer === true);
+  row.querySelector('button.no').classList.toggle('on', answer === false);
+  const state = document.getElementById('state-' + index);
+  if (state) {{ state.textContent = answer ? 'correct' : 'wrong'; }}
   row.classList.add('done');
+}}
+function nextUnreviewedFrom(pos) {{
+  for (let i = pos + 1; i < cards.length; i += 1) {{
+    if (verdicts[cards[i].dataset.index] === undefined) {{ return i; }}
+  }}
+  return cards.length - 1;
+}}
+function firstUnreviewed() {{
+  for (let i = 0; i < cards.length; i += 1) {{
+    if (verdicts[cards[i].dataset.index] === undefined) {{ return i; }}
+  }}
+  return 0;
+}}
+// `viaClick` matters: a click must move the cursor too, or the next keystroke lands
+// on whichever box the cursor was left on rather than the one being looked at.
+function mark(index, correct, viaClick) {{
+  verdicts[index] = correct;
+  paint(index);
   update();
+  if (viaClick) {{
+    const pos = cards.findIndex(function (row) {{ return Number(row.dataset.index) === index; }});
+    if (pos >= 0) {{ setActive(nextUnreviewedFrom(pos)); }}
+  }}
 }}
 function collect() {{
   document.querySelectorAll('.missed').forEach(function (input) {{
@@ -590,13 +634,11 @@ function setActive(i) {{
   row.scrollIntoView({{ block: 'center', behavior: 'smooth' }});
 }}
 function apply(correct) {{
-  if (active < 0) {{ setActive(0); }}
+  if (active < 0) {{ setActive(firstUnreviewed()); }}
   const row = cards[active];
   if (!row) {{ return; }}
   mark(Number(row.dataset.index), correct);
-  let next = active + 1;
-  while (next < cards.length && verdicts[cards[next].dataset.index] !== undefined) {{ next += 1; }}
-  if (next < cards.length) {{ setActive(next); }}
+  setActive(nextUnreviewedFrom(active));
 }}
 document.addEventListener('keydown', function (event) {{
   if (event.target && event.target.tagName === 'INPUT') {{ return; }}
@@ -608,8 +650,9 @@ document.addEventListener('keydown', function (event) {{
 }});
 
 document.querySelectorAll('.missed').forEach(function (input) {{ input.addEventListener('change', update); }});
+Object.keys(verdicts).forEach(paint);
 update();
-setActive(0);
+setActive(firstUnreviewed());
 </script>
 </body>
 </html>
@@ -621,6 +664,7 @@ def write_review(
     *,
     out_dir: str | Path = DEFAULT_REVIEW_DIR,
     source: str = "",
+    existing: dict[int, bool] | None = None,
 ) -> tuple[Path, Path]:
     """Write the detection list and the review page. Returns ``(detections, page)``."""
     directory = Path(out_dir)
@@ -641,7 +685,9 @@ def write_review(
     )
 
     page_path = directory / PAGE_FILENAME
-    page_path.write_text(render_page(rows, source=source, list_id=list_id), encoding="utf-8")
+    page_path.write_text(
+        render_page(rows, source=source, list_id=list_id, existing=existing), encoding="utf-8"
+    )
     return detections_path, page_path
 
 
