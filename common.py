@@ -66,6 +66,30 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def normalize_in_scope_classes(value: Any) -> frozenset[str]:
+    """Coerce an in-scope class allowlist into a lowercase label set.
+
+    Accepts the raw environment string (``"person, cell phone"``), an iterable of
+    labels, or ``None``. ``None`` and an empty result both mean "every class is in
+    scope", which is what keeps the unset default a no-op.
+    """
+    if value is None:
+        return frozenset()
+    if isinstance(value, str):
+        value = value.split(",")
+    return frozenset(str(part).strip().lower() for part in value if str(part).strip())
+
+
+def _env_class_list(name: str) -> frozenset[str]:
+    """Read a comma-separated class allowlist from the environment.
+
+    An unset, empty or whitespace-only value means *all* classes, never none of
+    them: a typo or a stray comma must not silently blank the dashboard. Labels
+    are lowercased here so matching does not depend on the caller's casing.
+    """
+    return normalize_in_scope_classes(os.getenv(name))
+
+
 def clamp(value: float, bounds: tuple[float, float]) -> float:
     low, high = bounds
     return min(max(value, low), high)
@@ -95,7 +119,8 @@ UNKNOWN_INCIDENT_MAX_FILES = max(_env_int("AI_STUDIO_UNKNOWN_INCIDENT_MAX_FILES"
 #
 # Confidence and IoU stay at Ultralytics' defaults on purpose: lowering the
 # global threshold adds low-confidence junk (surfboard/tie at 0.17), which is a
-# per-class policy decision rather than a global one.
+# per-class policy decision rather than a global one. The per-class half of that
+# decision is now available as a knob: see AI_STUDIO_YOLO_IN_SCOPE_CLASSES below.
 #
 # The bounds live here and are applied by `DetectorConfig` in
 # `object_detection.py`, so a value cannot be valid in one place and invalid in
@@ -120,6 +145,31 @@ YOLO_MAX_DET_DEFAULT = int(clamp(_env_int("AI_STUDIO_YOLO_MAX_DET", 300), YOLO_M
 # cannot be reported twice under two labels. Off by default because it can also
 # suppress a genuinely distinct overlapping label (a tie inside a person).
 YOLO_AGNOSTIC_NMS_DEFAULT = _env_bool("AI_STUDIO_YOLO_AGNOSTIC_NMS", False)
+
+# ── In-scope classes ──────────────────────────────────────────────────────────
+# The detector is class-agnostic: it reports whatever COCO label scores above the
+# confidence threshold, including labels this project has no use for. That is not
+# hypothetical — a 124-box review of the project's own frames (100% coverage)
+# measured `surfboard` at 0.000 precision, firing on curtain folds, and no box it
+# produced was ever correct (OBJECT_DETECTION_PLAN.md section 2h).
+#
+# Filtering is *off* by default. Unset keeps every label, so nothing changes until
+# a policy is deliberately chosen, and the knob cannot surprise anyone who has not
+# set it. Set ``AI_STUDIO_YOLO_IN_SCOPE_CLASSES`` to a comma-separated allowlist to
+# keep only those labels:
+#
+#   AI_STUDIO_YOLO_IN_SCOPE_CLASSES=person,cell phone,bottle
+#
+# Matching is case-insensitive and whitespace-tolerant. Because an empty value
+# means "all classes", filtering can only ever be narrowed by naming the labels to
+# keep; it cannot accidentally suppress everything.
+YOLO_IN_SCOPE_CLASSES_DEFAULT = _env_class_list("AI_STUDIO_YOLO_IN_SCOPE_CLASSES")
+
+# A denylist, for the opposite decision. Both exist because the two mistakes are
+# not symmetric: an allowlist short enough to be useful will hide a class nobody
+# thought of, while a denylist can only remove labels someone deliberately named.
+# Exclusion always wins, so a label in both lists is dropped rather than kept.
+YOLO_EXCLUDED_CLASSES_DEFAULT = _env_class_list("AI_STUDIO_YOLO_EXCLUDED_CLASSES")
 
 # ── Live pacing & instance capture ────────────────────────────────────────────
 # The monitor loop targets at most FPS_CAP_DEFAULT frames per second; the cap is

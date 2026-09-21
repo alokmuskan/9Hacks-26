@@ -158,9 +158,29 @@ class DualYoloDetector:
         imgsz: int | None = None,
         max_det: int | None = None,
         agnostic_nms: bool | None = None,
+        in_scope_classes: Any | None = None,
+        excluded_classes: Any | None = None,
     ) -> None:
         self.general_model_path = general_model_path
         self.custom_model_path = custom_model_path
+
+        # Which labels are worth reporting at all. `None` reads the configured
+        # policy; an empty list means "every label", so the unset default keeps
+        # today's behaviour exactly. Kept out of `DetectorConfig` on purpose:
+        # that dataclass is the set of Ultralytics kwargs, and this is not one.
+        self.in_scope_classes = (
+            common.YOLO_IN_SCOPE_CLASSES_DEFAULT
+            if in_scope_classes is None
+            else common.normalize_in_scope_classes(in_scope_classes)
+        )
+        self.excluded_classes = (
+            common.YOLO_EXCLUDED_CLASSES_DEFAULT
+            if excluded_classes is None
+            else common.normalize_in_scope_classes(excluded_classes)
+        )
+        # What the filter hid, per label, since start. A silent filter is
+        # indistinguishable from a broken detector, so the counts are kept.
+        self.suppressed_labels: dict[str, int] = {}
 
         # Inference parameters are resolved once, here, so the live loop and the
         # offline benchmark cannot drift apart, and so `/monitor/status` can report
@@ -212,6 +232,37 @@ class DualYoloDetector:
         self.config = config
         return self.config
 
+    def set_in_scope_classes(self, value: Any) -> frozenset[str]:
+        """Replace the in-scope label allowlist.
+
+        ``None``, ``""`` or an empty iterable all mean "every label is in scope".
+        Suppression counts are left alone: they are a record of what has been
+        hidden so far, not a property of the current policy.
+        """
+        self.in_scope_classes = common.normalize_in_scope_classes(value)
+        return self.in_scope_classes
+
+    def set_excluded_classes(self, value: Any) -> frozenset[str]:
+        """Replace the excluded-label denylist. ``None`` or empty excludes nothing."""
+        self.excluded_classes = common.normalize_in_scope_classes(value)
+        return self.excluded_classes
+
+    def _keep_in_scope(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop labels the policy does not want, counting what was dropped.
+
+        Exclusion wins over inclusion, so a label named in both lists is dropped
+        rather than kept — the conservative reading of a contradictory config.
+        """
+        kept: list[dict[str, Any]] = []
+        for row in rows:
+            label = str(row.get("label", "")).strip().lower()
+            in_scope = not self.in_scope_classes or label in self.in_scope_classes
+            if in_scope and label not in self.excluded_classes:
+                kept.append(row)
+            else:
+                self.suppressed_labels[label] = self.suppressed_labels.get(label, 0) + 1
+        return kept
+
     def _load_model(self, model_path: str) -> Any:
         try:
             from ultralytics import YOLO
@@ -258,6 +309,9 @@ class DualYoloDetector:
         if self.custom_enabled:
             rows.extend(self._run_model(self.custom_model, frame, "custom"))
 
+        if self.in_scope_classes or self.excluded_classes:
+            rows = self._keep_in_scope(rows)
+
         rows.sort(key=lambda row: row["confidence"], reverse=True)
         return rows
 
@@ -282,6 +336,12 @@ class DualYoloDetector:
     def get_state(self) -> dict[str, Any]:
         return {
             "params": self.params(),
+            "in_scope": {
+                "classes": sorted(self.in_scope_classes),
+                "excluded": sorted(self.excluded_classes),
+                "filtering": bool(self.in_scope_classes or self.excluded_classes),
+                "suppressed": dict(sorted(self.suppressed_labels.items())),
+            },
             "general": {
                 "enabled": self.general_enabled,
                 "loaded": self.general_model is not None,

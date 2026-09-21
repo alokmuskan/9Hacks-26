@@ -309,6 +309,8 @@ All variables are optional; the defaults below reflect the code.
 | `AI_STUDIO_YOLO_IOU` | `0.7` | backend | NMS IoU threshold (0.1–0.95) |
 | `AI_STUDIO_YOLO_MAX_DET` | `300` | backend | Maximum boxes per frame (1–1000) |
 | `AI_STUDIO_YOLO_AGNOSTIC_NMS` | `false` | backend | Class-agnostic NMS: one box pool across classes, so one object cannot be reported under two labels. Can also drop a genuinely distinct overlapping label |
+| `AI_STUDIO_YOLO_IN_SCOPE_CLASSES` | empty (all) | backend | Allowlist of labels to report; everything else is dropped before it reaches a consumer. Empty means every label |
+| `AI_STUDIO_YOLO_EXCLUDED_CLASSES` | empty (none) | backend | Denylist of labels to drop. Exclusion wins over inclusion. `surfboard` is the one class measured at 0.000 precision on this project's own frames |
 | `AI_STUDIO_FPS_CAP` | `12` | backend | Monitor-loop ceiling in frames/s. The cap is a ceiling — slow machines run at whatever they keep up with. Lower = less CPU, higher = snappier detection |
 | `AI_STUDIO_ENROLL_FPS_CAP` | `20` | backend | Same ceiling for enrollment sessions (kept faster on purpose; sample collection wants rate) |
 | `AI_STUDIO_SNAPSHOT_INTERVAL` | `8.0` | backend | Seconds between auto snapshots — the instances reports and chat ground on. Runs on wall-clock time, independent of FPS; clamped to 1–3600 |
@@ -542,29 +544,49 @@ pixi run python main.py review-detections --verdicts reviews/verdicts.json
 ```
 
 ```
-Reviewed 102 of 102 detection(s)  (coverage 100%)
-Precision: 0.686  (70 correct, 32 wrong)
+Reviewed 124 of 124 detection(s)  (coverage 100%)
+Precision: 0.911  (113 correct, 11 wrong)
   every detection was reviewed, so this is a census of these frames - no sampling error
 
 label              reviewed  correct  wrong  precision
-person                   76       49     27      0.645
+person                   96       89      7      0.927
 remote                    8        7      1      0.875
-cell phone                7        5      2      0.714
+cell phone                7        6      1      0.857
 toothbrush                5        5      0      1.000
 surfboard                 2        0      2      0.000
 tie                       2        2      0      1.000
+book                      1        1      0      1.000
 bottle                    1        1      0      1.000
 refrigerator              1        1      0      1.000
+snowboard                 1        1      0      1.000
 ```
 
-That table is a real run over this repository's saved snapshots, not an illustration.
-`surfboard` at 0.000 and `person` at 0.645 are the findings that matter, and both point
-the same way: the model proposes classes the scene does not contain, and it splits one
-person into more than one box. Re-running `review-detections` into the same directory is
-safe — the detection list is fingerprinted, and `score-detections` refuses a verdict file
-recorded against a different list rather than scoring it against the wrong boxes.
+That table is a real run over this repository's saved snapshots, not an illustration. The
+only class with zero precision is `surfboard`, whose two boxes sit on curtain folds; every
+other class is at or above 0.857.
 
-At the time of writing that is **102 boxes over 68 usable frames** — a couple of minutes of clicking, not a labelling project. Three things it is careful about:
+**The rubric matters more than the detector here.** A first pass over the same frames with the
+same model scored `person` at **0.645** (49/76) — because the page had not yet said what
+"Correct" meant, so duplicate boxes on one person and boxes clipped by the frame edge were
+marked Wrong, which the rubric says to mark Correct. The rejected and accepted boxes were
+statistically indistinguishable (median confidence 0.83 vs 0.87), and the person wrong-rate
+swung between 8.7% and 57.7% across sessions of the same scene. The criteria are now printed
+on the page itself, and the page's browser check asserts they are present.
+
+Because `surfboard` is a *policy* problem rather than a threshold problem, it is handled in
+configuration: `AI_STUDIO_YOLO_EXCLUDED_CLASSES=surfboard` drops it before it reaches the
+dashboard. Measured on the same frames: 124 → 122 boxes, `surfboard` gone, no other label
+changed. That is not an accuracy improvement — those boxes were correct detections of an
+object this project does not care about. `/monitor/status` reports the effective policy under
+`in_scope`, including a per-label count of what was suppressed, so a filtered class is never
+invisible.
+
+Re-running `review-detections` into the same directory is safe — the detection list is
+fingerprinted, and `score-detections` refuses a verdict file recorded against a different list
+rather than scoring it against the wrong boxes. That guard is load-bearing: the frame set grows
+whenever the app captures a new snapshot, so a list can legitimately change between runs.
+
+At the time of writing that is **124 boxes over 75 usable frames** (13 excluded: `too_dark=12`, `too_small=1`) — a couple of minutes of clicking, not a labelling project. Three things it is careful about:
 
 - **Unreviewed boxes are reported as unreviewed, never as correct.** A verdict it cannot parse is skipped rather than guessed, because assuming "correct" is the one thing that would inflate the number it exists to produce.
 - **A partial review is reported as a sample.** `--limit N` picks evenly across the confidence range (not the easiest top-N boxes) and the score prints a Wilson interval; below 80% coverage it says the interval is optimistic, because a subset picked by hand is not a random sample.

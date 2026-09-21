@@ -3,14 +3,18 @@
 Goal: make object detection recognise more real objects, reliably, without
 exceeding the frame budget of a **CPU-only** machine.
 
-Status: **Phases 0, 1 and 2 complete.** Phase 2 fixed the model-name fallback (§2d)
-and then benchmarked `yolo11*` and **rejected** it (§2e). The harness gap that made that
-comparison inconclusive was partly closed by a dataset validator and a latency
-distribution (§2g), and the frame budget has since been read out of the recorded sessions
-(§2h), which found that the session log records *face* detection latency rather than
-object detection and cannot close a per-frame budget. **Everything from Phase 3 onwards is
-blocked on the labelled frame set** specified in `OBJECT_DETECTION_FRAME_SET_SPEC.md`,
-which does not exist yet — that, not the harness, is the next thing to fix.
+Status: **Phases 0, 1 and 2 complete**, and the accuracy question has been answered as far
+as the frames on disk allow. Phase 2 fixed the model-name fallback (§2d) and then benchmarked
+`yolo11*` and **rejected** it (§2e). The harness gap that made that comparison inconclusive was
+partly closed by a dataset validator and a latency distribution (§2g); the frame budget was
+read out of the recorded sessions (§2h), which found that the session log records *face*
+detection latency rather than object detection and cannot close a per-frame budget. The
+labelled-frame-set block was worked around rather than accepted (§2i): reviewing the detector's
+own output produced the project's first measured **precision — 0.911 over 124 boxes, 100%
+reviewed** — and the one zero-precision class it found is now filtered by configuration.
+Two further phases were **retired on measurement** rather than built (§2i).
+**Recall is still unmeasured**, and the expo-level claim is still out of reach: it needs the
+enumeration set in `OBJECT_DETECTION_FRAME_SET_SPEC.md`, which does not exist.
 Every number below was measured on this machine (see *Evidence*), not assumed.
 
 Re-verified after Phase 1 landed; that audit found several deliverables that were
@@ -21,11 +25,11 @@ claimed but not actually in place, and they are fixed (see *§2c Re-verification
 | 0 — benchmark harness | ✅ done — `main.py bench-detect`, `detection_bench.py` |
 | 1 — parameterise inference | ✅ done — env knobs, typed `DetectorConfig`, status + HUD reporting, defaults from the benchmark |
 | 2 — model upgrade | ✅ done, gate half met — fallback fixed (§2d), `yolo11*` benchmarked and **rejected** (§2e) |
-| 3 — per-class thresholds / label policy | ⏸ blocked on a labelled frame set; §2i provides a review-based **precision** figure that can be run today |
+| 3 — per-class thresholds / label policy | 🟡 **answered for this scene** (§2i) — 0.911 precision measured, and the only zero-precision class (`surfboard`) is dropped by `AI_STUDIO_YOLO_EXCLUDED_CLASSES`. Expo-level policy still needs the labelled frame set |
 | 4 — capture / low-light | ❌ **measured negative** (§2i) — CLAHE recovers nothing on the dark frames and loses two classes on the lit ones. Do not build |
 | 5 — temporal smoothing | ⏸ **unverifiable with the frames on disk** (§2i) — snapshots are 15 s apart, so label flicker cannot be measured. Needs a short burst capture |
 | 6 — cross-source dedupe / tiling | ⏸ dedupe has **nothing to fix** (§2i: 0 duplicate pairs at IoU ≥ 0.7, custom model off). Tiling untested |
-| 7 — surfacing, docs, CI | 🟡 partly done — `frame-budget` (§2h) and `review-detections` (§2i) are the surfacing; the CI benchmark job is still missing |
+| 7 — surfacing, docs, CI | 🟡 partly done — `frame-budget` (§2h) and `review-detections`/`score-detections` (§2i) are the surfacing; the CI benchmark job is still missing |
 
 ---
 
@@ -730,7 +734,7 @@ unverifiable, and its gate cannot be met honestly until someone captures a short
 ### What replaces it: review the detections that already exist
 
 `review-detections` → `score-detections` (`detection_review.py`). The detector's output on
-frames that already exist is a *finite* list — **102 boxes over 68 usable frames** at the
+frames that already exist is a *finite* list — **124 boxes over 75 usable frames** at the
 time of writing — and a human can confirm or reject that list in a couple of minutes. This
 is the practical alternative: it needs no new capture and no labelling of anything the
 detector did not already propose, and it produces the project's first real **precision**
@@ -754,9 +758,62 @@ So the honest position stays: detection can now be scored for **false boxes** on
 frames, and for nothing else. Phase 3's per-class policy becomes answerable **for this
 scene** once a review is run; it remains unanswerable for the expo.
 
-**Status: written, 30 unit tests, battery green (329 tests, ruff clean, mypy clean across 9
-files). No production behaviour changed, no Phase 3 policy decided, no claim that the
-sample is representative.**
+### The result: the first measured precision, and a rubric that mattered more than the detector
+
+The review was run on the frames on disk: **124 boxes over 75 usable frames** (13 excluded —
+`too_dark=12`, `too_small=1`), **100% reviewed → precision 0.911** (113 correct, 11 wrong).
+
+| label | reviewed | correct | wrong | precision |
+| --- | --- | --- | --- | --- |
+| `person` | 96 | 89 | 7 | 0.927 |
+| `remote` | 8 | 7 | 1 | 0.875 |
+| `cell phone` | 7 | 6 | 1 | 0.857 |
+| `toothbrush` | 5 | 5 | 0 | 1.000 |
+| `surfboard` | 2 | 0 | 2 | **0.000** |
+| `tie`, `book`, `bottle`, `refrigerator`, `snowboard` | 1–2 each | all | 0 | 1.000 |
+
+**A first pass scored `person` at 0.645 (49/76) — same frames, same detector, same reviewer.**
+The difference was not detection quality, it was the rubric: the first version of the page
+never said what "Correct" meant, so duplicate boxes on one person and boxes clipped by the
+frame edge were marked Wrong, which the rubric says to mark Correct. The rejected and
+accepted boxes are statistically indistinguishable — median confidence 0.83 vs 0.87, median
+area 28% vs 23% — and the person wrong-rate swung between **8.7% and 57.7%** across sessions
+of the same scene, which is not what a confidence boundary looks like. The criteria are now
+printed on the page itself, and the page's browser check asserts they are present.
+
+This is recorded deliberately, because the other reading — "person detection is at 0.65, tune
+the thresholds" — would have sent the project tuning a detector that was never the problem.
+
+### What the result decided: the in-scope class knob
+
+Only `surfboard` came back at zero precision, and both of its boxes were on curtain folds.
+That is a policy fact rather than a threshold fact: no confidence threshold separates "curtain
+fold" from "surfboard" without discarding real detections at the same time. So the decision
+belongs in configuration, not in the model:
+
+| Knob | Meaning |
+| --- | --- |
+| `AI_STUDIO_YOLO_IN_SCOPE_CLASSES` | Allowlist — keep only these labels |
+| `AI_STUDIO_YOLO_EXCLUDED_CLASSES` | Denylist — drop exactly these labels |
+
+Both are empty by default, which means *every label*, so nothing is filtered until one is set
+deliberately. Exclusion wins over inclusion, so a label in both lists is dropped rather than
+kept. Filtering happens once, in `DualYoloDetector.detect()`, so the live loop, the API, the
+benchmark and the review all see the same set. `get_state()["in_scope"]` reports the effective
+policy **and a per-label count of what was suppressed** — a filter that hides output silently
+is indistinguishable from a detector that stopped working.
+
+Measured on the same 75 frames with `AI_STUDIO_YOLO_EXCLUDED_CLASSES=surfboard`: **124 → 122
+boxes**, `surfboard` gone, no other label changed by one box.
+
+**This does not improve the detector, and must not be reported as if it did.** It removes boxes
+the detector produced correctly for an object this project does not care about. The 0.911
+figure above was measured *before* the filter, and the per-class policy is settled for **this
+scene only**.
+
+**Status: battery green — 361 tests (343 → 361), ruff clean, mypy clean across 9 files,
+byte-compile clean. No Phase 3 decision is claimed for the expo: precision describes these
+frames, and recall is still unmeasured.**
 
 ## 3. Phases
 
