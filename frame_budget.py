@@ -94,6 +94,7 @@ class SessionBudget:
     frame_period_ms: float
     face: Stage
     gaze: Stage
+    objects: Stage
     residual_ms: float
     face_recognition: bool
     pacing: Pacing
@@ -108,6 +109,10 @@ class SessionBudget:
         return None if self.gaze.ms is None else self.gaze.ms / self.frame_period_ms
 
     @property
+    def object_share(self) -> float | None:
+        return None if self.objects.ms is None else self.objects.ms / self.frame_period_ms
+
+    @property
     def residual_share(self) -> float:
         return self.residual_ms / self.frame_period_ms
 
@@ -118,8 +123,12 @@ class SessionBudget:
 
     @property
     def fully_recorded(self) -> bool:
-        """Both recorded stages are known either way, so the residual means something."""
-        return self.face.state != "untimed" and self.gaze.state != "untimed"
+        """Every recorded stage is known either way, so the residual means something."""
+        return (
+            self.face.state != "untimed"
+            and self.gaze.state != "untimed"
+            and self.objects.state != "untimed"
+        )
 
 
 @dataclass(frozen=True)
@@ -136,12 +145,15 @@ class Cohort:
     sessions: int
     measured_face: int
     measured_gaze: int
+    measured_objects: int
     median_period_ms: float
     median_face_ms: float | None
     median_gaze_ms: float | None
+    median_objects_ms: float | None
     median_residual_ms: float
     median_face_share: float | None
     median_gaze_share: float | None
+    median_objects_share: float | None
     median_residual_share: float
 
 
@@ -225,10 +237,30 @@ def _measure_stage(
     return Stage(ms=calls * average / frames, state="measured")
 
 
+def _measure_object_stage(aggregate: Mapping[str, Any], frames: int) -> Stage:
+    """Cost per frame of object detection, which older records never timed.
+
+    The field's *presence* is the signal here, not its value. Sessions written
+    before schema 8 have no ``object_detection_calls`` at all: object detection ran
+    on every frame, but nothing timed it, so the honest render is the same ``--`` as
+    any untimed stage. Rendering ``off`` would claim the detector was switched off,
+    which is a different and false statement.
+    """
+    if "object_detection_calls" not in aggregate:
+        return Stage(ms=None, state="untimed")
+    calls = _as_int(aggregate.get("object_detection_calls"))
+    if calls <= 0:
+        return Stage(ms=None, state="disabled")
+    average = _as_float(aggregate.get("avg_object_detection_latency_ms"))
+    if average <= 0.0:
+        return Stage(ms=None, state="untimed")
+    return Stage(ms=calls * average / frames, state="measured")
+
+
 def _pacing(frame_period_ms: float, fps_cap: int) -> Pacing:
     """Whether the loop was pacing itself or working as fast as it could.
 
-    ``fps_cap`` is absent from every session recorded so far, so this returns
+    ``fps_cap`` is absent from sessions recorded before schema 8, so this returns
     ``not-recorded`` rather than inferring from a default that may not have applied.
     """
     if fps_cap <= 0:
@@ -290,7 +322,14 @@ def build_budget(row: Mapping[str, Any]) -> tuple[SessionBudget | None, str]:
             reason = "no call recorded"
         notes.append(f"gaze was enabled but never ran ({reason})")
 
-    residual_ms = frame_period_ms - ((face.ms or 0.0) + (gaze.ms or 0.0))
+    objects = _measure_object_stage(aggregate, frames)
+    if objects.state == "untimed":
+        notes.append(
+            "object detection is not timed in this session, so its cost sits in the remainder "
+            "rather than being unknown"
+        )
+
+    residual_ms = frame_period_ms - ((face.ms or 0.0) + (gaze.ms or 0.0) + (objects.ms or 0.0))
     if residual_ms < 0:
         notes.append(
             f"recorded stages exceed the mean period by {abs(residual_ms):.1f} ms, so the split "
@@ -329,6 +368,7 @@ def build_budget(row: Mapping[str, Any]) -> tuple[SessionBudget | None, str]:
             frame_period_ms=frame_period_ms,
             face=face,
             gaze=gaze,
+            objects=objects,
             residual_ms=residual_ms,
             face_recognition=face_recognition,
             pacing=pacing,
@@ -364,23 +404,32 @@ def _cohort(budgets: Sequence[SessionBudget]) -> Cohort:
     genuinely 100% unattributed, but including them would pull the stage medians
     toward a split that reflects the toggles rather than the pipeline.
     """
-    timed = [b for b in budgets if b.face.ms is not None or b.gaze.ms is not None]
+    timed = [
+        b
+        for b in budgets
+        if b.face.ms is not None or b.gaze.ms is not None or b.objects.ms is not None
+    ]
     if not timed:
-        return Cohort(0, 0, 0, 0.0, None, None, 0.0, None, None, 0.0)
+        return Cohort(0, 0, 0, 0, 0.0, None, None, None, 0.0, None, None, None, 0.0)
     face = [b.face.ms for b in timed if b.face.ms is not None]
     gaze = [b.gaze.ms for b in timed if b.gaze.ms is not None]
+    objects = [b.objects.ms for b in timed if b.objects.ms is not None]
     face_share = [s for s in (b.face_share for b in timed) if s is not None]
     gaze_share = [s for s in (b.gaze_share for b in timed) if s is not None]
+    object_share = [s for s in (b.object_share for b in timed) if s is not None]
     return Cohort(
         sessions=len(timed),
         measured_face=len(face),
         measured_gaze=len(gaze),
+        measured_objects=len(objects),
         median_period_ms=median([b.frame_period_ms for b in timed]),
         median_face_ms=median(face) if face else None,
         median_gaze_ms=median(gaze) if gaze else None,
+        median_objects_ms=median(objects) if objects else None,
         median_residual_ms=median([b.residual_ms for b in timed]),
         median_face_share=median(face_share) if face_share else None,
         median_gaze_share=median(gaze_share) if gaze_share else None,
+        median_objects_share=median(object_share) if object_share else None,
         median_residual_share=median([b.residual_share for b in timed]),
     )
 
@@ -397,7 +446,7 @@ def summarize(budgets: Sequence[SessionBudget]) -> BudgetSummary:
             median_ema_fps=0.0,
             stall_dominated=0,
             implausible_rate=0,
-            stages=Cohort(0, 0, 0, 0.0, None, None, 0.0, None, None, 0.0),
+            stages=Cohort(0, 0, 0, 0, 0.0, None, None, None, 0.0, None, None, None, 0.0),
             partial=PhaseCounts(0, 0, 0, 0),
         )
 
@@ -419,7 +468,9 @@ def summarize(budgets: Sequence[SessionBudget]) -> BudgetSummary:
             face_off=sum(1 for b in budgets if b.face.state == "disabled"),
             gaze_off=sum(1 for b in budgets if b.gaze.state == "disabled"),
             untimed_stages=sum(
-                (1 if b.face.state == "untimed" else 0) + (1 if b.gaze.state == "untimed" else 0)
+                (1 if b.face.state == "untimed" else 0)
+                + (1 if b.gaze.state == "untimed" else 0)
+                + (1 if b.objects.state == "untimed" else 0)
                 for b in budgets
             ),
         ),
@@ -447,13 +498,13 @@ def format_report(budget_set: BudgetSet) -> str:
 
     lines.append(
         f"{'session':<24}{'frames':>7}{'avg_fps':>8}{'ema_fps':>8}{'period_ms':>10}"
-        f"{'face_ms':>9}{'gaze_ms':>9}{'unattr_ms':>11}{'unattr':>8}  pacing"
+        f"{'face_ms':>9}{'gaze_ms':>9}{'obj_ms':>9}{'unattr_ms':>11}{'unattr':>8}  pacing"
     )
     for budget in budgets:
         lines.append(
             f"{budget.session_id:<24}{budget.frames_total:>7}{budget.avg_fps:>8.2f}"
             f"{budget.ema_fps:>8.2f}{budget.frame_period_ms:>10.1f}"
-            f"{budget.face.cell:>9}{budget.gaze.cell:>9}"
+            f"{budget.face.cell:>9}{budget.gaze.cell:>9}{budget.objects.cell:>9}"
             f"{budget.residual_ms:>11.1f}{budget.residual_share * 100:>7.1f}%"
             f"  {budget.pacing}"
         )
@@ -491,6 +542,10 @@ def format_report(budget_set: BudgetSet) -> str:
             f"over {cohort.measured_gaze} session(s)"
         )
         lines.append(
+            f"  object detection {_share(cohort.median_objects_share, cohort.median_objects_ms)}  "
+            f"over {cohort.measured_objects} session(s)"
+        )
+        lines.append(
             f"  unattributed     {cohort.median_residual_share * 100:5.1f}%  "
             f"({cohort.median_residual_ms:.1f} ms/frame)  - a remainder, not a measurement"
         )
@@ -506,18 +561,31 @@ def format_report(budget_set: BudgetSet) -> str:
 
     lines.append("")
     lines.append("What the record does and does not contain:")
-    lines.append("  recorded        face detection (`avg_detection_latency_ms`) and gaze inference")
-    lines.append("  NOT recorded    object detection: both loops call `detector.detect()` untimed, so")
-    lines.append("                  YOLO cost appears in no session record - it sits in 'unattr_ms'")
-    lines.append("  unattributed    object detection, capture, snapshot encoding, memory writes, HUD, idle")
+    lines.append("  recorded        face detection (`avg_detection_latency_ms`), gaze inference and, from")
+    lines.append("                  schema 8 on, object detection (`avg_object_detection_latency_ms`)")
+    legacy = sum(1 for b in budgets if b.objects.state == "untimed")
+    if legacy:
+        lines.append(
+            f"  NOT recorded    object detection in {legacy} session(s) written before schema 8: it ran"
+        )
+        lines.append("                  on every frame but nothing timed it, so it sits in 'unattr_ms'")
+    lines.append("  unattributed    capture, snapshot encoding, memory writes, HUD, idle, and object")
+    lines.append("                  detection in any session that carries no timing for it")
     if summary.partial.untimed_stages:
         lines.append(
             f"  untimed         {summary.partial.untimed_stages} stage(s) ran without a recorded latency "
             "and are shown as"
         )
         lines.append("                  '--', never as 0.0 ms: the timer measured a no-op")
-    lines.append("  pacing          `fps_cap` is absent from every record, so idle time cannot be split")
-    lines.append("                  from work even for a session that ran at its configured cap")
+    capped = sum(1 for b in budgets if b.pacing != "not-recorded")
+    if capped:
+        lines.append(
+            f"  pacing          `fps_cap` is recorded for {capped} session(s), so idle time is split"
+        )
+        lines.append("                  from work where the loop was pacing itself")
+    else:
+        lines.append("  pacing          `fps_cap` is absent from every record here, so idle time cannot be")
+        lines.append("                  split from work even for a session that ran at its configured cap")
 
     if budget_set.skipped:
         lines.append("")

@@ -2257,11 +2257,24 @@ SESSION_AGGREGATE_KEYS: tuple[str, ...] = (
     "moving_avg_fps",
     "min_fps",
     "max_fps",
+    # The configured ceiling, so `avg_fps` can be read as "held the cap" rather
+    # than "ran out of machine". 0 means uncapped, which the CLI loop is.
+    "fps_cap",
+    # Spread, not only a mean: a session averaging 0.82 fps contained a 178 fps
+    # instant, and a mean cannot tell work apart from stalls.
+    "frame_period_p50_ms",
+    "frame_period_p95_ms",
     "faces_per_sec",
     "avg_detection_latency_ms",
     "min_detection_latency_ms",
     "max_detection_latency_ms",
     "detection_calls",
+    # What `avg_detection_latency_ms` above actually measures is *face recognition*.
+    # Object detection was never timed at all, so it gets its own fields instead of
+    # being folded into a name that would then mean two things.
+    "object_detection_calls",
+    "avg_object_detection_latency_ms",
+    "max_object_detection_latency_ms",
     "avg_confidence",
     "recognition_rate",
     "unknown_rate",
@@ -2337,9 +2350,14 @@ class SessionAggregateInput:
     detection_latency_sum_ms: float = 0.0
     detection_latency_min_ms: float = float("inf")
     detection_latency_max_ms: float = 0.0
+    object_detection_calls: int = 0
+    object_detection_latency_sum_ms: float = 0.0
+    object_detection_latency_max_ms: float = 0.0
     fps_ema: float = 0.0
     fps_min: float = float("inf")
     fps_max: float = 0.0
+    fps_cap: int = 0
+    frame_periods_ms: list[float] = field(default_factory=list)
     object_detections_total: int = 0
     object_general_detections: int = 0
     object_custom_detections: int = 0
@@ -2398,6 +2416,20 @@ class SessionAggregateInput:
         def real_min(value: float) -> float:
             return 0.0 if value == float("inf") else _safe_float(value)
 
+        def percentile(values: list[float], fraction: float) -> float:
+            """Nearest-rank percentile of the per-frame periods.
+
+            An empty sample reports 0.0 rather than a plausible-looking guess, so a
+            session that recorded no periods cannot be read as a fast one.
+            """
+            if not values:
+                return 0.0
+            ordered = sorted(values)
+            index = round(fraction * (len(ordered) - 1))
+            return _safe_float(ordered[min(max(index, 0), len(ordered) - 1)])
+
+        periods = [_safe_float(period) for period in self.frame_periods_ms]
+
         return {
             "session_id": str(self.session_id),
             "frames_total": frames_total,
@@ -2414,6 +2446,9 @@ class SessionAggregateInput:
             "moving_avg_fps": round(_safe_float(self.fps_ema), 3),
             "min_fps": round(real_min(self.fps_min), 3),
             "max_fps": round(_safe_float(self.fps_max), 3),
+            "fps_cap": _safe_int(self.fps_cap),
+            "frame_period_p50_ms": round(percentile(periods, 0.5), 2),
+            "frame_period_p95_ms": round(percentile(periods, 0.95), 2),
             "faces_per_sec": round(ratio(detections_total, duration), 3),
             "avg_detection_latency_ms": round(
                 ratio(_safe_float(self.detection_latency_sum_ms), _safe_int(self.detection_calls)), 2
@@ -2421,6 +2456,17 @@ class SessionAggregateInput:
             "min_detection_latency_ms": round(real_min(self.detection_latency_min_ms), 2),
             "max_detection_latency_ms": round(_safe_float(self.detection_latency_max_ms), 2),
             "detection_calls": _safe_int(self.detection_calls),
+            "object_detection_calls": _safe_int(self.object_detection_calls),
+            "avg_object_detection_latency_ms": round(
+                ratio(
+                    _safe_float(self.object_detection_latency_sum_ms),
+                    _safe_int(self.object_detection_calls),
+                ),
+                2,
+            ),
+            "max_object_detection_latency_ms": round(
+                _safe_float(self.object_detection_latency_max_ms), 2
+            ),
             "avg_confidence": round(ratio(_safe_float(self.confidence_sum), detections_total), 4),
             "recognition_rate": round(
                 ratio(_safe_int(self.known_detections), detections_total), 6
@@ -2722,6 +2768,10 @@ def cmd_recognize(
     detection_latency_sum_ms = 0.0
     detection_latency_min_ms = float("inf")
     detection_latency_max_ms = 0.0
+    object_detection_calls = 0
+    object_detection_latency_sum_ms = 0.0
+    object_detection_latency_max_ms = 0.0
+    frame_periods_ms: list[float] = []
     detection_timeline: dict[str, int] = defaultdict(int)
 
     object_detections_total = 0
@@ -2796,6 +2846,7 @@ def cmd_recognize(
             fps_ema = inst_fps if fps_ema == 0.0 else (0.9 * fps_ema + 0.1 * inst_fps)
             fps_min = min(fps_min, inst_fps)
             fps_max = max(fps_max, inst_fps)
+            frame_periods_ms.append(dt * 1000.0)
 
             detect_t0 = time.perf_counter()
             face_rows = _detect(app, frame)
@@ -2805,6 +2856,12 @@ def cmd_recognize(
             detection_latency_min_ms = min(detection_latency_min_ms, latency_ms)
             detection_latency_max_ms = max(detection_latency_max_ms, latency_ms)
 
+            # Object detection is timed on its own. Lumping it in with the face
+            # recognition call above is why `avg_detection_latency_ms` reads as
+            # object detection while measuring face recognition, and why object
+            # detection appeared in no record at all (see OBJECT_DETECTION_PLAN.md
+            # section 2h: the frame budget could not be closed from the log).
+            object_t0 = time.perf_counter()
             try:
                 object_rows = detector.detect(frame)
             except Exception as exc:
@@ -2813,6 +2870,12 @@ def cmd_recognize(
                     detector_error_seen = True
                     add_event("object_detect_error", str(exc), severity="alert")
                     print(f"Object detection error: {exc}")
+            object_latency_ms = (time.perf_counter() - object_t0) * 1000.0
+            object_detection_calls += 1
+            object_detection_latency_sum_ms += object_latency_ms
+            object_detection_latency_max_ms = max(
+                object_detection_latency_max_ms, object_latency_ms
+            )
 
             face_count = len(face_rows)
             object_count = len(object_rows)
@@ -3279,9 +3342,16 @@ def cmd_recognize(
         detection_latency_sum_ms=detection_latency_sum_ms,
         detection_latency_min_ms=detection_latency_min_ms,
         detection_latency_max_ms=detection_latency_max_ms,
+        object_detection_calls=object_detection_calls,
+        object_detection_latency_sum_ms=object_detection_latency_sum_ms,
+        object_detection_latency_max_ms=object_detection_latency_max_ms,
         fps_ema=fps_ema,
         fps_min=fps_min,
         fps_max=fps_max,
+        # This loop runs as fast as the machine allows, so it has no ceiling to
+        # report. 0 is "uncapped", not "capped at zero".
+        fps_cap=0,
+        frame_periods_ms=frame_periods_ms,
         object_detections_total=object_detections_total,
         object_general_detections=object_general_detections,
         object_custom_detections=object_custom_detections,
@@ -3645,6 +3715,9 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
     moving_avg_fps = _safe_float(raw_aggregate.get("moving_avg_fps"), avg_fps)
     min_fps = _safe_float(raw_aggregate.get("min_fps"), avg_fps)
     max_fps = _safe_float(raw_aggregate.get("max_fps"), avg_fps)
+    fps_cap = _safe_int(raw_aggregate.get("fps_cap"), 0)
+    frame_period_p50_ms = _safe_float(raw_aggregate.get("frame_period_p50_ms"), 0.0)
+    frame_period_p95_ms = _safe_float(raw_aggregate.get("frame_period_p95_ms"), 0.0)
     frames_empty = _safe_int(raw_aggregate.get("frames_empty"), max(frames_total - frames_with_faces, 0))
 
     aggregate = {
@@ -3668,6 +3741,9 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
         "moving_avg_fps": moving_avg_fps,
         "min_fps": min_fps,
         "max_fps": max_fps,
+        "fps_cap": fps_cap,
+        "frame_period_p50_ms": frame_period_p50_ms,
+        "frame_period_p95_ms": frame_period_p95_ms,
         "faces_per_sec": faces_per_sec,
         "avg_detection_latency_ms": _safe_float(
             raw_aggregate.get("avg_detection_latency_ms", event.get("avg_detection_latency_ms", 0.0)),
@@ -3682,6 +3758,13 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
             0.0,
         ),
         "detection_calls": _safe_int(raw_aggregate.get("detection_calls", event.get("detection_calls", 0)), 0),
+        "object_detection_calls": _safe_int(raw_aggregate.get("object_detection_calls"), 0),
+        "avg_object_detection_latency_ms": _safe_float(
+            raw_aggregate.get("avg_object_detection_latency_ms"), 0.0
+        ),
+        "max_object_detection_latency_ms": _safe_float(
+            raw_aggregate.get("max_object_detection_latency_ms"), 0.0
+        ),
         "avg_confidence": avg_conf,
         "recognition_rate": _safe_float(
             raw_aggregate.get("recognition_rate"),

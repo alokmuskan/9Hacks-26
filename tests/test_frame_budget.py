@@ -84,6 +84,40 @@ class PeriodTests(unittest.TestCase):
 class UntimedStageTests(unittest.TestCase):
     """A missing measurement must never read as a fast one."""
 
+    def test_object_detection_is_timed_when_the_record_carries_it(self):
+        """Schema 8+: object detection gets its own cost instead of hiding in the residual."""
+        budget, _ = fb.build_budget(
+            _row(
+                object_detection_calls=100,
+                avg_object_detection_latency_ms=20.0,
+            )
+        )
+
+        self.assertEqual(budget.objects.state, "measured")
+        # 100 calls x 20 ms spread over 100 frames = 20 ms per frame.
+        self.assertAlmostEqual(budget.objects.ms, 20.0, places=6)
+        self.assertLess(budget.residual_ms, budget.frame_period_ms)
+
+    def test_a_record_from_before_the_instrumentation_reads_untimed_not_off(self):
+        """Object detection ran on every frame of those sessions; nothing timed it.
+
+        Rendering `off` would claim the detector was switched off, which is a
+        different and false statement, so the field's absence must not do that.
+        """
+        budget, _ = fb.build_budget(_row())
+
+        self.assertEqual(budget.objects.state, "untimed")
+        self.assertEqual(budget.objects.cell, fb.NOT_RECORDED)
+        self.assertFalse(budget.fully_recorded)
+
+    def test_the_detector_being_switched_off_is_not_an_untimed_stage(self):
+        budget, _ = fb.build_budget(
+            _row(object_detection_calls=0, avg_object_detection_latency_ms=0.0)
+        )
+
+        self.assertEqual(budget.objects.state, "disabled")
+        self.assertEqual(budget.objects.cell, fb.DISABLED)
+
     def test_face_detection_with_no_recorded_latency_is_not_zero(self):
         budget, _ = fb.build_budget(
             _row(detection_calls=100, avg_detection_latency_ms=0.0)
@@ -297,15 +331,30 @@ class CollectionTests(unittest.TestCase):
 
 class ReportTests(unittest.TestCase):
     def _report(self) -> str:
-        rows = [_row(), _row(session_id="monitor-test-alloff", face_recognition_enabled=False, detection_calls=100, avg_detection_latency_ms=0.0, gaze_enabled=False, gaze_inference_calls=0, gaze_inference_avg_ms=0.0)]
+        rows = [
+            _row(),
+            _row(
+                session_id="monitor-test-alloff",
+                face_recognition_enabled=False,
+                detection_calls=100,
+                avg_detection_latency_ms=0.0,
+                gaze_enabled=False,
+                gaze_inference_calls=0,
+                gaze_inference_avg_ms=0.0,
+                object_detection_calls=0,
+                avg_object_detection_latency_ms=0.0,
+            ),
+        ]
         return fb.format_report(fb.collect_budgets(rows))
 
-    def test_the_report_states_that_object_detection_is_not_recorded(self):
+    def test_the_report_names_object_detection_per_session(self):
         """The single most misleading omission: 'detection' in the log means faces."""
         text = self._report()
 
+        # Only the legacy row lacks the timing, so only it is called NOT recorded.
         self.assertIn("NOT recorded", text)
-        self.assertIn("detector.detect()", text)
+        self.assertIn("written before schema 8", text)
+        self.assertIn("object detection", text)
 
     def test_the_report_says_the_unattributed_share_is_a_remainder(self):
         self.assertIn("a remainder, not a measurement", self._report())
@@ -317,9 +366,13 @@ class ReportTests(unittest.TestCase):
         lines = [line for line in self._report().splitlines() if line.startswith("monitor-test")]
         by_session = {line.split()[0]: line for line in lines}
 
-        row = by_session["monitor-test-alloff"]
-        self.assertIn(f" {fb.DISABLED} ", row)
-        self.assertNotIn(fb.NOT_RECORDED, row)
+        alloff = by_session["monitor-test-alloff"]
+        older = by_session["monitor-test-000000"]
+
+        # A stage that did not run renders `off`; one that ran untimed renders `--`.
+        self.assertIn(f" {fb.DISABLED} ", alloff)
+        self.assertNotIn(fb.NOT_RECORDED, alloff)
+        self.assertIn(fb.NOT_RECORDED, older)
 
     def test_no_sessions_produces_a_statement_rather_than_an_empty_table(self):
         text = fb.format_report(fb.collect_budgets([]))

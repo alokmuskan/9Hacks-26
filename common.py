@@ -23,7 +23,7 @@ from typing import Any
 
 # Bump a version when the shape of that record changes. Readers normalise older
 # rows, so both entry points must agree on the number they write.
-SESSION_SCHEMA_VERSION = 7
+SESSION_SCHEMA_VERSION = 8
 ENROLL_SCHEMA_VERSION = 4
 OBJECT_TRAIN_SCHEMA_VERSION = 1
 

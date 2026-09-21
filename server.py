@@ -946,6 +946,10 @@ class PipelineManager:
         chat_queries_llm = 0
         detection_latency_sum_ms = 0.0
         detection_calls = 0
+        object_detection_calls = 0
+        object_detection_latency_sum_ms = 0.0
+        object_detection_latency_max_ms = 0.0
+        frame_periods_ms: list[float] = []
         detection_latency_min_ms = float("inf")
         detection_latency_max_ms = 0.0
         gaze_inference_calls = 0
@@ -1044,6 +1048,7 @@ class PipelineManager:
                 fps_ema = inst_fps if fps_ema == 0.0 else (0.9 * fps_ema + 0.1 * inst_fps)
                 fps_min = min(fps_min, inst_fps)
                 fps_max = max(fps_max, inst_fps)
+                frame_periods_ms.append(dt * 1000.0)
 
                 detect_t0 = time.perf_counter()
                 face_rows = core._detect(app, frame)
@@ -1053,6 +1058,10 @@ class PipelineManager:
                 detection_latency_min_ms = min(detection_latency_min_ms, det_ms)
                 detection_latency_max_ms = max(detection_latency_max_ms, det_ms)
 
+                # Timed separately from the face recognition call above, which is
+                # what `avg_detection_latency_ms` has always measured. Object
+                # detection was previously in no record at all.
+                object_t0 = time.perf_counter()
                 try:
                     object_rows = detector.detect(frame)
                 except Exception as exc:
@@ -1063,6 +1072,12 @@ class PipelineManager:
                         detector_error_seen = True
                         add_event("object_detect_error", str(exc), severity="alert")
                         LOGGER.warning("Object detection error: %s", exc)
+                object_latency_ms = (time.perf_counter() - object_t0) * 1000.0
+                object_detection_calls += 1
+                object_detection_latency_sum_ms += object_latency_ms
+                object_detection_latency_max_ms = max(
+                    object_detection_latency_max_ms, object_latency_ms
+                )
 
                 face_count = len(face_rows)
                 object_count = len(object_rows)
@@ -1452,9 +1467,14 @@ class PipelineManager:
                 detection_latency_sum_ms=detection_latency_sum_ms,
                 detection_latency_min_ms=detection_latency_min_ms,
                 detection_latency_max_ms=detection_latency_max_ms,
+                object_detection_calls=object_detection_calls,
+                object_detection_latency_sum_ms=object_detection_latency_sum_ms,
+                object_detection_latency_max_ms=object_detection_latency_max_ms,
                 fps_ema=fps_ema,
                 fps_min=fps_min,
                 fps_max=fps_max,
+                fps_cap=self._fps_cap,
+                frame_periods_ms=frame_periods_ms,
                 object_detections_total=object_detections_total,
                 object_general_detections=object_general_detections,
                 object_custom_detections=object_custom_detections,

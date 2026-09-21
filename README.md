@@ -90,27 +90,27 @@ On top of that data, the platform provides a **query layer**: deterministic natu
 
 ```
                        ┌────────────────────────┐
-   Camera / video ───► │  Async frame reader     │  (background thread, latest-frame slot)
+   Camera / video ───► │  Async frame reader    │  (background thread, latest-frame slot)
                        └───────────┬────────────┘
                                    ▼
                        ┌────────────────────────┐
-                       │ Face detect + recognize │  InsightFace
+                       │ Face detect + recognize│  InsightFace
                        └───────────┬────────────┘
                                    ▼
               ┌────────────────────┴────────────────────┐
               ▼                                         ▼
    ┌────────────────────┐                    ┌────────────────────┐
-   │ Object detection    │                   │ Gaze estimation     │
-   │ YOLO general/custom │                   │ L2CS-Net            │
-   └──────────┬──────────┘                   └──────────┬──────────┘
-              └───────────────┬──────────────────────────┘
+   │ Object detection   │                   │ Gaze estimation    │
+   │ YOLO general/custom│                   │ L2CS-Net           │
+   └──────────┬─────────┘                   └──────────┬─────────┘
+              └───────────────┬─────────────────────────┘
                               ▼
                  ┌──────────────────────────┐
-                 │ Gaze → object fusion      │  inside box (+8 px) / nearest (≤120 px)
+                 │ Gaze → object fusion     │  inside box (+8 px) / nearest (≤120 px)
                  └───────────┬──────────────┘
                              ▼
                  ┌──────────────────────────┐
-                 │ Behavior tracker          │  window 5 frames, confirm 3, end timeout 1.0 s
+                 │ Behavior tracker         │  window 5 frames, confirm 3, end timeout 1.0 s
                  └───────────┬──────────────┘
                              ▼
      ┌───────────────────────┼────────────────────────┬─────────────────────┐
@@ -504,9 +504,9 @@ pixi run python main.py frame-budget --limit 5 --json budget.json
 ```
 
 ```
-session                  frames avg_fps ema_fps period_ms  face_ms  gaze_ms  unattr_ms  unattr  pacing
-monitor-20260920-104542      38    0.68    1.73    1470.6     65.6    433.2      971.8   66.1%  not-recorded
-monitor-20260921-191819     362    4.75    4.73     210.5      off      off      210.5  100.0%  not-recorded
+session                  frames avg_fps ema_fps period_ms  face_ms  gaze_ms   obj_ms  unattr_ms  unattr  pacing
+monitor-20260920-104542      38    0.68    1.73    1470.6     65.6    433.2       --      971.8   66.1%  not-recorded
+monitor-20260921-191819     362    4.75    4.73     210.5      off      off       --      210.5  100.0%  not-recorded
 
 12 session(s), 1300 frames, 718.5 s: median 0.83 fps (range 0.68-9.39), median EMA rate 2.80 fps
   5 session(s) are stall-dominated (EMA rate above 2x the session average)
@@ -514,14 +514,19 @@ monitor-20260921-191819     362    4.75    4.73     210.5      off      off     
 Stage accounting, as a share of each session's mean period (median):
   face detection     3.6%  (41.1 ms/frame)  over 8 session(s)
   gaze              28.3%  (334.5 ms/frame)  over 6 session(s)
+  object detection not recorded in this cohort  over 0 session(s)
   unattributed      69.1%  (833.6 ms/frame)  - a remainder, not a measurement
 ```
 
+The `--` above is not an accident: those sessions were recorded before the instrumentation below existed, so the report names them under `written before schema 8` rather than pretending the stage was off.
+
 It refuses three things, each because the record does not support them:
 
-- **It never reports a missing measurement as zero.** `avg_detection_latency_ms` in the log times **face detection**, not the YOLO object detector — both loops call `detector.detect()` untimed — so object detection appears in *no* session record. The report says so, and the remainder is labelled `unattr_ms` rather than given a stage name it never had.
-- **It does not treat a session average as a per-frame cost.** Five of the twelve recorded sessions have an EMA frame rate more than 2× their session average (one reached 178 fps instantaneously against a 0.82 fps mean), so their period is dominated by stalls and is flagged rather than smoothed in.
+- **It never reports a missing measurement as zero.** `avg_detection_latency_ms` in the log has always timed **face recognition**, not the YOLO object detector. Sessions from schema 8 on carry object detection separately (`avg_object_detection_latency_ms`, `object_detection_calls`); older ones show `--` and the report says why, because the remainder is labelled `unattr_ms` rather than given a stage name it never had.
+- **It does not treat a session average as a per-frame cost.** Five of the twelve recorded sessions have an EMA frame rate more than 2× their session average (one reached 178 fps instantaneously against a 0.82 fps mean), so their period is dominated by stalls and is flagged rather than smoothed in. Sessions from schema 8 on also record `frame_period_p50_ms` / `frame_period_p95_ms`, so a spread is available without re-deriving it from the mean.
 - **It renders three different states differently**: a timed stage, `off` (the stage did not run), and `--` (it ran with no recorded latency). A disabled stage still counts its calls and still wraps a no-op in a timer, so it reports ~0.01 ms; believing that would record a missing measurement as a fast one.
+
+`fps_cap` is recorded too, so a session that was pacing itself can be told apart from one that simply ran out of machine — the second refusal above only applies where the cap is absent.
 
 Sessions that cannot produce a period at all are listed by name under `Skipped rows` instead of being dropped.
 

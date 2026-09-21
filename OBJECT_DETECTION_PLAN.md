@@ -8,7 +8,8 @@ as the frames on disk allow. Phase 2 fixed the model-name fallback (§2d) and th
 `yolo11*` and **rejected** it (§2e). The harness gap that made that comparison inconclusive was
 partly closed by a dataset validator and a latency distribution (§2g); the frame budget was
 read out of the recorded sessions (§2h), which found that the session log records *face*
-detection latency rather than object detection and cannot close a per-frame budget. The
+detection latency rather than object detection and could not close a per-frame budget — the
+three fields whose absence was why are now recorded (§2h follow-up). The
 labelled-frame-set block was worked around rather than accepted (§2i): reviewing the detector's
 own output produced the project's first measured **precision — 0.911 over 124 boxes, 100%
 reviewed** — and the one zero-precision class it found is now filtered by configuration.
@@ -686,12 +687,36 @@ result is *why* neither source can answer it:
   more than 2× in five of twelve sessions.
 
 Closing it therefore needs instrumentation rather than analysis: time `detector.detect()`
-into the aggregate, record `fps_cap`, and record a frame-duration distribution. That is a
-separate, small change, and it is **not** made here — this section changes no recorded
+into the aggregate, record `fps_cap`, and record a frame-duration distribution. *(All three
+have since been recorded — see the **§2h follow-up** immediately after this section. The
+diagnosis above stands as written: it is what the log looked like when this was measured, and
+the sessions it describes still carry no object-detection timing.)* That is a
+separate, small change, and it was **not** made here — this section changes no recorded
 field and no runtime behaviour.
 
 **Status: written, 30 unit tests, full battery green (299 tests, `ruff` clean, `mypy`
 clean across 8 files). No Phase 3 decision is made or implied.**
+
+### 2h follow-up: the three fields the log was missing
+
+§2h concluded that the session log *cannot* close a frame budget, and named the three
+reasons. All three are now recorded (session schema 7 -> 8):
+
+| Field | Why it was needed |
+| --- | --- |
+| `object_detection_calls`, `avg_object_detection_latency_ms`, `max_object_detection_latency_ms` | Both loops called `detector.detect()` **untimed**, so object detection appeared in no session record at all. `avg_detection_latency_ms` was always face *recognition*, which the name concealed |
+| `fps_cap` | Without the configured ceiling, `avg_fps` cannot be read as "held the cap" rather than "ran out of machine" -- and idle pacing time cannot be separated from work |
+| `frame_period_p50_ms`, `frame_period_p95_ms` | A session averaging 0.82 fps contained a 178 fps instant. A mean cannot tell a slow pipeline apart from a stall-dominated one, and four of the twelve recorded sessions are stall-dominated |
+
+`frame_budget.py` reads all three, and its `--` rendering is load-bearing: the presence of
+`object_detection_calls` is the signal, because the twelve sessions already on disk ran the
+detector on every frame without timing it. Those render `untimed` (`--`), never `off` ("the
+stage did not run"), which would be a different and false statement. The report now prints how
+many sessions predate the change instead of describing the old limitation as a current one.
+
+**What this does and does not buy.** It makes the frame-budget question answerable from the
+*next* session onwards. It cannot answer it for the sessions already recorded -- that data was
+never captured and is not recoverable. No measurement in this document changes as a result.
 
 ## 2i. Closing the accuracy question without new data
 
@@ -935,7 +960,9 @@ measurement can satisfy is a bug in the plan (see §2c).
    the harness cannot answer it in its current form — it measures detection only,
    roughly a sixth of the frame (measured more precisely in §2h: about 7% of the median
    recorded period, and the recorded period is itself stall-dominated in five of twelve
-   sessions). §2h also establishes that the session log cannot answer it either, and names
-   the three fields whose absence is why. §2e made the question less urgent for *model choice*
-   (no variant earned its cost regardless of the budget), but it remains the gate for
-   Phase 3's end-to-end verification and for any `imgsz` change.
+   sessions). §2h also establishes that the session log could not answer it either, and names
+   the three fields whose absence was why; those three are now recorded (§2h follow-up), so the
+   question becomes answerable **from the next session onwards** — the twelve sessions already on
+   disk still cannot be attributed, and no number in this document changes. §2e made the question
+   less urgent for *model choice* (no variant earned its cost regardless of the budget), but it
+   remains the gate for Phase 3's end-to-end verification and for any `imgsz` change.
