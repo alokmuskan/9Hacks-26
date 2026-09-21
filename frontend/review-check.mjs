@@ -55,7 +55,7 @@ try {
   check("indices are unique so a verdict is unambiguous", unique.size === indices.length);
 
   // Nothing touched yet: the page must not imply any box was judged.
-  const before = await page.$eval("#progress", (n) => n.textContent);
+  const before = await page.$eval(".progress", (n) => n.textContent);
   check("an untouched list counts zero reviewed", /reviewed 0 \//.test(before), before);
 
   // Mark the first two rows, one each way.
@@ -63,8 +63,8 @@ try {
   await page.click(`.row[data-index="${first}"] button.yes`);
   await page.click(`.row[data-index="${second}"] button.no`);
 
-  const after = await page.$eval("#progress", (n) => n.textContent);
-  const wrong = await page.$eval("#wrongcount", (n) => n.textContent);
+  const after = await page.$eval(".progress", (n) => n.textContent);
+  const wrong = await page.$eval(".wrongcount", (n) => n.textContent);
   check("clicking updates the reviewed counter", /reviewed 2 \//.test(after), after);
   check("clicking updates the wrong counter", /wrong 1/.test(wrong), wrong);
 
@@ -96,13 +96,13 @@ try {
   const keys = await page.$$eval(".row", (nodes) => nodes.map((n) => n.dataset.index));
 
   await page.keyboard.press("y");
-  const afterY = await page.$eval("#progress", (n) => n.textContent);
+  const afterY = await page.$eval(".progress", (n) => n.textContent);
   check("pressing Y marks the highlighted box", /reviewed 1 \//.test(afterY), afterY);
   const yState = await page.$eval(`#state-${keys[0]}`, (n) => n.textContent);
   check("Y records the box as correct", yState.trim() === "correct", yState);
 
   await page.keyboard.press("n");
-  const afterN = await page.$eval("#progress", (n) => n.textContent);
+  const afterN = await page.$eval(".progress", (n) => n.textContent);
   check("N marks the next box without a click", /reviewed 2 \//.test(afterN), afterN);
   const nState = await page.$eval(`#state-${keys[1]}`, (n) => n.textContent);
   check("N records the box as wrong", nState.trim() === "wrong", nState);
@@ -116,13 +116,27 @@ try {
 
   await page.click(`#missed-${keys[2]}`);
   await page.type(`#missed-${keys[2]}`, "yn");
-  const afterTyping = await page.$eval("#progress", (n) => n.textContent);
+  const afterTyping = await page.$eval(".progress", (n) => n.textContent);
   check("typing y/n in a note field is not read as a verdict", /reviewed 2 \//.test(afterTyping), afterTyping);
+
+  // A sticky header would overlay the cards and swallow clicks on the top rows.
+  const sticky = await page.$eval("header", (n) => getComputedStyle(n).position);
+  check("the header does not stick over the cards", sticky !== "sticky", sticky);
+
+  const footerCounters = await page.$$eval("footer .progress", (nodes) => nodes.length);
+  check("the counters are mirrored at the end of the list", footerCounters === 1);
 
   const honesty = await page.$eval("header .honest", (n) => n.textContent.replace(/\s+/g, " "));
   check("the page states it measures precision only", /precision only/.test(honesty));
   check("the page states it cannot measure recall", /cannot measure recall/.test(honesty));
   check("the page states unreviewed is not correct", /never as correct/.test(honesty));
+
+  const rubric = await page.$eval("details.rubric", (n) => n.textContent.replace(/\s+/g, " "));
+  check("the page states the verdict criteria", /right object, right place/i.test(rubric));
+  check("the rubric keeps a sloppy-on-the-right-object box correct", /still Correct/.test(rubric));
+  check("the rubric says a duplicate box on one object is wrong", /One object, two boxes/.test(rubric));
+  check("the rubric says label correctness is not about usefulness", /not.*about usefulness/.test(rubric));
+  check("the rubric says an undecidable box stays unreviewed", /Leave it unreviewed/.test(rubric));
 
   const noindex = await page.$eval('meta[name="robots"]', (n) => n.content);
   check("the page is noindex because it shows a camera", /noindex/.test(noindex), noindex);

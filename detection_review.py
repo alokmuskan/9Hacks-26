@@ -439,7 +439,10 @@ def render_page(rows: list[ReviewRow], *, source: str, list_id: str = "") -> str
 <style>
   :root {{ color-scheme: dark; }}
   body {{ font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #14161a; color: #e7e9ee; }}
-  header {{ position: sticky; top: 0; background: #1b1e24; padding: 14px 18px; border-bottom: 1px solid #2b3038; }}
+  /* Deliberately not sticky: a sticky header overlays the cards as you scroll, so a
+     click on a box near the top lands on the header instead of its button. */
+  header {{ background: #1b1e24; padding: 14px 18px; border-bottom: 1px solid #2b3038; }}
+  footer {{ background: #1b1e24; padding: 14px 18px; border-top: 1px solid #2b3038; }}
   h1 {{ margin: 0 0 6px; font-size: 16px; }}
   .honest {{ color: #b6bcc8; font-size: 12px; max-width: 900px; }}
   .bar {{ display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-top: 10px; }}
@@ -462,6 +465,12 @@ def render_page(rows: list[ReviewRow], *, source: str, list_id: str = "") -> str
   .state {{ font-size: 12px; color: #8fa0b8; }}
   .missed {{ margin-top: 8px; width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px;
              border: 1px solid #3a4049; background: #14161a; color: #e7e9ee; font: inherit; }}
+  details.rubric {{ margin-top: 10px; max-width: 900px; background: #23272f; border: 1px solid #3a4049;
+                    border-radius: 8px; padding: 8px 12px; }}
+  details.rubric summary {{ cursor: pointer; font-weight: 600; }}
+  details.rubric ul {{ margin: 8px 0 2px; padding-left: 20px; color: #cfd5e0; font-size: 13px;
+                       display: block; grid-template-columns: none; }}
+  details.rubric li {{ margin-bottom: 4px; }}
 </style>
 </head>
 <body>
@@ -474,12 +483,35 @@ def render_page(rows: list[ReviewRow], *, source: str, list_id: str = "") -> str
     says nothing about any other scene. Frames you leave <em>unreviewed</em> are reported as
     unreviewed, never as correct.
   </p>
+  <details class="rubric" open>
+    <summary>What counts as Correct, and what counts as Wrong</summary>
+    <ul>
+      <li><strong>Correct</strong> \u2014 the green box is on the thing the label names, and that thing
+          really is in the frame. Right object, right place: both, or it is Wrong.</li>
+      <li><strong>Wrong</strong> \u2014 the label does not match what is inside the box (pale curtain folds
+          labelled <em>surfboard</em>), or the box sits on something that is not a real object of
+          that class at all.</li>
+      <li>A sloppy but clearly on-the-right-object box is still <strong>Correct</strong>. This measures
+          whether the detection is right, not how tight the box is.</li>
+      <li>One object, two boxes: mark the best-fitting one <strong>Correct</strong>, the surplus one
+          <strong>Wrong</strong>. One object is one detection.</li>
+      <li>An object cut off by the frame edge is still <strong>Correct</strong> if the visible part is right.
+          Same for a box that includes a hand around the object.</li>
+      <li>Correctness is about the label, <em>not</em> about usefulness. A real surfboard labelled
+          <em>surfboard</em> is <strong>Correct</strong> even though this project does not want one.
+          What you choose to keep is a separate decision, made later.</li>
+      <li>Cannot tell? Leave it <strong>unreviewed</strong> rather than guessing \u2014 the score reports
+          that as coverage and treats the result as a sample. A guess does not.</li>
+      <li>Judge only the box that is drawn. Anything you see that has no box goes in the note field,
+          not in a verdict.</li>
+    </ul>
+  </details>
   <div class="bar">
-    <span id="progress">reviewed 0 / {len(rows)}</span>
-    <span id="wrongcount">wrong 0</span>
+    <span class="progress">reviewed 0 / {len(rows)}</span>
+    <span class="wrongcount">wrong 0</span>
     <button type="button" onclick="downloadVerdicts()">Download verdicts.json</button>
     <button type="button" onclick="copyVerdicts()">Copy JSON</button>
-    <span id="copied" class="state"></span>
+    <span class="copied state"></span>
   </div>
   <p class="honest" style="margin: 8px 0 0">
     Keyboard: <strong>Y</strong> = correct, <strong>N</strong> = wrong (the highlighted box advances
@@ -490,6 +522,15 @@ def render_page(rows: list[ReviewRow], *, source: str, list_id: str = "") -> str
 <ul id="rows">
 {body}
 </ul>
+<footer>
+  <div class="bar">
+    <span class="progress">reviewed 0 / {len(rows)}</span>
+    <span class="wrongcount">wrong 0</span>
+    <button type="button" onclick="downloadVerdicts()">Download verdicts.json</button>
+    <button type="button" onclick="copyVerdicts()">Copy JSON</button>
+    <span class="copied state"></span>
+  </div>
+</footer>
 <script>
 const verdicts = {{}};
 const missed = {{}};
@@ -513,11 +554,12 @@ function collect() {{
   }});
   return JSON.stringify({{fingerprint: "{list_id}", verdicts: verdicts, missed: missed}}, null, 2);
 }}
+function each(selector, set) {{ document.querySelectorAll(selector).forEach(set); }}
 function update() {{
   const n = Object.keys(verdicts).length;
   const w = Object.values(verdicts).filter(function (v) {{ return v === false; }}).length;
-  document.getElementById('progress').textContent = 'reviewed ' + n + ' / {len(rows)}';
-  document.getElementById('wrongcount').textContent = 'wrong ' + w;
+  each('.progress', function (el) {{ el.textContent = 'reviewed ' + n + ' / {len(rows)}'; }});
+  each('.wrongcount', function (el) {{ el.textContent = 'wrong ' + w; }});
 }}
 function downloadVerdicts() {{
   const blob = new Blob([collect()], {{type: 'application/json'}});
@@ -529,7 +571,7 @@ function downloadVerdicts() {{
 }}
 function copyVerdicts() {{
   const text = collect();
-  const done = function () {{ document.getElementById('copied').textContent = 'copied'; }};
+  const done = function () {{ each('.copied', function (el) {{ el.textContent = 'copied'; }}); }};
   if (navigator.clipboard) {{ navigator.clipboard.writeText(text).then(done, done); }}
   else {{ window.prompt('Copy this JSON', text); }}
 }}
