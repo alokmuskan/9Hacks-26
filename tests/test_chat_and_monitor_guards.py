@@ -1,5 +1,7 @@
 import importlib
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -479,6 +481,85 @@ class MonitorWorkerResilienceTests(unittest.TestCase):
             ),
             "no pipeline_state event reported the missing face recogniser",
         )
+
+
+class GroqReasoningModelWiringTests(unittest.TestCase):
+    """The default Groq model is a reasoning model: it spends completion tokens
+    on internal reasoning before answering, so without reasoning_effort the
+    350-500 token budget is exhausted by the chain-of-thought and the API
+    returns EMPTY content - which the chat path reported as "response
+    unavailable" despite a valid key. These tests pin the wiring so it cannot
+    silently regress."""
+
+    def setUp(self):
+        _install_stubs()
+        self.main = importlib.import_module("main")
+        self.server = importlib.import_module("server")
+
+    def _capture(self, fake_response):
+        captured: dict = {}
+
+        class _FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return fake_response
+
+        class _FakeChat:
+            completions = _FakeCompletions()
+
+        class _FakeClient:
+            def __init__(self, api_key=None):
+                self.chat = _FakeChat()
+
+        return captured, _FakeClient
+
+    @staticmethod
+    def _response(content):
+        choice = type("Choice", (), {"message": type("Msg", (), {"content": content})()})
+        return type("Resp", (), {"choices": [choice()]})()
+
+    def test_grounded_call_sets_reasoning_effort_and_reads_content(self):
+        captured, fake_client = self._capture(self._response("Alok is present [C1]."))
+        with (
+            mock.patch.dict(os.environ, {"GROQ_API_KEY": "k"}),
+            mock.patch.dict(sys.modules, {"groq": mock.MagicMock(Groq=fake_client)}),
+        ):
+            answer, ok = self.server._query_groq_grounded(
+                question="who is present",
+                session_history=[],
+                grounding={"citations": []},
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(answer, "Alok is present [C1].")
+        self.assertEqual(captured["extra_body"].get("reasoning_effort"), "low")
+        self.assertGreaterEqual(captured["max_tokens"], 500)
+
+    def test_empty_content_falls_back_deterministically(self):
+        _, fake_client = self._capture(self._response(""))
+        with (
+            mock.patch.dict(os.environ, {"GROQ_API_KEY": "k"}),
+            mock.patch.dict(sys.modules, {"groq": mock.MagicMock(Groq=fake_client)}),
+        ):
+            answer, ok = self.server._query_groq_grounded(
+                question="who is present",
+                session_history=[],
+                grounding={"citations": []},
+            )
+
+        self.assertFalse(ok)
+        self.assertIsNone(answer)
+
+    def test_cli_chat_call_sets_reasoning_effort(self):
+        captured, fake_client = self._capture(self._response("Alok is present."))
+        with (
+            mock.patch.dict(os.environ, {"GROQ_API_KEY": "k"}),
+            mock.patch.dict(sys.modules, {"groq": mock.MagicMock(Groq=fake_client)}),
+        ):
+            answer = self.main._query_groq("who is present", {"people_present": ["alok"]})
+
+        self.assertEqual(answer, "Alok is present.")
+        self.assertEqual(captured["extra_body"].get("reasoning_effort"), "low")
 
 
 if __name__ == "__main__":

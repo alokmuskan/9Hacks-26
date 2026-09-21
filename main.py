@@ -1931,10 +1931,12 @@ def _query_groq(question: str, context: dict[str, Any]) -> str | None:
 
     try:
         client = Groq(api_key=api_key)
+        # Reasoning model: see the longer comment in server.py's grounded path.
         response = client.chat.completions.create(
             model=GROQ_MODEL_DEFAULT,
             temperature=0.2,
             max_tokens=350,
+            extra_body={"reasoning_effort": "low"},
             messages=[
                 {"role": "system", "content": GROQ_SYSTEM_PROMPT},
                 {

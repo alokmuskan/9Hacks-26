@@ -315,7 +315,7 @@ All variables are optional; the defaults below reflect the code.
 | `AI_STUDIO_ENROLL_FPS_CAP` | `20` | backend | Same ceiling for enrollment sessions (kept faster on purpose; sample collection wants rate) |
 | `AI_STUDIO_SNAPSHOT_INTERVAL` | `8.0` | backend | Seconds between auto snapshots — the instances reports and chat ground on. Runs on wall-clock time, independent of FPS; clamped to 1–3600 |
 | `GROQ_API_KEY` *(or `groq_api_key`)* | unset | backend | Enables the LLM chat fallback |
-| `GROQ_MODEL` | `openai/gpt-oss-120b` | backend | Groq model name |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | backend | Groq model name. `gpt-oss-*` are reasoning models — the code sends `reasoning_effort=low` so the answer fits the token budget |
 | `PORT` | `8000` | backend | Port for `python server.py` |
 | `VITE_API_BASE` | `http://localhost:8000` | frontend | Backend base URL (also used to derive the WebSocket URL) |
 
@@ -661,7 +661,8 @@ Base URL: `http://localhost:8000`
 | Method | Path | Query parameters |
 | --- | --- | --- |
 | `GET` | `/api/v1/memory/stats` | - |
-| `GET` | `/api/v1/memory/recent` | `minutes` (1-1440), `limit` (1-200) |
+| `GET` | `/api/v1/memory/recent` | `minutes` (1-1440), `limit` (1-200); capped to the last monitoring session's window; response reports `effective_minutes`, `session_window_minutes`, `capped` |
+| `GET` | `/api/v1/memory/session-window` | - — minutes since the last monitoring session ended (for UI lookback caps) |
 | `GET` | `/api/v1/memory/find/object` | `name` |
 | `GET` | `/api/v1/memory/find/person` | `name` |
 | `GET` | `/api/v1/memory/search` | `text`, `top_k` (1-50) |

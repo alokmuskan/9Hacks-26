@@ -1,4 +1,4 @@
-import { useContext, useState } from "react";
+import { useContext, useEffect, useMemo, useState } from "react";
 import { Search } from "lucide-react";
 import { api } from "../api/client";
 import { SurveillanceContext } from "../context/SurveillanceContext";
@@ -24,12 +24,14 @@ function SnapshotList({ rows }) {
 function MemoryPage() {
   const { memoryStats, refreshMemoryStats } = useContext(SurveillanceContext);
   const [recentRows, setRecentRows] = useState([]);
+  const [recentMeta, setRecentMeta] = useState(null);
   const [objectQuery, setObjectQuery] = useState("");
   const [personQuery, setPersonQuery] = useState("");
   const [textQuery, setTextQuery] = useState("");
   const [result, setResult] = useState(null);
   const [searchRows, setSearchRows] = useState([]);
   const [busy, setBusy] = useState(false);
+  const [statsFlash, setStatsFlash] = useState(false);
 
   const run = async (fn) => {
     try {
@@ -38,6 +40,55 @@ function MemoryPage() {
     } finally {
       setBusy(false);
     }
+  };
+
+  // Ask the backend when the last monitoring session ended; the picker offers
+  // windows up to that point only, so the user cannot request a range that is
+  // entirely before any session ran. Falls back to 60 min when the backend is
+  // unreachable or no session has ever been recorded.
+  const [maxWindowMinutes, setMaxWindowMinutes] = useState(60);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .sessionWindow()
+      .then((row) => {
+        if (!cancelled && Number.isFinite(row?.session_window_minutes)) {
+          setMaxWindowMinutes(Math.max(1, row.session_window_minutes));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const windowOptions = useMemo(
+    () =>
+      [1, 5, 15, 30, 60, 180, 720, 1440]
+        .map((m) => ({
+          minutes: m,
+          label: m >= 60 ? `${m / 60} h` : `${m} min`,
+        }))
+        .filter((o) => o.minutes <= maxWindowMinutes),
+    [maxWindowMinutes]
+  );
+  const [windowMinutes, setWindowMinutes] = useState(10);
+  useEffect(() => {
+    if (windowOptions.length && !windowOptions.some((o) => o.minutes === windowMinutes)) {
+      setWindowMinutes(windowOptions[windowOptions.length - 1].minutes);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [windowOptions]);
+
+  const loadRecent = async (minutes = windowMinutes) => {
+    const row = await api.memoryRecent(minutes, 40);
+    setRecentRows(row.items || []);
+    setRecentMeta(row);
+  };
+
+  const refreshStats = async () => {
+    await refreshMemoryStats();
+    setStatsFlash(true);
+    setTimeout(() => setStatsFlash(false), 1200);
   };
 
   return (
@@ -54,20 +105,44 @@ function MemoryPage() {
             Snapshot storage and vector backend status.
           </div>
           <pre className="json-box">{JSON.stringify(memoryStats || {}, null, 2)}</pre>
-          <button className="btn-secondary" onClick={() => run(refreshMemoryStats)} disabled={busy}>
-            Refresh
+          <button
+            className="btn-secondary"
+            onClick={() => run(refreshStats)}
+            disabled={busy}
+            title="Re-read snapshot storage and vector backend status from the backend"
+          >
+            {statsFlash ? "Updated ✓" : busy ? "Refreshing…" : "Refresh"}
           </button>
+          {statsFlash && <span className="tiny muted" style={{ marginLeft: 8 }}>Memory stats are up to date</span>}
         </section>
 
         <section className="glass-panel">
           <h3>Recent Snapshots</h3>
-          <button
-            className="btn-secondary"
-            disabled={busy}
-            onClick={() => run(async () => setRecentRows((await api.memoryRecent(10, 40)).items || []))}
-          >
-            Load Last 10 Minutes
-          </button>
+          <div className="lookup-row">
+            <div className="field">
+              <label>Time window</label>
+              <select
+                value={windowMinutes}
+                onChange={(e) => setWindowMinutes(Number(e.target.value))}
+                disabled={busy || !windowOptions.length}
+              >
+                {windowOptions.map((o) => (
+                  <option key={o.minutes} value={o.minutes}>
+                    Last {o.label}
+                  </option>
+                ))
+                }
+              </select>
+            </div>
+            <button className="btn-secondary" disabled={busy || !windowOptions.length} onClick={() => run(() => loadRecent())}>
+              Load
+            </button>
+          </div>
+          {recentMeta?.capped && (
+            <p className="tiny muted" style={{ margin: "6px 0 0" }}>
+              Capped to the last monitoring session ({recentMeta.session_window_minutes} min window).
+            </p>
+          )}
           <SnapshotList rows={recentRows} />
         </section>
       </div>

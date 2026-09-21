@@ -1,10 +1,49 @@
+import json
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 
 from scene_memory import SceneMemoryManager
+
+
+class LatestSessionWindowTests(unittest.TestCase):
+    def _write_metrics(self, metrics_dir: Path, rows: list[dict]) -> None:
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        with (metrics_dir / "metrics_log.jsonl").open("w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+
+    def test_returns_minutes_since_last_session_end(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ended = datetime.now(UTC) - timedelta(minutes=14)
+            # The log lives beside the memory dir (project root in production).
+            self._write_metrics(
+                root,
+                [
+                    {"event_type": "recognize_session", "end_utc": ended.isoformat()},
+                    {"event_type": "chat_query"},
+                ],
+            )
+            memory = SceneMemoryManager(base_dir=root / "memory", enable_vectors=False)
+            window = memory.latest_session_window_minutes()
+            self.assertIsNotNone(window)
+            self.assertTrue(14 <= window <= 16, f"expected ~15, got {window}")
+
+    def test_returns_none_without_sessions(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_metrics(root, [{"event_type": "chat_query"}])
+            memory = SceneMemoryManager(base_dir=root / "memory", enable_vectors=False)
+            self.assertIsNone(memory.latest_session_window_minutes())
+
+    def test_returns_none_when_log_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            memory = SceneMemoryManager(base_dir=Path(td) / "memory", enable_vectors=False)
+            self.assertIsNone(memory.latest_session_window_minutes())
 
 
 class SceneMemoryTests(unittest.TestCase):

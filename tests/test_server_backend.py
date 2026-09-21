@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import unittest
+from datetime import UTC, datetime, timedelta
 from typing import ClassVar
 from unittest import mock
 
@@ -684,6 +685,70 @@ class PacingAndCaptureDefaultsTests(unittest.TestCase):
             self._probe(AI_STUDIO_FPS_CAP="abc", AI_STUDIO_SNAPSHOT_INTERVAL="xyz"),
             ["12", "20", "8.0"],
         )
+
+
+class RecentSnapshotsWindowTests(unittest.TestCase):
+    """The /memory/recent window is capped at the last monitoring session."""
+
+    def setUp(self):
+        self.server = importlib.import_module("server")
+
+    def tearDown(self):
+        try:
+            self.server.MANAGER._loop = None
+            self.server.MANAGER.stop()
+        except Exception:
+            pass
+
+    def test_recent_caps_to_session_window(self):
+        memory = mock.MagicMock()
+        memory.latest_session_window_minutes.return_value = 9
+        captured: dict = {}
+
+        def fake_recent(minutes, limit):
+            captured["minutes"] = minutes
+            return [{"id": 1}]
+
+        memory.get_recent_snapshots.side_effect = fake_recent
+        with mock.patch.object(self.server, "_core") as core:
+            core.return_value.SceneMemoryManager.return_value = memory
+            with TestClient(self.server.app) as client:
+                row = client.get("/api/v1/memory/recent?minutes=60").json()
+
+        self.assertEqual(captured["minutes"], 9)
+        self.assertTrue(row["capped"])
+        self.assertEqual(row["effective_minutes"], 9)
+        self.assertEqual(row["requested_minutes"], 60)
+
+    def test_recent_ignores_cap_without_session_history(self):
+        memory = mock.MagicMock()
+        memory.latest_session_window_minutes.return_value = None
+        captured: dict = {}
+        memory.get_recent_snapshots.side_effect = lambda minutes, limit: (
+            captured.setdefault("minutes", minutes),
+            [],
+        )[1]
+        with mock.patch.object(self.server, "_core") as core:
+            core.return_value.SceneMemoryManager.return_value = memory
+            with TestClient(self.server.app) as client:
+                row = client.get("/api/v1/memory/recent?minutes=60").json()
+
+        self.assertEqual(captured["minutes"], 60)
+        self.assertFalse(row["capped"])
+        self.assertIsNone(row["session_window_minutes"])
+
+    def test_session_window_endpoint_reads_metrics(self):
+        recent_end = datetime.now(UTC) - timedelta(seconds=30)
+        events = [
+            {"event_type": "recognize_session", "end_utc": recent_end.isoformat()},
+            {"event_type": "chat_query"},
+        ]
+        with mock.patch.object(self.server, "_load_metric_events", return_value=events):
+            with TestClient(self.server.app) as client:
+                row = client.get("/api/v1/memory/session-window").json()
+
+        self.assertEqual(row["session_window_minutes"], 1)
+        self.assertIn("last_session", row)
 
 
 if __name__ == "__main__":

@@ -1984,10 +1984,15 @@ def _query_groq_grounded(
     )
     try:
         client = Groq(api_key=api_key)
+        # The default model is a reasoning model: it spends completion tokens on
+        # internal reasoning before answering, so a small max_tokens yields an
+        # EMPTY response (finish_reason=length) rather than an error. reasoning_effort
+        # keeps the chain-of-thought short enough that 500 tokens is plenty.
         response = client.chat.completions.create(
             model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip(),
             temperature=0.1,
             max_tokens=500,
+            extra_body={"reasoning_effort": "low"},
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -2528,8 +2533,51 @@ def api_memory_recent(
 ) -> dict[str, Any]:
     core = _core()
     memory = core.SceneMemoryManager(base_dir=core.MEMORY_DIR, enable_vectors=False)
-    rows = memory.get_recent_snapshots(minutes=minutes, limit=limit)
-    return {"items": rows, "count": len(rows)}
+    # The UI asks for "everything from the last monitoring session"; cap the
+    # lookback at that session's recency so a long-running request can never
+    # walk snapshots older than the monitoring run the user is asking about.
+    requested = min(max(int(minutes), 1), 24 * 60)
+    window = memory.latest_session_window_minutes()
+    effective = requested if window is None else max(1, min(requested, window))
+    rows = memory.get_recent_snapshots(minutes=effective, limit=limit)
+    return {
+        "items": rows,
+        "count": len(rows),
+        "requested_minutes": requested,
+        "effective_minutes": effective,
+        "session_window_minutes": window,
+        "capped": window is not None and requested > window,
+    }
+
+
+def _latest_session_window_from_metrics() -> int | None:
+    """Minutes since the last recognise_session ended, rounded up (None if none)."""
+    latest_end: datetime | None = None
+    for row in _load_metric_events():
+        if row.get("event_type") != "recognize_session":
+            continue
+        raw = str(row.get("end_utc") or row.get("timestamp_utc") or "")
+        try:
+            ended = datetime.fromisoformat(raw)
+        except ValueError:
+            continue
+        if ended.tzinfo is None:
+            ended = ended.replace(tzinfo=UTC)
+        if latest_end is None or ended > latest_end:
+            latest_end = ended
+    if latest_end is None:
+        return None
+    elapsed = datetime.now(UTC) - latest_end
+    return max(int(timedelta.total_seconds(elapsed) // 60) + 1, 1)
+
+
+@app.get("/api/v1/memory/session-window")
+def api_memory_session_window() -> dict[str, Any]:
+    """Recency of the last monitoring session, for UI lookback caps."""
+    return {
+        "session_window_minutes": _latest_session_window_from_metrics(),
+        "last_session": MANAGER.latest_session_summary(),
+    }
 
 
 @app.get("/api/v1/memory/find/object")
