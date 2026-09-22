@@ -1,5 +1,5 @@
-import { useContext, useEffect } from "react";
-import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { useContext } from "react";
+import { Navigate, Route, Routes } from "react-router-dom";
 import LoadingScreen from "./components/LoadingScreen";
 import Sidebar from "./components/Sidebar";
 import { SurveillanceContext, SurveillanceProvider } from "./context/SurveillanceContext";
@@ -13,13 +13,6 @@ import "./App.css";
 
 function AppShell() {
   const { initializing, operation, errors, removeError } = useContext(SurveillanceContext);
-  const navigate = useNavigate();
-
-  // Every fresh page load starts on the dashboard, never on the last visited
-  // page: the browser keeps the URL across reloads, so bounce it once on mount.
-  useEffect(() => {
-    navigate("/", { replace: true });
-  }, [navigate]);
 
   const appBusy = Boolean(initializing || operation?.active);
   const visibleErrors = (errors || []).slice(0, 3);
