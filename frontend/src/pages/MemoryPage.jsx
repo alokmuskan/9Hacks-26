@@ -122,6 +122,7 @@ function MemoryPage() {
             <div className="field">
               <label>Time window</label>
               <select
+                className="time-window-select"
                 value={windowMinutes}
                 onChange={(e) => setWindowMinutes(Number(e.target.value))}
                 disabled={busy || !windowOptions.length}

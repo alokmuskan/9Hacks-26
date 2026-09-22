@@ -80,7 +80,7 @@ function Sidebar() {
         </button>
         <div className="mobile-topbar-brand">
           <Shield size={20} color="var(--accent-blue)" />
-          <span>Vigilance AI</span>
+          <span>EyeQx</span>
         </div>
       </header>
 
@@ -93,7 +93,7 @@ function Sidebar() {
       >
         <div className="sidebar-header">
           <Shield size={30} color="var(--accent-blue)" />
-          <h2>Vigilance AI</h2>
+          <h2>EyeQx</h2>
           <button
             type="button"
             className="nav-drawer-close"

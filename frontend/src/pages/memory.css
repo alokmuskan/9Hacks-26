@@ -26,6 +26,30 @@
   margin-top: 10px;
 }
 
+/* Chrome on Windows renders the native option list with a light system
+   background unless its options have explicit colours. The control itself was
+   dark, but its white menu inherited light text and made most time windows
+   unreadable. Keep this scope narrow so other selects retain their design. */
+.time-window-select {
+  color-scheme: dark;
+}
+
+.time-window-select option {
+  background-color: #10243b;
+  color: #f5f8ff;
+}
+
+.time-window-select option:checked {
+  background-color: #0b79d0;
+  color: #ffffff;
+}
+
+.time-window-select:disabled,
+.time-window-select:disabled option {
+  background-color: #1b2838;
+  color: #9ba9ba;
+}
+
 .json-box {
   margin-top: 12px;
   background: rgba(0, 0, 0, 0.25);
