@@ -44,7 +44,7 @@ jobs:
           # server.py imports cv2 while the test modules are discovered.  Use
           # the headless wheel: CI encodes placeholder frames but never needs a
           # desktop display or camera window.
-          pip install "numpy>=1.26,<3" "pillow>=11,<12" opencv-python-headless fastapi httpx
+          pip install "numpy>=1.26,<3" "pillow>=11,<12" opencv-python-headless fastapi httpx "python-dotenv>=1,<2"
 
       # CPU-only wheel, so the full suite runs rather than skipping the L2CS test.
       # Pin it even though this job does not import torchvision: keeping the same

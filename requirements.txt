@@ -45,7 +45,7 @@ fastapi
 uvicorn
 httpx
 websockets
-python-dotenv
+python-dotenv>=1,<2
 
 # Test suite
 pytest>=9.0.2,<10
