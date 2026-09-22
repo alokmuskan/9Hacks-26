@@ -566,14 +566,16 @@ class EnrollLifecycleTests(unittest.TestCase):
 
     def test_enrolling_a_name_the_db_already_knows_is_refused(self):
         """`upsert` merges samples by name, so a duplicate silently blurred two people."""
-        db = self.server._core().FaceDB.load()
-        self.assertTrue(db.names, "this test needs at least one enrolled identity")
-        existing = str(db.names[0]).strip()
+        existing = "Alice"
 
-        # Case and whitespace must not be enough to sneak past the check.
-        variant = "  " + existing.upper() + "  "
-        with TestClient(self.server.app) as client:
-            response = client.post("/api/v1/enroll/start", json={"name": variant})
+        # A repository checkout must not need a developer's face_db.npz.  The
+        # endpoint only reads `names` before refusing a duplicate, so this small
+        # fixture captures the production contract without involving disk state.
+        fake_db = mock.Mock(names=[existing])
+        with mock.patch.object(self.server._core().FaceDB, "load", return_value=fake_db):
+            # Case and whitespace must not be enough to sneak past the check.
+            with TestClient(self.server.app) as client:
+                response = client.post("/api/v1/enroll/start", json={"name": "  ALICE  "})
         self.assertEqual(response.status_code, 409)
         self.assertIn(existing.casefold(), response.json()["detail"].casefold())
 
