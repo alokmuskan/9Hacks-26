@@ -179,18 +179,14 @@ class CliRecognizeLoopTests(unittest.TestCase):
         )
         patches = [
             mock.patch.object(self.main, "cv2", self._fake_cv2(frames)),
-            mock.patch.object(
-                self.main, "FaceDB", _FakeEmptyFaceDB if empty_db else _FakeFaceDB
-            ),
+            mock.patch.object(self.main, "FaceDB", _FakeEmptyFaceDB if empty_db else _FakeFaceDB),
             mock.patch.object(self.main, "_try_build_face_app", return_value=face_app),
             mock.patch.object(self.main, "DualYoloDetector", return_value=fake_detector),
             mock.patch.object(self.main, "SceneMemoryManager", _FakeMemory),
             mock.patch.object(self.main, "_build_app", return_value=object()),
             mock.patch.object(self.main, "_open_camera", return_value=_FakeCap()),
             mock.patch.object(self.main, "_AsyncCameraReader", return_value=reader),
-            mock.patch.object(
-                self.main, "_detect", side_effect=lambda _app, _frame: [face]
-            ),
+            mock.patch.object(self.main, "_detect", side_effect=lambda _app, _frame: [face]),
             mock.patch.object(self.main, "_estimate_gaze_points", new=fake_gaze),
             mock.patch.object(self.main, "_load_gaze_runtime", return_value=gaze_return),
             mock.patch.object(self.main, "_print_runtime_help", return_value=None),
@@ -220,7 +216,9 @@ class CliRecognizeLoopTests(unittest.TestCase):
 
         payload = self._session(appended)
         self.assertIsNotNone(payload, "the CLI never reached its session summary")
-        self.assertEqual(payload["schema_version"], importlib.import_module("common").SESSION_SCHEMA_VERSION)
+        self.assertEqual(
+            payload["schema_version"], importlib.import_module("common").SESSION_SCHEMA_VERSION
+        )
 
         aggregate = payload["aggregate"]
         self.assertEqual(set(aggregate), set(self.main.SESSION_AGGREGATE_KEYS))
@@ -229,6 +227,35 @@ class CliRecognizeLoopTests(unittest.TestCase):
         self.assertEqual(aggregate["unknown_detections"], 0)
         self.assertIn("Alok", payload["people"])
         self.assertGreaterEqual(payload["events_total_count"], 0)
+
+    def test_a_backwards_wall_clock_step_cannot_invent_a_frame_rate(self):
+        """One recorded session reports 29,537 fps against a 0.68 fps average.
+
+        Its intervals were measured against the wall clock, which can be corrected
+        backwards mid-session, turning one interval into microseconds. Pacing now
+        reads a monotonic clock, so a backwards step must leave the rates sane.
+        """
+        monotonic_tick = [1000.0]
+        wall_tick = [1_700_000_000.0]
+
+        def monotonic() -> float:
+            monotonic_tick[0] += 0.5
+            return monotonic_tick[0]
+
+        def wall_clock() -> float:
+            wall_tick[0] -= 30.0  # 30 s earlier on every single call
+            return wall_tick[0]
+
+        with mock.patch.object(self.main.time, "monotonic", side_effect=monotonic):
+            with mock.patch.object(self.main.time, "time", side_effect=wall_clock):
+                appended, _gaze, _detector = self._run(frames=4)
+
+        aggregate = self._session(appended)["aggregate"]
+        self.assertGreaterEqual(aggregate["frames_total"], 3)
+        # Half a second between frames is 2 fps. Measured with the stepping wall
+        # clock instead, this reads as tens of thousands of fps.
+        self.assertLess(aggregate["max_fps"], 5.0)
+        self.assertLess(aggregate["moving_avg_fps"], 5.0)
 
     def test_default_gaze_runs_every_frame_and_reports_full_rate(self):
         appended, fake_gaze, _detector = self._run(frames=4, disable_gaze=False)

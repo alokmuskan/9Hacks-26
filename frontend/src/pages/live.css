@@ -33,10 +33,13 @@
   color: var(--accent-red);
 }
 
+/* Sized so the controls and counts stay near the fold without shrinking the feed
+   into a thumbnail: viewport-relative height with hard bounds, and the image is
+   letterboxed inside (see StreamImage) so nothing is cropped at any size. */
 .live-viewport {
   position: relative;
   width: 100%;
-  min-height: 420px;
+  height: clamp(320px, 44vh, 500px);
   border-radius: 12px;
   border: 1px solid var(--glass-border);
   overflow: hidden;
@@ -91,12 +94,15 @@
   }
 }
 
+/* The old keyframe travelled a hardcoded 420px, which desynced from the feed the
+   moment the viewport height changed. Percentages in `transform` resolve against
+   the element's own 3px height, so travel it via `top` instead. */
 @keyframes scanline {
   0% {
-    transform: translateY(0);
+    top: 0;
   }
   100% {
-    transform: translateY(420px);
+    top: calc(100% - 3px);
   }
 }
 
@@ -124,7 +130,33 @@
 }
 
 .toggle-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   justify-content: flex-start;
+  width: 100%;
+}
+
+/* Each toggle is paired with a one-line explanation of what it detects. */
+.toggle-row {
+  display: grid;
+  gap: 4px;
+}
+
+.toggle-hint {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.toggle-chip {
+  margin-left: auto;
+  padding: 1px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  font-weight: 600;
 }
 
 .counts-grid {
@@ -152,17 +184,32 @@
   font-size: 1.2rem;
 }
 
+.conn-ok {
+  color: var(--accent-green);
+}
+
+.conn-warn {
+  color: var(--accent-amber);
+}
+
+.conn-bad {
+  color: var(--accent-red);
+}
+
 @media (max-width: 1200px) {
+  /* Single column: the feed can breathe a little more here. */
   .live-grid {
     grid-template-columns: 1fr;
+  }
+
+  .live-viewport {
+    height: clamp(340px, 46vh, 540px);
   }
 }
 
 @media (max-width: 640px) {
   .live-viewport {
-    min-height: 0;
-    height: 56vw;
-    max-height: 420px;
+    height: clamp(240px, 62vw, 400px);
   }
 
   .controls-row .btn-primary,

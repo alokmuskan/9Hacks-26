@@ -115,9 +115,7 @@ class DoctorFaceRecognitionTests(unittest.TestCase):
         self.assertIn("too old", detail)
 
     def test_insightface_2x_is_accepted(self):
-        rows = self._rows(
-            lambda name: (True, "2.0") if name == "insightface" else (True, "9.9.9")
-        )
+        rows = self._rows(lambda name: (True, "2.0") if name == "insightface" else (True, "9.9.9"))
         status, detail = rows["module:insightface"]
         self.assertEqual(status, "ok")
         self.assertNotIn("too old", detail)

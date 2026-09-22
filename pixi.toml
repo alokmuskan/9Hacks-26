@@ -36,7 +36,7 @@ gdown = "*"
 l2cs = { git = "https://github.com/Ahmednull/L2CS-Net.git", rev = "a4d8f7fa5436a2b2b9f088471623b552a85811bd" }
 face_detection = { git = "https://github.com/elliottzheng/face-detection.git" }
 groq = "*"
-python-dotenv = "*"
+python-dotenv = ">=1,<2"
 fastapi = "*"
 uvicorn = "*"
 httpx = "*"

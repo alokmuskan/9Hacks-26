@@ -90,27 +90,27 @@ On top of that data, the platform provides a **query layer**: deterministic natu
 
 ```
                        ┌────────────────────────┐
-   Camera / video ───► │  Async frame reader     │  (background thread, latest-frame slot)
+   Camera / video ───► │  Async frame reader    │  (background thread, latest-frame slot)
                        └───────────┬────────────┘
                                    ▼
                        ┌────────────────────────┐
-                       │ Face detect + recognize │  InsightFace
+                       │ Face detect + recognize│  InsightFace
                        └───────────┬────────────┘
                                    ▼
               ┌────────────────────┴────────────────────┐
               ▼                                         ▼
    ┌────────────────────┐                    ┌────────────────────┐
-   │ Object detection    │                   │ Gaze estimation     │
-   │ YOLO general/custom │                   │ L2CS-Net            │
-   └──────────┬──────────┘                   └──────────┬──────────┘
-              └───────────────┬──────────────────────────┘
+   │ Object detection   │                   │ Gaze estimation    │
+   │ YOLO general/custom│                   │ L2CS-Net           │
+   └──────────┬─────────┘                   └──────────┬─────────┘
+              └───────────────┬─────────────────────────┘
                               ▼
                  ┌──────────────────────────┐
-                 │ Gaze → object fusion      │  inside box (+8 px) / nearest (≤120 px)
+                 │ Gaze → object fusion     │  inside box (+8 px) / nearest (≤120 px)
                  └───────────┬──────────────┘
                              ▼
                  ┌──────────────────────────┐
-                 │ Behavior tracker          │  window 5 frames, confirm 3, end timeout 1.0 s
+                 │ Behavior tracker         │  window 5 frames, confirm 3, end timeout 1.0 s
                  └───────────┬──────────────┘
                              ▼
      ┌───────────────────────┼────────────────────────┬─────────────────────┐
@@ -304,11 +304,18 @@ All variables are optional; the defaults below reflect the code.
 | `AI_STUDIO_METRICS_BACKUPS` | `2` | backend | Rotated generations to keep (`0` truncates instead of rotating) |
 | `AI_STUDIO_MEMORY_MAX_AUTO_SNAPSHOTS` | `5000` | backend | Automatic snapshots to keep; `0` disables pruning. Manual snapshots are never pruned |
 | `AI_STUDIO_UNKNOWN_INCIDENT_MAX_FILES` | `500` | backend | Unknown-face captures to keep, oldest pruned first; `0` disables pruning |
+| `AI_STUDIO_YOLO_IMGSZ` | `768` | backend | Object-detection inference size (320–1920, snapped to a multiple of 32). Benchmarked: 768 found 8 classes vs 5 at 640 on this project's own frames at ~150 ms vs ~90 ms per frame |
+| `AI_STUDIO_YOLO_CONF` | `0.25` | backend | Object-detection confidence threshold (0.01–0.99). Lower finds more at the cost of low-confidence noise |
+| `AI_STUDIO_YOLO_IOU` | `0.7` | backend | NMS IoU threshold (0.1–0.95) |
+| `AI_STUDIO_YOLO_MAX_DET` | `300` | backend | Maximum boxes per frame (1–1000) |
+| `AI_STUDIO_YOLO_AGNOSTIC_NMS` | `false` | backend | Class-agnostic NMS: one box pool across classes, so one object cannot be reported under two labels. Can also drop a genuinely distinct overlapping label |
+| `AI_STUDIO_YOLO_IN_SCOPE_CLASSES` | empty (all) | backend | Allowlist of labels to report; everything else is dropped before it reaches a consumer. Empty means every label |
+| `AI_STUDIO_YOLO_EXCLUDED_CLASSES` | empty (none) | backend | Denylist of labels to drop. Exclusion wins over inclusion. `surfboard` is the one class measured at 0.000 precision on this project's own frames |
 | `AI_STUDIO_FPS_CAP` | `12` | backend | Monitor-loop ceiling in frames/s. The cap is a ceiling — slow machines run at whatever they keep up with. Lower = less CPU, higher = snappier detection |
 | `AI_STUDIO_ENROLL_FPS_CAP` | `20` | backend | Same ceiling for enrollment sessions (kept faster on purpose; sample collection wants rate) |
 | `AI_STUDIO_SNAPSHOT_INTERVAL` | `8.0` | backend | Seconds between auto snapshots — the instances reports and chat ground on. Runs on wall-clock time, independent of FPS; clamped to 1–3600 |
 | `GROQ_API_KEY` *(or `groq_api_key`)* | unset | backend | Enables the LLM chat fallback |
-| `GROQ_MODEL` | `openai/gpt-oss-120b` | backend | Groq model name |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | backend | Groq model name. `gpt-oss-*` are reasoning models — the code sends `reasoning_effort=low` so the answer fits the token budget |
 | `PORT` | `8000` | backend | Port for `python server.py` |
 | `VITE_API_BASE` | `http://localhost:8000` | frontend | Backend base URL (also used to derive the WebSocket URL) |
 
@@ -446,11 +453,152 @@ pixi run python main.py chat --question "What happened in the last 10 minutes?"
 
 # ASCII security report -> report.txt
 pixi run python main.py report
+
+# Offline detection benchmark (see "Detection Benchmark" below)
+pixi run python main.py bench-detect
+
+# Frame budget from recorded sessions (see "Frame Budget" below)
+pixi run python main.py frame-budget
+
+# Review the detections the system already made (measures precision - see "Detection Review")
+pixi run python main.py review-detections
+pixi run python main.py score-detections --review-dir reviews
 ```
+
+`review-detections` options: `--frames`, `--out-dir`, `--limit`, `--min-brightness`, `--verdicts`.
 
 Global flag: `--model {buffalo_l,buffalo_m,buffalo_s,buffalo_sc,antelopev2}` (default `buffalo_sc`).
 
 `recognize` options: `--general-model`, `--custom-model`, `--disable-general`, `--disable-custom`, `--disable-gaze`, `--snapshot-interval`, `--gaze-arch`, `--gaze-weights`, `--gaze-weights-source`, `--disable-gaze-auto-download`, `--gaze-max-interval`, `--gaze-target-fps-drop`.
+
+### Detection Benchmark
+
+Detection quality is measurably different from detection *working*, and the live loop can only tell you the latter — in a scene nobody can replay. `bench-detect` runs the **real detector** over a fixed frame set (your own saved snapshots, plus the reference images bundled with Ultralytics that have known labels) and reports per-class counts, mean confidence and ms/frame, so a tuning change can be justified with numbers:
+
+```bash
+pixi run python main.py bench-detect
+pixi run python main.py bench-detect --imgsz 640 768 960 --conf 0.25 0.15
+pixi run python main.py bench-detect --json bench.json
+```
+
+```
+excluded frames: 10 (too_dark=9, too_small=1)
+
+conf=0.25 imgsz=768    86 ms/frame   8 classes   reference recall=1.00
+    person x56 (max 0.92)  remote x8 (max 0.48)  cell phone x5 (max 0.45) ...
+conf=0.25 imgsz=640    58 ms/frame   5 classes   reference recall=1.00
+    person x56 (max 0.94)  cell phone x7 (max 0.46)  remote x2 (max 0.29) ...
+```
+
+Frames too dark, blurred or small to detect anything in are **excluded and reported by reason** instead of dragging the recall numbers down — on a real capture set a large fraction of frames are unusable, and averaging those in measures the room's lighting rather than the detector. With no arguments the benchmark compares the *shipping* configuration against the historical 640/0.25 baseline, so the default run answers "did the change I just made help?".
+
+Run it after changing any `AI_STUDIO_YOLO_*` knob. `--frames` accepts globs, `--min-brightness` sets the usable-frame floor, and `--json` writes the raw per-class results.
+
+### Frame Budget
+
+`bench-detect` measures the detector alone, on saved frames. `frame-budget` reads the opposite half of the evidence — the sessions the pipeline has **already recorded** into `metrics_log.jsonl` — and reports what a live frame period was actually made of, with no camera and no new run:
+
+```bash
+pixi run python main.py frame-budget
+pixi run python main.py frame-budget --limit 5 --json budget.json
+```
+
+```
+session                  frames avg_fps ema_fps period_ms  face_ms  gaze_ms   obj_ms  unattr_ms  unattr  pacing
+monitor-20260920-104542      38    0.68    1.73    1470.6     65.6    433.2       --      971.8   66.1%  not-recorded
+monitor-20260921-191819     362    4.75    4.73     210.5      off      off       --      210.5  100.0%  not-recorded
+
+12 session(s), 1300 frames, 718.5 s: median 0.83 fps (range 0.68-9.39), median EMA rate 2.80 fps
+  5 session(s) are stall-dominated (EMA rate above 2x the session average)
+
+Stage accounting, as a share of each session's mean period (median):
+  face detection     3.6%  (41.1 ms/frame)  over 8 session(s)
+  gaze              28.3%  (334.5 ms/frame)  over 6 session(s)
+  object detection not recorded in this cohort  over 0 session(s)
+  unattributed      69.1%  (833.6 ms/frame)  - a remainder, not a measurement
+```
+
+The `--` above is not an accident: those sessions were recorded before the instrumentation below existed, so the report names them under `written before schema 8` rather than pretending the stage was off.
+
+It refuses three things, each because the record does not support them:
+
+- **It never reports a missing measurement as zero.** `avg_detection_latency_ms` in the log has always timed **face recognition**, not the YOLO object detector. Sessions from schema 8 on carry object detection separately (`avg_object_detection_latency_ms`, `object_detection_calls`); older ones show `--` and the report says why, because the remainder is labelled `unattr_ms` rather than given a stage name it never had.
+- **It does not treat a session average as a per-frame cost.** Five of the twelve recorded sessions have an EMA frame rate more than 2× their session average (one reached 178 fps instantaneously against a 0.82 fps mean), so their period is dominated by stalls and is flagged rather than smoothed in. Sessions from schema 8 on also record `frame_period_p50_ms` / `frame_period_p95_ms`, so a spread is available without re-deriving it from the mean.
+- **It renders three different states differently**: a timed stage, `off` (the stage did not run), and `--` (it ran with no recorded latency). A disabled stage still counts its calls and still wraps a no-op in a timer, so it reports ~0.01 ms; believing that would record a missing measurement as a fast one.
+
+`fps_cap` is recorded too, so a session that was pacing itself can be told apart from one that simply ran out of machine — the second refusal above only applies where the cap is absent.
+
+Sessions that cannot produce a period at all are listed by name under `Skipped rows` instead of being dropped.
+
+### Detection Review
+
+`bench-detect` can measure recall against two bundled reference images and detection statistics on your own frames — but **not precision**, because your frames carry no labels. `review-detections` gets a precision figure without new capture and without labelling anything: the detector proposes a finite list of boxes, and you confirm or reject that list.
+
+```bash
+pixi run python main.py review-detections          # writes reviews/review.html + reviews/detections.json
+# open reviews/review.html, mark each box Correct / Wrong, click "Download verdicts.json"
+pixi run python main.py score-detections --review-dir reviews
+```
+
+To revisit a previous run — for example to correct answers after reading the rubric —
+pass the recorded verdicts back in and the page opens with them already marked, so a
+correction pass is only the boxes you want to change:
+
+```bash
+pixi run python main.py review-detections --verdicts reviews/verdicts.json
+```
+
+```
+Reviewed 124 of 124 detection(s)  (coverage 100%)
+Precision: 0.911  (113 correct, 11 wrong)
+  every detection was reviewed, so this is a census of these frames - no sampling error
+
+label              reviewed  correct  wrong  precision
+person                   96       89      7      0.927
+remote                    8        7      1      0.875
+cell phone                7        6      1      0.857
+toothbrush                5        5      0      1.000
+surfboard                 2        0      2      0.000
+tie                       2        2      0      1.000
+book                      1        1      0      1.000
+bottle                    1        1      0      1.000
+refrigerator              1        1      0      1.000
+snowboard                 1        1      0      1.000
+```
+
+That table is a real run over this repository's saved snapshots, not an illustration. The
+only class with zero precision is `surfboard`, whose two boxes sit on curtain folds; every
+other class is at or above 0.857.
+
+**The rubric matters more than the detector here.** A first pass over the same frames with the
+same model scored `person` at **0.645** (49/76) — because the page had not yet said what
+"Correct" meant, so duplicate boxes on one person and boxes clipped by the frame edge were
+marked Wrong, which the rubric says to mark Correct. The rejected and accepted boxes were
+statistically indistinguishable (median confidence 0.83 vs 0.87), and the person wrong-rate
+swung between 8.7% and 57.7% across sessions of the same scene. The criteria are now printed
+on the page itself, and the page's browser check asserts they are present.
+
+Because `surfboard` is a *policy* problem rather than a threshold problem, it is handled in
+configuration: `AI_STUDIO_YOLO_EXCLUDED_CLASSES=surfboard` drops it before it reaches the
+dashboard. Measured on the same frames: 124 → 122 boxes, `surfboard` gone, no other label
+changed. That is not an accuracy improvement — those boxes were correct detections of an
+object this project does not care about. `/monitor/status` reports the effective policy under
+`in_scope`, including a per-label count of what was suppressed, so a filtered class is never
+invisible.
+
+Re-running `review-detections` into the same directory is safe — the detection list is
+fingerprinted, and `score-detections` refuses a verdict file recorded against a different list
+rather than scoring it against the wrong boxes. That guard is load-bearing: the frame set grows
+whenever the app captures a new snapshot, so a list can legitimately change between runs.
+
+At the time of writing that is **124 boxes over 75 usable frames** (13 excluded: `too_dark=12`, `too_small=1`) — a couple of minutes of clicking, not a labelling project. Three things it is careful about:
+
+- **Unreviewed boxes are reported as unreviewed, never as correct.** A verdict it cannot parse is skipped rather than guessed, because assuming "correct" is the one thing that would inflate the number it exists to produce.
+- **A partial review is reported as a sample.** `--limit N` picks evenly across the confidence range (not the easiest top-N boxes) and the score prints a Wilson interval; below 80% coverage it says the interval is optimistic, because a subset picked by hand is not a random sample.
+- **It measures precision, not recall.** Recall needs every object in every frame enumerated — the "extensive labelling" this exists to avoid. The optional per-row note records objects you *noticed* were missed; those are printed as concrete misses with no denominator, never as a recall figure.
+- **A correction pass cannot drift onto the wrong boxes.** `--verdicts` only preloads a file carrying the same list id; anything else prints a warning and starts blank, and `score-detections` refuses a mismatch outright.
+
+The number describes **the frames in `reviews/`** and nothing else; every run says so. The page embeds real camera frames, so it lives in the git-ignored `reviews/` directory and carries `noindex`.
 
 ### Gaze Scheduling
 
@@ -513,7 +661,8 @@ Base URL: `http://localhost:8000`
 | Method | Path | Query parameters |
 | --- | --- | --- |
 | `GET` | `/api/v1/memory/stats` | - |
-| `GET` | `/api/v1/memory/recent` | `minutes` (1-1440), `limit` (1-200) |
+| `GET` | `/api/v1/memory/recent` | `minutes` (1-1440), `limit` (1-200); capped to the last monitoring session's window; response reports `effective_minutes`, `session_window_minutes`, `capped` |
+| `GET` | `/api/v1/memory/session-window` | - — minutes since the last monitoring session ended (for UI lookback caps) |
 | `GET` | `/api/v1/memory/find/object` | `name` |
 | `GET` | `/api/v1/memory/find/person` | `name` |
 | `GET` | `/api/v1/memory/search` | `text`, `top_k` (1-50) |
@@ -627,7 +776,9 @@ Waiting is bounded (10 s for writers, 2 s for readers). If a required lock canno
 pixi run python -m unittest discover -s tests -q
 ```
 
-133 tests cover the detection schema and toggles, gaze L2CS helpers and interval scheduling, the shared session aggregate contract, environment readiness and first-run bootstrap, storage lifecycle (metrics rotation, snapshot and incident retention), cross-process locking (real subprocess contention, including control cases proving those tests detect unsynchronised writers), persistence integrity (including concurrent snapshot and metrics writers), behavior tracking and summaries, chat and snapshot actions, metrics schema normalisation, scene memory, the CLI `recognize` loop end-to-end, and the FastAPI surface (status schema, monitor lifecycle, camera recovery, stream generator, WebSocket envelope, chat sessions, and two-step action confirmation).
+The suite prints its own count when it runs, which is the authoritative number — it is deliberately not restated here, because a hardcoded count goes stale the next time a test is added. Coverage: the detection schema and toggles, gaze L2CS helpers and interval scheduling, the shared session aggregate contract, environment readiness and first-run bootstrap, storage lifecycle (metrics rotation, snapshot and incident retention), cross-process locking (real subprocess contention, including control cases proving those tests detect unsynchronised writers), persistence integrity (including concurrent snapshot and metrics writers), behavior tracking and summaries, chat and snapshot actions, metrics schema normalisation, scene memory, the CLI `recognize` loop end-to-end, the offline detection benchmark, and the FastAPI surface (status schema, monitor lifecycle, camera recovery, stream generator, WebSocket envelope, chat sessions, and two-step action confirmation).
+
+> The detection benchmark's inference tests need the real computer-vision stack. The rest of the suite stubs `cv2`, so those tests swap the real module in for the duration and put the stub back afterwards; on a machine without OpenCV or `ultralytics` they report as skipped rather than silently passing.
 
 > The server tests import `server.py` at module scope, which creates `memory/snapshots/` and `unknown_incidents/`. Chat tests append to `metrics_log.jsonl`. These paths are git-ignored.
 
@@ -650,21 +801,32 @@ mypy             # static types (config: mypy.ini)
 
 Install the tools with `pip install ruff mypy` (they are listed in `requirements.txt`). The rule set in `ruff.toml` is listed explicitly rather than inherited from the tool's defaults, so results do not drift when ruff is upgraded. The file also records **which families are deliberately not selected and why** — notably `BLE`/`S` (broad `except Exception` is how the pipeline degrades around optional dependencies, and `try/except/pass` is how best-effort cleanup is written) and `D`/`ANN` (behaviour is documented in the README and the test suite rather than in docstrings). Individual rules within the selected families that would fight the existing style (`SIM117`, `TRY003`, `TRY300`) are ignored in the same file, each with a reason.
 
-`mypy` is **staged, not all-or-nothing**: `common.py`, `object_detection.py`, `scene_memory.py` and `server.py` are enforced and currently clean, while `main.py` is opted out *explicitly* in `mypy.ini` with its remaining finding count recorded there. It reports ~108 issues today, 104 of them possible-`None` dereferences in the long CLI/report/chat helpers; guarding those is a refactor, not a config change. Deleting the one override line is all that is needed to start enforcing it.
+`mypy` is **staged, not all-or-nothing**: `common.py`, `object_detection.py`, `detection_bench.py`, `scene_memory.py` and `server.py` are enforced and currently clean, while `main.py` is opted out *explicitly* in `mypy.ini` with its remaining finding count recorded there. It reports ~108 issues today, 104 of them possible-`None` dereferences in the long CLI/report/chat helpers; guarding those is a refactor, not a config change. Deleting the one override line is all that is needed to start enforcing it.
 
-Formatting is configured (`line-length = 100`, double quotes) but **not applied to the existing code** — running `ruff format .` would rewrite every file at once, so it is left as an opt-in. `ruff format --check` is therefore not yet enforced in CI.
+Formatting is applied (`line-length = 100`, double quotes) and enforced: CI runs `ruff format --check .`. Run `ruff format .` before committing Python and it stays clean; the one-time reformat of the existing code is already in the history.
 
 ### Continuous Integration
 
-`.github/workflows/ci.yml` runs three jobs on every push to `main` and every pull request:
+`.github/workflows/ci.yml` runs four jobs on every push to `main` and every pull request:
 
 | Job | What it runs |
 | --- | --- |
 | Backend tests | `python -m unittest discover -s tests -q`, then a byte-compile of every module |
-| Lint and types | `ruff check .` and `mypy` |
+| Detection smoke | The real stack (OpenCV + ultralytics + `yolov8n.pt`), running `test_detection_bench.py` with `AI_STUDIO_REQUIRE_REAL_INFERENCE=1` |
+| Lint and types | `ruff check .`, `ruff format --check .` and `mypy` |
 | Frontend | `npm ci`, `npm test`, `npm run build` |
 
 The backend job installs only `numpy`, `pillow`, `fastapi` and `httpx`, because the suite stubs cv2 and insightface — the full computer-vision stack is not needed to run the tests. It also installs a CPU-only `torch` so the one L2CS decoding test executes rather than skipping; remove that step to make the job lighter and that test will report as skipped instead of failing.
+
+The **Detection smoke** job exists because that stubbing has a cost: four tests in `test_detection_bench.py` guard the real inference wiring (that the benchmark drives the shipping detector, and that `conf`/`imgsz` actually reach the model), and without the stack they skip themselves — so CI could not catch a broken wiring while reporting green. They are also the tests that *skipped* in the backend job, so the count there is expected to be higher.
+
+`unittest` exits 0 when tests skip, so that job sets `AI_STUDIO_REQUIRE_REAL_INFERENCE=1`, which turns “the real stack is missing” into a failure rather than a skip. Locally the same knob makes it verifiable:
+
+```bash
+AI_STUDIO_REQUIRE_REAL_INFERENCE=1 python -m unittest discover -s tests -q -p "test_detection_bench.py"
+```
+
+Run it from the repository root — the guard looks for `yolov8n.pt` in the working directory, and from anywhere else it will (correctly) report that the weights are unavailable.
 
 ### End-to-End
 
@@ -719,6 +881,27 @@ pip install -U "insightface>=0.7.3,<3"
 ```
 
 The 0.7.x line is **source-only on PyPI** (needs a C++ toolchain and Cython), but the **2.x line ships a pure-Python wheel** (`py3-none-any`) that installs with no compiler and was verified against this project's API — `FaceAnalysis(providers=..., allowed_modules=...)`, `prepare`, `get` — including on Windows/Python 3.13. `python main.py doctor` reports an unusable insightface as a `warn`, not a `fail`, because an importable module is not necessarily a usable one — and an unusable one no longer blocks the session.
+
+**Check which interpreter you are running first — this is usually the whole problem.** The dependency lives in the project environment, not necessarily in whichever `python` is first on `PATH`. Running `python server.py` with a system Python that carries an old insightface reproduces the symptom above *while the suite passes in `.venv`*:
+
+```bash
+python -c "import sys, insightface; print(sys.executable, insightface.__version__)"
+.venv\Scripts\python.exe -c "import sys, insightface; print(sys.executable, insightface.__version__)"  # Windows
+```
+
+If the first prints a path outside the project, start the app from the project environment instead (`pixi run python server.py`, or `.venv\Scripts\python.exe server.py`). `python main.py doctor` names the interpreter it is describing. The server now also logs `Face recognition DISABLED: <reason>` at startup: it previously only published a dashboard event, so a terminal running the API looked healthy while every frame reported zero faces.
+
+**Enrolment sits on `WAITING FOR FRAMES` and never captures**
+
+That text is a placeholder image the stream serves when there are no frames at all, so it means the enrolment worker is not running — not that it is waiting on you. The usual cause is the insightface problem above: enrolment needs face *detection*, and the worker used to raise on startup and die silently behind the placeholder. It now fails with the reason instead, so check `degraded_reason` in the pipeline status and fix the environment as described above.
+
+**Turning Custom YOLO on does nothing, or the stream stalls and reconnects forever**
+
+Custom YOLO is off because **no checkpoint is configured**: the pipeline looks for a path in `custom_model_path.txt`, then `models/custom_yolo.pt`, then `runs/detect/*/weights/best.pt`. With none present the request cannot be granted, and it now says so in `toggle_refused` rather than looping — the handler used to retry until the reported state matched the request, which never happened without a model, so it spun inside the frame loop and froze the stream. To actually use it, fine-tune on your own classes and point the pipeline at the result:
+
+```bash
+python main.py train-objects --data dataset.yaml --epochs 30 --set-default
+```
 
 **Gaze is unavailable**
 

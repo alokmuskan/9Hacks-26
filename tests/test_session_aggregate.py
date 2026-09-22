@@ -15,10 +15,14 @@ class SessionAggregateContractTests(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)), "duplicate keys in the declared contract")
         # The key count and the schema version move together: changing one without the
         # other would alter the contract under downstream consumers (reports, the HUD).
-        self.assertEqual(common.SESSION_SCHEMA_VERSION, 7)
-        self.assertEqual(len(keys), 67, "the aggregate contract changed size without a schema bump")
+        self.assertEqual(common.SESSION_SCHEMA_VERSION, 8)
+        # 67 -> 73 at schema 7 -> 8: object detection is timed on its own, the
+        # configured FPS ceiling is recorded, and frame periods carry a spread.
+        self.assertEqual(len(keys), 73, "the aggregate contract changed size without a schema bump")
         self.assertIn("gaze_interval_frames_final", keys)
         self.assertIn("behavior_activity_patterns", keys)
+        self.assertIn("avg_object_detection_latency_ms", keys)
+        self.assertIn("frame_period_p95_ms", keys)
 
     def test_default_inputs_emit_exactly_the_contract_and_are_zero_safe(self):
         aggregate = self.main.SessionAggregateInput(session_id="recognize-20260314-113000").build()
@@ -140,9 +144,13 @@ class SessionAggregateContractTests(unittest.TestCase):
         self.assertAlmostEqual(aggregate["behavior_attention_total_sec"], 30.0, places=6)
         self.assertEqual(aggregate["behavior_events_count"], 7)
         self.assertEqual(aggregate["behavior_top_objects"], [["laptop", 20.0]])
-        self.assertAlmostEqual(aggregate["behavior_activity_patterns"]["transitions_per_min"], 4.0, places=6)
+        self.assertAlmostEqual(
+            aggregate["behavior_activity_patterns"]["transitions_per_min"], 4.0, places=6
+        )
         self.assertEqual(aggregate["behavior_activity_patterns"]["unique_attended_objects"], 1)
-        self.assertAlmostEqual(aggregate["behavior_activity_patterns"]["focus_ratio"], 0.5, places=6)
+        self.assertAlmostEqual(
+            aggregate["behavior_activity_patterns"]["focus_ratio"], 0.5, places=6
+        )
 
     def test_timelines_are_truncated_to_the_last_twenty_buckets(self):
         timeline = {f"10:00:{index:02d}": index for index in range(30)}
@@ -201,6 +209,70 @@ class SessionAggregateContractTests(unittest.TestCase):
         self.assertAlmostEqual(agg["gaze_inference_avg_ms"], 10.0, places=6)
         self.assertEqual(agg["gaze_base_interval_frames"], 1)
         self.assertEqual(agg["behavior_top_objects"], [])
+
+
+class FrameBudgetInstrumentationTests(unittest.TestCase):
+    """Object-detection timing, the FPS ceiling and the period spread.
+
+    `avg_detection_latency_ms` has always measured *face recognition*. Object
+    detection was in no record at all, which is why the frame budget could not be
+    closed from the log (OBJECT_DETECTION_PLAN.md section 2h). These tests pin the
+    three fields that make the question answerable.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        _install_stubs()
+        cls.main = importlib.import_module("main")
+
+    def test_object_detection_latency_is_separate_from_face_latency(self):
+        aggregate = self.main.SessionAggregateInput(
+            session_id="s",
+            duration_sec=10.0,
+            frames_total=10,
+            detection_calls=10,
+            detection_latency_sum_ms=500.0,
+            detection_latency_max_ms=60.0,
+            object_detection_calls=10,
+            object_detection_latency_sum_ms=200.0,
+            object_detection_latency_max_ms=30.0,
+        ).build()
+
+        # The two are reported side by side and do not contaminate each other.
+        self.assertEqual(aggregate["avg_detection_latency_ms"], 50.0)
+        self.assertEqual(aggregate["avg_object_detection_latency_ms"], 20.0)
+        self.assertEqual(aggregate["max_object_detection_latency_ms"], 30.0)
+        self.assertEqual(aggregate["object_detection_calls"], 10)
+
+    def test_period_spread_distinguishes_stalls_from_slow_work(self):
+        """Two sessions with the same mean period, one of them stall-dominated."""
+        steady = self.main.SessionAggregateInput(
+            session_id="steady", frame_periods_ms=[100.0] * 10
+        ).build()
+        mixed = self.main.SessionAggregateInput(
+            session_id="mixed",
+            frame_periods_ms=[100.0] * 9 + [3000.0],
+        ).build()
+
+        self.assertEqual(steady["frame_period_p50_ms"], 100.0)
+        self.assertEqual(steady["frame_period_p95_ms"], 100.0)
+        # One stall in ten moves p95 and only barely moves the median, which is the
+        # whole point: the mean period cannot tell the two sessions apart.
+        self.assertEqual(mixed["frame_period_p50_ms"], 100.0)
+        self.assertGreater(mixed["frame_period_p95_ms"], 250.0)
+
+    def test_a_session_with_no_periods_reports_zero_not_a_guess(self):
+        aggregate = self.main.SessionAggregateInput(session_id="empty").build()
+
+        self.assertEqual(aggregate["frame_period_p50_ms"], 0.0)
+        self.assertEqual(aggregate["frame_period_p95_ms"], 0.0)
+        self.assertEqual(aggregate["fps_cap"], 0)
+        self.assertEqual(aggregate["avg_object_detection_latency_ms"], 0.0)
+
+    def test_the_ceiling_is_recorded_so_avg_fps_can_be_read(self):
+        aggregate = self.main.SessionAggregateInput(session_id="s", fps_cap=12).build()
+
+        self.assertEqual(aggregate["fps_cap"], 12)
 
 
 if __name__ == "__main__":

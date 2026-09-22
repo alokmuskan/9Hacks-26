@@ -5,11 +5,16 @@ import { SurveillanceContext } from "../context/SurveillanceContext";
 import "./register.css";
 
 function RegisterPage() {
-  const { apiBase, status, enrollStatus, startEnroll, refreshEnroll, stopEnroll } = useContext(SurveillanceContext);
+  const { apiBase, status, enrollStatus, startEnroll, refreshEnroll } = useContext(SurveillanceContext);
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
 
   const active = Boolean(enrollStatus?.active && !enrollStatus?.is_finished);
+  const finished = Boolean(enrollStatus?.is_finished && enrollStatus?.finished_utc);
+  const enrolledName = String(enrollStatus?.name || "");
+  const samples = Number(enrollStatus?.samples_captured || 0);
+  const target = Number(enrollStatus?.target_samples || 0);
 
   useEffect(() => {
     if (!active) {
@@ -27,18 +32,15 @@ function RegisterPage() {
     if (!cleaned || busy) {
       return;
     }
+    setError("");
     try {
       setBusy(true);
       await startEnroll(cleaned);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onStop = async () => {
-    try {
-      setBusy(true);
-      await stopEnroll();
+    } catch (err) {
+      // The backend rejects duplicates with 409 and a reason; surface it here
+      // instead of leaving the button unresponsive with no explanation.
+      const detail = err?.detail || err?.message || "Enrollment could not be started";
+      setError(String(detail));
     } finally {
       setBusy(false);
     }
@@ -64,12 +66,14 @@ function RegisterPage() {
                 <UserPlus size={16} />
                 Start Enroll
               </button>
-              <button className="btn-danger" type="button" disabled={busy || !active} onClick={onStop}>
-                Stop
-              </button>
             </div>
+            {error ? <p className="register-error">{error}</p> : null}
           </form>
-          <pre className="json-box">{JSON.stringify(enrollStatus || {}, null, 2)}</pre>
+          {finished ? (
+            <p className="register-complete" role="status">
+              ✔ Enrollment complete — {enrolledName ? <strong>{enrolledName}</strong> : "person"} added with {samples} sample(s).
+            </p>
+          ) : null}
         </section>
 
         <section className="glass-panel">
@@ -85,7 +89,7 @@ function RegisterPage() {
             />
           </div>
           <div className="tiny">
-            Progress: {enrollStatus?.samples_captured || 0} / {enrollStatus?.target_samples || 0}
+            Progress: {samples} / {target}
           </div>
         </section>
       </div>

@@ -134,6 +134,11 @@ The persisted session aggregate records `face_recognition_enabled` and
 | `AI_STUDIO_METRICS_BACKUPS` | `2` | Rotated metric generations kept |
 | `AI_STUDIO_MEMORY_MAX_AUTO_SNAPSHOTS` | `5000` | Auto-snapshot retention cap |
 | `AI_STUDIO_UNKNOWN_INCIDENT_MAX_FILES` | `500` | Unknown-face capture cap |
+| `AI_STUDIO_YOLO_IMGSZ` | `768` | Object-detection inference size (bigger finds more, costs CPU) |
+| `AI_STUDIO_YOLO_CONF` | `0.25` | Object-detection confidence threshold |
+| `AI_STUDIO_YOLO_IOU` | `0.7` | NMS IoU threshold |
+| `AI_STUDIO_YOLO_MAX_DET` | `300` | Maximum boxes per frame |
+| `AI_STUDIO_YOLO_AGNOSTIC_NMS` | `false` | One box pool across classes (stops double-labelling; can drop a distinct overlapping label) |
 | `AI_STUDIO_FPS_CAP` | `12` | Monitor FPS ceiling (lower = less CPU) |
 | `AI_STUDIO_ENROLL_FPS_CAP` | `20` | Enrollment FPS ceiling |
 | `AI_STUDIO_SNAPSHOT_INTERVAL` | `8.0` | Seconds between auto snapshots (the instances used for analysis) |
@@ -160,9 +165,16 @@ Dashboard → backend URL: set `VITE_API_BASE` in `frontend/.env.local` (default
 
 ```bash
 python -m compileall -q main.py server.py common.py scene_memory.py object_detection.py
-python -m unittest discover -s tests          # 150 tests
+python -m unittest discover -s tests          # the backend battery; the run prints its own count
+python main.py bench-detect                   # detection quality on your own frames
+python main.py frame-budget                   # where a recorded session's frame time went
+python main.py review-detections              # box-by-box review -> a real precision figure
 cd frontend && npm test                       # 7 tests
 ruff check . && mypy                          # lint + types (see ruff.toml / mypy.ini)
 ```
+
+`bench-detect`, `frame-budget` and `review-detections` answer three different questions and none replaces another: the first measures the detector on saved frames (recall against labelled reference images, detection statistics on yours), the second reads the sessions already in `metrics_log.jsonl` and reports what the frame period was made of — including which stages the log does *not* record — and the third turns the detector's own output into a measured **precision** figure with a two-minute review and no new capture. Only the last one measures whether individual detections are *correct*; follow it with `score-detections --review-dir reviews`. If you want to change an answer afterwards, rebuild the page with the recorded verdicts — `python main.py review-detections --verdicts reviews/verdicts.json` — and it opens with the previous answers already marked, so only the corrections are left to do.
+
+The detection benchmark needs the real computer-vision stack (`ultralytics` + OpenCV). The rest of the battery stubs `cv2`, so its inference tests report as **skipped** on a machine without them — a skip there means "not checked here", not "passing".
 
 CI runs the same battery on every push (`.github/workflows/ci.yml`).

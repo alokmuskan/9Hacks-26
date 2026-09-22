@@ -161,7 +161,9 @@ class SceneMemoryManager:
             self._torch = torch
 
             clip_arch = "ViT-B-32-quickgelu"
-            model, _, preprocess = open_clip.create_model_and_transforms(clip_arch, pretrained="openai")
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                clip_arch, pretrained="openai"
+            )
             device = "cuda" if torch.cuda.is_available() else "cpu"
             self._clip_model = model.to(device)
             self._clip_model.eval()
@@ -342,8 +344,7 @@ class SceneMemoryManager:
                 {
                     str(row.get("name"))
                     for row in face_rows
-                    if str(row.get("name", "")).strip()
-                    and str(row.get("name")) != "Unknown"
+                    if str(row.get("name", "")).strip() and str(row.get("name")) != "Unknown"
                 }
             )
 
@@ -469,6 +470,44 @@ class SceneMemoryManager:
                     break
         rows.reverse()
         return rows
+
+    def latest_session_window_minutes(self) -> int | None:
+        """Minutes since the most recent recognise_session ended, rounded up.
+
+        Read from the shared metrics log so a web UI can cap its lookback at
+        "the last monitoring session" without the session having happened in
+        the same process. Returns None when no session has ever been recorded
+        (or the log is unreadable) -- the caller decides the fallback.
+        """
+        path = self.base_dir.parent / common.METRICS_FILENAME
+        latest_end: datetime | None = None
+        try:
+            with path.open(encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if "recognize_session" not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if row.get("event_type") != "recognize_session":
+                        continue
+                    raw = str(row.get("end_utc") or row.get("timestamp_utc") or "")
+                    try:
+                        ended = datetime.fromisoformat(raw)
+                    except ValueError:
+                        continue
+                    if ended.tzinfo is None:
+                        ended = ended.replace(tzinfo=UTC)
+                    if latest_end is None or ended > latest_end:
+                        latest_end = ended
+        except OSError:
+            return None
+        if latest_end is None:
+            return None
+        elapsed = datetime.now(UTC) - latest_end
+        return max(int(timedelta.total_seconds(elapsed) // 60) + 1, 1)
 
     def find_object_last_seen(self, object_name: str) -> dict[str, Any] | None:
         target = object_name.strip().lower()

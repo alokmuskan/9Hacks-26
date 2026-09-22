@@ -138,7 +138,7 @@ Set one of:
 
 Optional:
 
-- `GROQ_MODEL` (default: `llama-3.3-70b-versatile`)
+- `GROQ_MODEL` (default: `openai/gpt-oss-120b` — a *reasoning* model: the code sends `reasoning_effort=low` so the answer fits in the token budget; earlier defaults such as `llama-3.3-70b-versatile` no longer exist on Groq and return 404)
 
 ## Telemetry
 

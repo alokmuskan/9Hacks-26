@@ -13,6 +13,7 @@ import "./App.css";
 
 function AppShell() {
   const { initializing, operation, errors, removeError } = useContext(SurveillanceContext);
+
   const appBusy = Boolean(initializing || operation?.active);
   const visibleErrors = (errors || []).slice(0, 3);
 

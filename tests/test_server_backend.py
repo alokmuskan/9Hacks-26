@@ -4,13 +4,17 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 import unittest
+from datetime import UTC, datetime, timedelta
 from typing import ClassVar
 from unittest import mock
 
 import numpy as np
 from fastapi.testclient import TestClient
+
+from object_detection import DualYoloDetector
 
 
 class ServerBackendTests(unittest.TestCase):
@@ -45,6 +49,18 @@ class ServerBackendTests(unittest.TestCase):
         self.assertEqual(row["session_id"], "s1")
         self.assertEqual(row["payload"], payload)
 
+    def test_publish_event_does_not_create_a_coroutine_for_a_closed_loop(self):
+        manager = self.server.PipelineManager()
+        loop = mock.Mock()
+        loop.is_closed.return_value = True
+        manager.set_event_loop(loop)
+        publish = mock.AsyncMock()
+        manager.event_hub.publish = publish
+
+        manager._publish_event("pipeline_state", {"running": False})
+
+        publish.assert_not_awaited()
+
     def test_fps_throttle_sleep_duration(self):
         dur = self.server.PipelineManager._compute_sleep_duration(0.05, 0.01)
         self.assertAlmostEqual(dur, 0.04, places=6)
@@ -54,7 +70,9 @@ class ServerBackendTests(unittest.TestCase):
 
     def test_stream_generator_uses_frame_store_only(self):
         # If stream path accidentally touches core inference stack, this will fail.
-        with mock.patch.object(self.server, "_core", side_effect=AssertionError("core should not be called")):
+        with mock.patch.object(
+            self.server, "_core", side_effect=AssertionError("core should not be called")
+        ):
             gen = self.server.build_video_stream_generator()
             data = asyncio.run(gen.__anext__())
             asyncio.run(gen.aclose())
@@ -103,12 +121,19 @@ class ServerBackendTests(unittest.TestCase):
 
         def rec(level, exc=None, msg="ok"):
             return logging.LogRecord(
-                name="uvicorn.error", level=level, pathname=__file__, lineno=0,
-                args=(), msg=msg, exc_info=exc,
+                name="uvicorn.error",
+                level=level,
+                pathname=__file__,
+                lineno=0,
+                args=(),
+                msg=msg,
+                exc_info=exc,
             )
 
         cancelled = asyncio.CancelledError("queue.get cancelled during shutdown")
-        benign = rec(logging.ERROR, exc=(asyncio.CancelledError, cancelled, cancelled.__traceback__))
+        benign = rec(
+            logging.ERROR, exc=(asyncio.CancelledError, cancelled, cancelled.__traceback__)
+        )
         self.assertFalse(flt.filter(benign), "benign CancelledError record must be dropped")
 
         real_fail = rec(logging.ERROR, exc=(RuntimeError, RuntimeError("camera exploded"), None))
@@ -118,19 +143,33 @@ class ServerBackendTests(unittest.TestCase):
         self.assertFalse(flt.filter(plain_msg), "formatted CancelledError text must be dropped")
 
         cancelled_msg = asyncio.CancelledError("queue.get cancelled during shutdown")
-        with_message = rec(logging.ERROR, exc=(asyncio.CancelledError, cancelled_msg, cancelled_msg.__traceback__))
-        self.assertFalse(flt.filter(with_message), "CancelledError with a message must also be dropped")
+        with_message = rec(
+            logging.ERROR, exc=(asyncio.CancelledError, cancelled_msg, cancelled_msg.__traceback__)
+        )
+        self.assertFalse(
+            flt.filter(with_message), "CancelledError with a message must also be dropped"
+        )
 
         kb = rec(logging.ERROR, exc=(KeyboardInterrupt, KeyboardInterrupt(), None))
         self.assertFalse(flt.filter(kb), "bare KeyboardInterrupt record must be dropped")
 
-        mentions = rec(logging.ERROR, msg="upload failed after CancelledError occurred mid-transfer")
+        mentions = rec(
+            logging.ERROR, msg="upload failed after CancelledError occurred mid-transfer"
+        )
         self.assertTrue(flt.filter(mentions), "text that merely mentions the name must pass")
 
-        looks_cancelled = rec(logging.ERROR, msg="Exception in ASGI application\nTraceback ...\nasyncio.exceptions.CancelledError")
-        self.assertFalse(flt.filter(looks_cancelled), "message-embedded traceback ending in CancelledError must be dropped")
+        looks_cancelled = rec(
+            logging.ERROR,
+            msg="Exception in ASGI application\nTraceback ...\nasyncio.exceptions.CancelledError",
+        )
+        self.assertFalse(
+            flt.filter(looks_cancelled),
+            "message-embedded traceback ending in CancelledError must be dropped",
+        )
 
-        info_rec = rec(logging.INFO, exc=(asyncio.CancelledError, cancelled, cancelled.__traceback__))
+        info_rec = rec(
+            logging.INFO, exc=(asyncio.CancelledError, cancelled, cancelled.__traceback__)
+        )
         self.assertTrue(flt.filter(info_rec), "non-ERROR records must always pass")
 
     def test_api_status_schema(self):
@@ -157,7 +196,9 @@ class ServerBackendTests(unittest.TestCase):
                     manager_self._thread = None
             manager_self._set_pipeline_state(mode="idle", running=False, degraded=False)
 
-        with mock.patch.object(self.server.PipelineManager, "_run_monitor_worker", _fake_monitor_worker):
+        with mock.patch.object(
+            self.server.PipelineManager, "_run_monitor_worker", _fake_monitor_worker
+        ):
             with TestClient(self.server.app) as client:
                 started = client.post("/api/v1/monitor/start", json={})
                 self.assertEqual(started.status_code, 200)
@@ -183,7 +224,9 @@ class ServerBackendTests(unittest.TestCase):
         self.server.MANAGER.frame_store.clear()
         self.server.MANAGER.frame_store.update(jpeg)
 
-        with mock.patch.object(self.server, "_core", side_effect=AssertionError("core should not be called")):
+        with mock.patch.object(
+            self.server, "_core", side_effect=AssertionError("core should not be called")
+        ):
             g1 = self.server.build_video_stream_generator()
             g2 = self.server.build_video_stream_generator()
             c1 = asyncio.run(g1.__anext__())
@@ -199,7 +242,9 @@ class ServerBackendTests(unittest.TestCase):
         self.server.MANAGER.frame_store.clear()
         self.server.MANAGER.frame_store.update(raw)
 
-        with mock.patch.object(self.server, "_encode_jpeg", side_effect=AssertionError("should not encode in stream")):
+        with mock.patch.object(
+            self.server, "_encode_jpeg", side_effect=AssertionError("should not encode in stream")
+        ):
             gen = self.server.build_video_stream_generator()
             chunk = asyncio.run(gen.__anext__())
             asyncio.run(gen.aclose())
@@ -210,8 +255,9 @@ class ServerBackendTests(unittest.TestCase):
         self.server.MANAGER.frame_store.clear()
         self.server.MANAGER.frame_store.update(raw)
 
-        with mock.patch.object(self.server, "MJPEG_KEEPALIVE_SEC", 0.0), mock.patch.object(
-            self.server, "FRAME_WAIT_IDLE_SEC", 0.0
+        with (
+            mock.patch.object(self.server, "MJPEG_KEEPALIVE_SEC", 0.0),
+            mock.patch.object(self.server, "FRAME_WAIT_IDLE_SEC", 0.0),
         ):
             gen = self.server.build_video_stream_generator()
             first = asyncio.run(gen.__anext__())
@@ -233,7 +279,9 @@ class ServerBackendTests(unittest.TestCase):
             time.sleep(0.02)
             manager_self._mark_startup_failed("startup_timeout_no_frames")
 
-        with mock.patch.object(self.server.PipelineManager, "_run_monitor_worker", _fake_monitor_worker):
+        with mock.patch.object(
+            self.server.PipelineManager, "_run_monitor_worker", _fake_monitor_worker
+        ):
             with TestClient(self.server.app) as client:
                 started = client.post("/api/v1/monitor/start", json={})
                 self.assertEqual(started.status_code, 200)
@@ -307,8 +355,11 @@ class ServerBackendTests(unittest.TestCase):
                 }
             ]
         }
-        with mock.patch.object(self.server, "_build_chat_grounding", return_value=fake_grounding), mock.patch.object(
-            self.server, "_query_groq_grounded", return_value=("Grounded answer [C1].", True)
+        with (
+            mock.patch.object(self.server, "_build_chat_grounding", return_value=fake_grounding),
+            mock.patch.object(
+                self.server, "_query_groq_grounded", return_value=("Grounded answer [C1].", True)
+            ),
         ):
             with TestClient(self.server.app) as client:
                 first = client.post("/api/v1/chat/query", json={"message": "hello"}).json()
@@ -343,8 +394,17 @@ class ServerBackendTests(unittest.TestCase):
             self.assertFalse(invalid.get("hit"))
 
     def test_chat_greeting_is_deterministic_without_groq(self):
-        with mock.patch.object(self.server, "_query_groq_grounded", side_effect=AssertionError("Groq should not be called")), mock.patch.object(
-            self.server, "_build_chat_grounding", side_effect=AssertionError("Grounding should not be called for greeting")
+        with (
+            mock.patch.object(
+                self.server,
+                "_query_groq_grounded",
+                side_effect=AssertionError("Groq should not be called"),
+            ),
+            mock.patch.object(
+                self.server,
+                "_build_chat_grounding",
+                side_effect=AssertionError("Grounding should not be called for greeting"),
+            ),
         ):
             with TestClient(self.server.app) as client:
                 row = client.post("/api/v1/chat/query", json={"message": "Hi"}).json()
@@ -392,10 +452,17 @@ class ServerBackendTests(unittest.TestCase):
             "face_rows": [],
         }
 
-        with mock.patch.object(self.server, "_load_metric_events", return_value=fake_events), mock.patch.object(
-            self.server.MANAGER, "build_chat_runtime_context", return_value=fake_context
-        ), mock.patch.object(self.server, "_build_chat_grounding", return_value=fake_grounding), mock.patch.object(
-            self.server, "_query_groq_grounded", side_effect=AssertionError("Groq should not be called")
+        with (
+            mock.patch.object(self.server, "_load_metric_events", return_value=fake_events),
+            mock.patch.object(
+                self.server.MANAGER, "build_chat_runtime_context", return_value=fake_context
+            ),
+            mock.patch.object(self.server, "_build_chat_grounding", return_value=fake_grounding),
+            mock.patch.object(
+                self.server,
+                "_query_groq_grounded",
+                side_effect=AssertionError("Groq should not be called"),
+            ),
         ):
             with TestClient(self.server.app) as client:
                 row = client.post(
@@ -406,6 +473,160 @@ class ServerBackendTests(unittest.TestCase):
                 self.assertTrue(row.get("hit"))
                 self.assertIn("2 distinct persons", str(row.get("reply")))
                 self.assertTrue(isinstance(row.get("citations"), list))
+
+
+class ToggleRefusalTests(unittest.TestCase):
+    """A toggle the detector cannot honour must not block the frame loop.
+
+    Enabling a model that is not loaded is the case that bit in practice:
+    `toggle_custom()` always returns ``False`` when no checkpoint is configured, so
+    the previous `while state != desired: state = detector.toggle_custom()` spun
+    forever inside the worker thread. Frames stopped, the dashboard served its
+    stalled placeholder, and the user saw "Reconnecting" with no stated cause.
+    The assertion is therefore a timeout: the handler has to return.
+    """
+
+    def setUp(self):
+        self.server = importlib.import_module("server")
+
+    def _manager(self):
+        manager = self.server.PipelineManager()
+        events: list[tuple[str, dict]] = []
+        manager._publish_event = lambda event_type, payload: events.append((event_type, payload))
+        return manager, events
+
+    def _drain_with_timeout(self, manager, detector, state, command) -> bool:
+        manager._control_q.put(command)
+        finished = threading.Event()
+
+        def drain() -> None:
+            manager._drain_controls(detector, state)
+            finished.set()
+
+        threading.Thread(target=drain, daemon=True).start()
+        return finished.wait(5.0)
+
+    def test_asking_for_a_custom_model_that_is_not_loaded_returns(self):
+        detector = DualYoloDetector(general_model_obj=object(), enable_custom=False)
+        manager, events = self._manager()
+        state = {"general": True, "custom": False, "gaze": False}
+
+        command = {"type": "toggle", "general_yolo": None, "custom_yolo": True, "gaze": None}
+        self.assertTrue(
+            self._drain_with_timeout(manager, detector, state, command),
+            "the toggle handler never returned, so it would have frozen the frame loop",
+        )
+
+        self.assertFalse(state["custom"], "custom must stay off with no checkpoint")
+        payload = events[0][1]
+        self.assertIn("custom", payload["toggle_refused"])
+        self.assertIn("models/custom_yolo.pt", payload["toggle_refused"]["custom"])
+
+    def test_asking_for_a_general_model_that_is_not_loaded_returns(self):
+        detector = DualYoloDetector(general_model_obj=None, enable_general=False)
+        manager, events = self._manager()
+        state = {"general": False, "custom": False, "gaze": False}
+
+        command = {"type": "toggle", "general_yolo": True, "custom_yolo": None, "gaze": None}
+        self.assertTrue(self._drain_with_timeout(manager, detector, state, command))
+
+        self.assertFalse(state["general"])
+        self.assertIn("general", events[0][1]["toggle_refused"])
+
+    def test_a_loaded_model_is_enabled_and_nothing_is_refused(self):
+        detector = DualYoloDetector(
+            general_model_obj=object(),
+            custom_model_obj=object(),
+            enable_general=True,
+            enable_custom=False,
+        )
+        manager, events = self._manager()
+        state = {"general": True, "custom": False, "gaze": False}
+
+        command = {"type": "toggle", "general_yolo": None, "custom_yolo": True, "gaze": None}
+        self.assertTrue(self._drain_with_timeout(manager, detector, state, command))
+
+        self.assertTrue(state["custom"])
+        self.assertEqual(events[0][1]["toggle_refused"], {})
+        self.assertTrue(events[0][1]["toggle_update"]["custom"])
+
+
+class EnrollLifecycleTests(unittest.TestCase):
+    """Enrollment must refuse duplicates, and the stream must not pin a dead session."""
+
+    def setUp(self):
+        self.server = importlib.import_module("server")
+
+    def tearDown(self):
+        try:
+            self.server.MANAGER._loop = None
+            self.server.MANAGER.stop()
+        except Exception:
+            pass
+
+    def test_enrolling_a_name_the_db_already_knows_is_refused(self):
+        """`upsert` merges samples by name, so a duplicate silently blurred two people."""
+        existing = "Alice"
+
+        # A repository checkout must not need a developer's face_db.npz.  The
+        # endpoint only reads `names` before refusing a duplicate, so this small
+        # fixture captures the production contract without involving disk state.
+        fake_db = mock.Mock(names=[existing])
+        with mock.patch.object(self.server._core().FaceDB, "load", return_value=fake_db):
+            # Case and whitespace must not be enough to sneak past the check.
+            with TestClient(self.server.app) as client:
+                response = client.post("/api/v1/enroll/start", json={"name": "  ALICE  "})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn(existing.casefold(), response.json()["detail"].casefold())
+
+    def test_a_distinct_name_starts_normally(self):
+        db = self.server._core().FaceDB.load()
+        taken = {str(n).strip().casefold() for n in db.names}
+        fresh = next(f"ci-test-{n}" for n in range(1000) if f"ci-test-{n}".casefold() not in taken)
+
+        def _fake_worker(manager_self, **_kwargs):
+            time.sleep(0.2)
+            with manager_self._lock:
+                if manager_self._mode == "enroll":
+                    manager_self._mode = "idle"
+                    manager_self._thread = None
+
+        with mock.patch.object(self.server.PipelineManager, "_run_enroll_worker", _fake_worker):
+            with TestClient(self.server.app) as client:
+                response = client.post("/api/v1/enroll/start", json={"name": fresh})
+                self.assertEqual(response.status_code, 200)
+            self.server.MANAGER.stop()
+
+    def test_stop_clears_the_last_frame_from_the_stream(self):
+        """A stopped session must not leave its final frame frozen on screen."""
+        manager = self.server.PipelineManager()
+        manager.frame_store.update(b"stale-jpeg-bytes")
+
+        manager.stop()
+
+        frame = manager.get_stream_frame()
+        self.assertNotEqual(frame["frame_bytes"], b"stale-jpeg-bytes")
+        # Idle mode serves the idle placeholder, not the stale or stalled one.
+        self.assertEqual(frame["frame_bytes"], manager._placeholder_idle)
+
+    def test_a_worker_exit_clears_the_last_frame_even_without_stop(self):
+        """Camera loss or a startup failure exits without `stop()` being called.
+
+        The camera path itself is stubbed out: a real recovery attempt would reach
+        for actual hardware and hang the suite.
+        """
+        manager = self.server.PipelineManager()
+        manager.frame_store.update(b"stale-jpeg-bytes")
+
+        with mock.patch.object(
+            self.server.PipelineManager,
+            "_attempt_camera_recovery",
+            return_value=None,
+        ):
+            manager._run_enroll_worker(name="nobody", model="buffalo_sc", fps_cap=20)
+
+        frame = manager.get_stream_frame()
+        self.assertEqual(frame["frame_bytes"], manager._placeholder_idle)
 
 
 class PacingAndCaptureDefaultsTests(unittest.TestCase):
@@ -478,6 +699,70 @@ class PacingAndCaptureDefaultsTests(unittest.TestCase):
             self._probe(AI_STUDIO_FPS_CAP="abc", AI_STUDIO_SNAPSHOT_INTERVAL="xyz"),
             ["12", "20", "8.0"],
         )
+
+
+class RecentSnapshotsWindowTests(unittest.TestCase):
+    """The /memory/recent window is capped at the last monitoring session."""
+
+    def setUp(self):
+        self.server = importlib.import_module("server")
+
+    def tearDown(self):
+        try:
+            self.server.MANAGER._loop = None
+            self.server.MANAGER.stop()
+        except Exception:
+            pass
+
+    def test_recent_caps_to_session_window(self):
+        memory = mock.MagicMock()
+        memory.latest_session_window_minutes.return_value = 9
+        captured: dict = {}
+
+        def fake_recent(minutes, limit):
+            captured["minutes"] = minutes
+            return [{"id": 1}]
+
+        memory.get_recent_snapshots.side_effect = fake_recent
+        with mock.patch.object(self.server, "_core") as core:
+            core.return_value.SceneMemoryManager.return_value = memory
+            with TestClient(self.server.app) as client:
+                row = client.get("/api/v1/memory/recent?minutes=60").json()
+
+        self.assertEqual(captured["minutes"], 9)
+        self.assertTrue(row["capped"])
+        self.assertEqual(row["effective_minutes"], 9)
+        self.assertEqual(row["requested_minutes"], 60)
+
+    def test_recent_ignores_cap_without_session_history(self):
+        memory = mock.MagicMock()
+        memory.latest_session_window_minutes.return_value = None
+        captured: dict = {}
+        memory.get_recent_snapshots.side_effect = lambda minutes, limit: (
+            captured.setdefault("minutes", minutes),
+            [],
+        )[1]
+        with mock.patch.object(self.server, "_core") as core:
+            core.return_value.SceneMemoryManager.return_value = memory
+            with TestClient(self.server.app) as client:
+                row = client.get("/api/v1/memory/recent?minutes=60").json()
+
+        self.assertEqual(captured["minutes"], 60)
+        self.assertFalse(row["capped"])
+        self.assertIsNone(row["session_window_minutes"])
+
+    def test_session_window_endpoint_reads_metrics(self):
+        recent_end = datetime.now(UTC) - timedelta(seconds=30)
+        events = [
+            {"event_type": "recognize_session", "end_utc": recent_end.isoformat()},
+            {"event_type": "chat_query"},
+        ]
+        with mock.patch.object(self.server, "_load_metric_events", return_value=events):
+            with TestClient(self.server.app) as client:
+                row = client.get("/api/v1/memory/session-window").json()
+
+        self.assertEqual(row["session_window_minutes"], 1)
+        self.assertIn("last_session", row)
 
 
 if __name__ == "__main__":

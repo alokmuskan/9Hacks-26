@@ -72,6 +72,7 @@ export const api = {
   memoryStats: () => request("/api/v1/memory/stats", { timeoutMs: 12_000 }),
   memoryRecent: (minutes = 5, limit = 20) =>
     request(`/api/v1/memory/recent?minutes=${minutes}&limit=${limit}`, { timeoutMs: 12_000 }),
+  sessionWindow: () => request("/api/v1/memory/session-window", { timeoutMs: 12_000 }),
   memoryFindObject: (name) =>
     request(`/api/v1/memory/find/object?name=${encodeURIComponent(name)}`, { timeoutMs: 12_000 }),
   memoryFindPerson: (name) =>

@@ -259,7 +259,9 @@ class GazeL2CSHelperTests(unittest.TestCase):
 
         expected_pitch = torch.sum(softmax(pitch_logits) * idx_deg, dim=1) * (np.pi / 180.0)
         expected_yaw = torch.sum(softmax(yaw_logits) * idx_deg, dim=1) * (np.pi / 180.0)
-        self.assertAlmostEqual(float(pitch_rad[0].item()), float(expected_pitch[0].item()), places=6)
+        self.assertAlmostEqual(
+            float(pitch_rad[0].item()), float(expected_pitch[0].item()), places=6
+        )
         self.assertAlmostEqual(float(yaw_rad[0].item()), float(expected_yaw[0].item()), places=6)
 
     def test_align_face_fallbacks_when_landmarks_missing_or_invalid(self):
@@ -313,6 +315,7 @@ class GazeL2CSHelperTests(unittest.TestCase):
         )
         self.assertEqual(gx, 100)
         self.assertEqual(gy, 75)
+
 
 class GazeMirrorFallbackTests(unittest.TestCase):
     """The Drive folder is dead upstream; bootstrap must recover via the mirror."""
@@ -412,7 +415,9 @@ class GazeMirrorFallbackTests(unittest.TestCase):
                 mock.patch.object(main, "GAZE_WEIGHTS_MIRROR_SIZE", len(blob)),
                 mock.patch.object(main, "GAZE_WEIGHTS_MIRROR_SHA256", digest),
                 mock.patch.object(
-                    main, "_load_safetensors_state_dict", return_value={k: v.copy() for k, v in state.items()}
+                    main,
+                    "_load_safetensors_state_dict",
+                    return_value={k: v.copy() for k, v in state.items()},
                 ),
                 mock.patch.object(
                     main.urllib.request,
@@ -429,7 +434,9 @@ class GazeMirrorFallbackTests(unittest.TestCase):
             self.assertIsInstance(loaded, dict)
             for key, value in loaded.items():
                 self.assertIsInstance(value, torch.Tensor, f"{key} must be a torch tensor")
-                self.assertTrue(np.array_equal(value.numpy(), state[key]), f"{key} values must match")
+                self.assertTrue(
+                    np.array_equal(value.numpy(), state[key]), f"{key} values must match"
+                )
 
     def test_checksum_mismatch_rejects_download(self):
         _install_stubs()
@@ -444,7 +451,9 @@ class GazeMirrorFallbackTests(unittest.TestCase):
             with (
                 mock.patch.object(main, "GAZE_WEIGHTS_MIRROR_SIZE", len(blob)),
                 mock.patch.object(main, "GAZE_WEIGHTS_MIRROR_SHA256", wrong_digest),
-                mock.patch.object(main.urllib.request, "urlopen", side_effect=_fake_urlopen_blob(blob)),
+                mock.patch.object(
+                    main.urllib.request, "urlopen", side_effect=_fake_urlopen_blob(blob)
+                ),
             ):
                 result = main._download_gaze_weights_from_mirror(target)
 
@@ -473,7 +482,9 @@ class GazeMirrorFallbackTests(unittest.TestCase):
             target = Path(td) / "models" / "L2CSNet_gaze360.pkl"
             with (
                 mock.patch.object(main, "GAZE_WEIGHTS_MIRROR_SIZE", 10_000_000),
-                mock.patch.object(main.urllib.request, "urlopen", side_effect=_fake_urlopen_blob(blob)),
+                mock.patch.object(
+                    main.urllib.request, "urlopen", side_effect=_fake_urlopen_blob(blob)
+                ),
             ):
                 result = main._download_gaze_weights_from_mirror(target)
 

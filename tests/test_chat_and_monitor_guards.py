@@ -1,5 +1,7 @@
 import importlib
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -49,7 +51,9 @@ class ChatTruthfulnessTests(unittest.TestCase):
             old_metrics = self.main.METRICS_LOG_PATH
             self.main.METRICS_LOG_PATH = Path(td) / "metrics.jsonl"
             try:
-                reply, found = self.main._answer_attention_query("what is Alok looking at", ["Alok"])
+                reply, found = self.main._answer_attention_query(
+                    "what is Alok looking at", ["Alok"]
+                )
                 self.assertFalse(found)
                 self.assertIn("No recent attention events", reply)
 
@@ -62,7 +66,9 @@ class ChatTruthfulnessTests(unittest.TestCase):
                 }
                 self.main.METRICS_LOG_PATH.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
-                reply, found = self.main._answer_attention_query("what is Alok looking at", ["Alok"])
+                reply, found = self.main._answer_attention_query(
+                    "what is Alok looking at", ["Alok"]
+                )
                 self.assertTrue(found)
                 self.assertIn("laptop", reply)
             finally:
@@ -101,10 +107,17 @@ class ChatTruthfulnessTests(unittest.TestCase):
         self.assertIn("laptop", row["reply"])
 
     def test_greeting_is_not_marked_grounded(self):
-        with mock.patch.object(
-            self.server, "_query_groq_grounded", side_effect=AssertionError("Groq should not be called")
-        ), mock.patch.object(
-            self.server, "_build_chat_grounding", side_effect=AssertionError("no grounding for a greeting")
+        with (
+            mock.patch.object(
+                self.server,
+                "_query_groq_grounded",
+                side_effect=AssertionError("Groq should not be called"),
+            ),
+            mock.patch.object(
+                self.server,
+                "_build_chat_grounding",
+                side_effect=AssertionError("no grounding for a greeting"),
+            ),
         ):
             with TestClient(self.server.app) as client:
                 row = client.post("/api/v1/chat/query", json={"message": "Hi"}).json()
@@ -124,8 +137,11 @@ class ChatTruthfulnessTests(unittest.TestCase):
                 }
             ]
         }
-        with mock.patch.object(self.server, "_build_chat_grounding", return_value=fake_grounding), mock.patch.object(
-            self.server, "_query_groq_grounded", return_value=("Camera is offline [C1].", True)
+        with (
+            mock.patch.object(self.server, "_build_chat_grounding", return_value=fake_grounding),
+            mock.patch.object(
+                self.server, "_query_groq_grounded", return_value=("Camera is offline [C1].", True)
+            ),
         ):
             with TestClient(self.server.app) as client:
                 row = client.post(
@@ -154,7 +170,9 @@ class MonitorGuardTests(unittest.TestCase):
         with TestClient(self.server.app) as client:
             for bad in (0, -5, 0.01, 5000):
                 row = client.post("/api/v1/monitor/start", json={"snapshot_interval": bad})
-                self.assertEqual(row.status_code, 422, f"snapshot_interval={bad} should be rejected")
+                self.assertEqual(
+                    row.status_code, 422, f"snapshot_interval={bad} should be rejected"
+                )
 
     def test_unsupported_gaze_arch_is_rejected(self):
         with TestClient(self.server.app) as client:
@@ -165,7 +183,9 @@ class MonitorGuardTests(unittest.TestCase):
         def _fake_monitor_worker(_manager_self, **_kwargs):
             return None
 
-        with mock.patch.object(self.server.PipelineManager, "_run_monitor_worker", _fake_monitor_worker):
+        with mock.patch.object(
+            self.server.PipelineManager, "_run_monitor_worker", _fake_monitor_worker
+        ):
             with TestClient(self.server.app) as client:
                 started = client.post("/api/v1/monitor/start", json={"gaze_arch": "ResNet18"})
                 self.assertEqual(started.status_code, 200)
@@ -199,8 +219,11 @@ class MonitorGuardTests(unittest.TestCase):
             "attention_rows": [],
         }
 
-        with mock.patch.object(self.server, "_core", return_value=_FakeCore()), mock.patch.object(
-            self.server.MANAGER, "build_chat_runtime_context", return_value=context
+        with (
+            mock.patch.object(self.server, "_core", return_value=_FakeCore()),
+            mock.patch.object(
+                self.server.MANAGER, "build_chat_runtime_context", return_value=context
+            ),
         ):
             with TestClient(self.server.app) as client:
                 row = client.post("/api/v1/monitor/snapshot").json()
@@ -358,10 +381,13 @@ class MonitorWorkerResilienceTests(unittest.TestCase):
         fake_core = self._fake_core(appended)
         reader = _FakeReader(manager, frames=3)
 
-        with mock.patch.object(self.server, "_core", return_value=fake_core), mock.patch.object(
-            self.server.PipelineManager,
-            "_attempt_camera_recovery",
-            lambda _self, **_kwargs: (object(), reader),
+        with (
+            mock.patch.object(self.server, "_core", return_value=fake_core),
+            mock.patch.object(
+                self.server.PipelineManager,
+                "_attempt_camera_recovery",
+                lambda _self, **_kwargs: (object(), reader),
+            ),
         ):
             manager._run_monitor_worker(
                 model="buffalo_sc",
@@ -378,7 +404,9 @@ class MonitorWorkerResilienceTests(unittest.TestCase):
                 fps_cap=20,
             )
 
-        sessions = [payload for event_type, payload in appended if event_type == "recognize_session"]
+        sessions = [
+            payload for event_type, payload in appended if event_type == "recognize_session"
+        ]
         self.assertEqual(len(sessions), 1, "the worker did not reach its session summary")
 
         payload = sessions[0]
@@ -404,10 +432,13 @@ class MonitorWorkerResilienceTests(unittest.TestCase):
         fake_core = self._fake_core(appended, face_reason=reason)
         reader = _FakeReader(manager, frames=3)
 
-        with mock.patch.object(self.server, "_core", return_value=fake_core), mock.patch.object(
-            self.server.PipelineManager,
-            "_attempt_camera_recovery",
-            lambda _self, **_kwargs: (object(), reader),
+        with (
+            mock.patch.object(self.server, "_core", return_value=fake_core),
+            mock.patch.object(
+                self.server.PipelineManager,
+                "_attempt_camera_recovery",
+                lambda _self, **_kwargs: (object(), reader),
+            ),
         ):
             manager._run_monitor_worker(
                 model="buffalo_sc",
@@ -424,7 +455,9 @@ class MonitorWorkerResilienceTests(unittest.TestCase):
                 fps_cap=20,
             )
 
-        sessions = [payload for event_type, payload in appended if event_type == "recognize_session"]
+        sessions = [
+            payload for event_type, payload in appended if event_type == "recognize_session"
+        ]
         self.assertEqual(len(sessions), 1, "the worker did not reach its session summary")
         aggregate = sessions[0]["aggregate"]
         self.assertFalse(aggregate["face_recognition_enabled"])
@@ -442,9 +475,125 @@ class MonitorWorkerResilienceTests(unittest.TestCase):
             if event.get("type") == "pipeline_state" and event["payload"].get("degraded")
         ]
         self.assertTrue(
-            any("face_recognition_unavailable" in str(s.get("degraded_reason")) for s in degraded_states),
+            any(
+                "face_recognition_unavailable" in str(s.get("degraded_reason"))
+                for s in degraded_states
+            ),
             "no pipeline_state event reported the missing face recogniser",
         )
+
+
+class GroqReasoningModelWiringTests(unittest.TestCase):
+    """The default Groq model is a reasoning model: it spends completion tokens
+    on internal reasoning before answering, so without reasoning_effort the
+    350-500 token budget is exhausted by the chain-of-thought and the API
+    returns EMPTY content - which the chat path reported as "response
+    unavailable" despite a valid key. These tests pin the wiring so it cannot
+    silently regress."""
+
+    def setUp(self):
+        _install_stubs()
+        self.main = importlib.import_module("main")
+        self.server = importlib.import_module("server")
+
+    def _capture(self, fake_response):
+        captured: dict = {}
+
+        class _FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return fake_response
+
+        class _FakeChat:
+            completions = _FakeCompletions()
+
+        class _FakeClient:
+            def __init__(self, api_key=None):
+                self.chat = _FakeChat()
+
+        return captured, _FakeClient
+
+    @staticmethod
+    def _response(content):
+        choice = type("Choice", (), {"message": type("Msg", (), {"content": content})()})
+        return type("Resp", (), {"choices": [choice()]})()
+
+    def test_grounded_call_sets_reasoning_effort_and_reads_content(self):
+        captured, fake_client = self._capture(self._response("Alok is present [C1]."))
+        with (
+            mock.patch.dict(os.environ, {"GROQ_API_KEY": "k"}),
+            mock.patch.dict(sys.modules, {"groq": mock.MagicMock(Groq=fake_client)}),
+        ):
+            answer, ok = self.server._query_groq_grounded(
+                question="who is present",
+                session_history=[],
+                grounding={"citations": []},
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(answer, "Alok is present [C1].")
+        self.assertEqual(captured["extra_body"].get("reasoning_effort"), "low")
+        self.assertGreaterEqual(captured["max_tokens"], 500)
+
+    def test_empty_content_falls_back_deterministically(self):
+        _, fake_client = self._capture(self._response(""))
+        with (
+            mock.patch.dict(os.environ, {"GROQ_API_KEY": "k"}),
+            mock.patch.dict(sys.modules, {"groq": mock.MagicMock(Groq=fake_client)}),
+        ):
+            answer, ok = self.server._query_groq_grounded(
+                question="who is present",
+                session_history=[],
+                grounding={"citations": []},
+            )
+
+        self.assertFalse(ok)
+        self.assertIsNone(answer)
+
+    def test_cli_chat_call_sets_reasoning_effort(self):
+        captured, fake_client = self._capture(self._response("Alok is present."))
+        with (
+            mock.patch.dict(os.environ, {"GROQ_API_KEY": "k"}),
+            mock.patch.dict(sys.modules, {"groq": mock.MagicMock(Groq=fake_client)}),
+        ):
+            answer = self.main._query_groq("who is present", {"people_present": ["alok"]})
+
+        self.assertEqual(answer, "Alok is present.")
+        self.assertEqual(captured["extra_body"].get("reasoning_effort"), "low")
+
+
+class ServerDotEnvLoadingTests(unittest.TestCase):
+    """server.py must load .env at import, like the CLI entry point does.
+
+    Regression: only main.py called load_dotenv, so `python server.py` never
+    had GROQ_API_KEY in its process environment and chat always answered
+    "Groq response unavailable" despite a valid key in .env.
+    """
+
+    def test_importing_server_loads_env_file(self):
+        import subprocess
+
+        repo_root = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text('PROBE_MARKER_9F27A = "env-file-loaded"\n', encoding="utf-8")
+            # Run with CWD = the temp dir so load_dotenv() can only find the
+            # probe key through server.py's own import-time load. Any real env
+            # var must not leak in, so the probe name is unique.
+            code = (
+                "import sys; sys.path.insert(0, r" + repr(str(repo_root)) + "); "
+                "import server; import os; "
+                "print('PROBE:' + str(os.getenv('PROBE_MARKER_9F27A')))"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("PROBE:env-file-loaded", proc.stdout, proc.stderr[-800:])
 
 
 if __name__ == "__main__":

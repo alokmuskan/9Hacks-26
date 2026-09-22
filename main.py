@@ -15,7 +15,7 @@ import time
 import urllib.request
 from collections import Counter, defaultdict, deque
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,10 @@ import cv2
 import numpy as np
 
 import common
+import detection_bench
+import detection_review
+import frame_budget
+import frame_set_validation
 from object_detection import DualYoloDetector, find_latest_custom_model
 from scene_memory import SceneMemoryManager
 
@@ -97,9 +101,7 @@ GAZE_WEIGHTS_MIRROR_URL = (
     "https://huggingface.co/py-feat/l2cs/resolve/main/l2cs_gaze360_resnet50.safetensors"
 )
 GAZE_WEIGHTS_MIRROR_SIZE = 95_773_960
-GAZE_WEIGHTS_MIRROR_SHA256 = (
-    "75405bdc01f7086b3887280fe50c28a14bc62463a53fa749781e4a3cf98eca0e"
-)
+GAZE_WEIGHTS_MIRROR_SHA256 = "75405bdc01f7086b3887280fe50c28a14bc62463a53fa749781e4a3cf98eca0e"
 GAZE_EMA_ALPHA = 0.10
 GAZE_RECOVERY_STREAK_MIN = common.GAZE_RECOVERY_STREAK_MIN
 GAZE_OBJECT_HIT_PADDING_PX = 8.0
@@ -229,7 +231,7 @@ def _timeline_bar(count: int, max_count: int, width: int = 12) -> str:
 
 def _save_unknown_snapshot(
     frame: np.ndarray, unknown_bboxes: list[np.ndarray], ts_utc: datetime
-) -> str:
+) -> str | None:
     UNKNOWN_INCIDENTS_DIR.mkdir(parents=True, exist_ok=True)
     ts_local = ts_utc.astimezone()
     base = ts_local.strftime("unknown_%Y-%m-%d_%H-%M-%S")
@@ -259,7 +261,14 @@ def _save_unknown_snapshot(
         if candidate is None:
             candidate = UNKNOWN_INCIDENTS_DIR / f"{base}_overflow.jpg"
 
-        cv2.imwrite(str(candidate), snap)
+        # A reserved-but-empty file is worse than no capture at all: it looks like
+        # evidence while containing nothing. (The detection benchmark found 28 such
+        # files on this machine.) Verify the write and leave nothing misleading.
+        written = bool(cv2.imwrite(str(candidate), snap)) and candidate.stat().st_size > 0
+        if not written:
+            with suppress(OSError):
+                candidate.unlink()
+            candidate = None
 
     pruned = _prune_unknown_incidents()
     if pruned:
@@ -267,6 +276,10 @@ def _save_unknown_snapshot(
             f"Incident retention: pruned {pruned} capture(s); "
             f"keeping the newest {common.UNKNOWN_INCIDENT_MAX_FILES}."
         )
+
+    if candidate is None:
+        print("Unknown-face capture could not be written; incident image skipped.")
+        return None
 
     return str(candidate)
 
@@ -303,14 +316,49 @@ def _prune_unknown_incidents(keep: int | None = None) -> int:
     return removed
 
 
-def _resolve_general_model_path(path: str | None) -> str:
-    if path:
-        return path
+def _resolve_general_model_path(path: str | None = None) -> str:
+    """Return the checkpoint to load, honouring whatever was configured.
 
-    configured = Path(DEFAULT_GENERAL_MODEL)
-    if configured.exists():
-        return str(configured)
-    return "yolov8n.pt"
+    A bare name such as ``yolo11s.pt`` is a *model name*, not a missing file:
+    Ultralytics downloads it on first use, which is what the README promises. This
+    used to return the configured value only when a file of that name already
+    existed, and otherwise substitute ``yolov8n.pt`` — so
+    ``AI_STUDIO_GENERAL_YOLO_MODEL`` looked like it worked while detection ran on a
+    different model entirely, and `doctor` reported the substitute as if it were
+    the configured one. A silent swap would also quietly corrupt every benchmark
+    number, which would measure one model while printing the name of another.
+    """
+    return str(path) if path else DEFAULT_GENERAL_MODEL
+
+
+def _is_downloadable_model_name(model_path: str) -> bool:
+    """True for a bare checkpoint name (``yolo11s.pt``), false for a real path.
+
+    Ultralytics resolves a bare name against its release assets, but a path such
+    as ``runs/detect/train/weights/best.pt`` it will only ever open from disk.
+    """
+    candidate = Path(model_path)
+    return candidate.parent == Path() and candidate.suffix == ".pt"
+
+
+def _ensure_general_model(model_path: str) -> str:
+    """Make ``model_path`` available, downloading it once if it is a model name.
+
+    Returns ``""`` when the checkpoint is ready to load, or a human-readable reason
+    when it could not be obtained — offline, unknown name, unreadable path. The
+    caller reports that reason and carries on without the model, rather than
+    substituting a checkpoint nobody asked for: the substitution is what made the
+    original bug invisible, since a failed download still printed success.
+    """
+    if Path(model_path).exists():
+        return ""
+    try:
+        from ultralytics import YOLO
+
+        YOLO(model_path)
+        return ""
+    except Exception as exc:  # offline, unknown checkpoint, unusable path
+        return str(exc) or type(exc).__name__
 
 
 def _load_default_custom_model_path() -> str | None:
@@ -727,9 +775,7 @@ def _download_gaze_weights_from_mirror(destination: Path) -> Path | None:
         return None
 
     if len(buffer) != GAZE_WEIGHTS_MIRROR_SIZE:
-        print(
-            f"[GAZE] Mirror download truncated ({len(buffer)} != {GAZE_WEIGHTS_MIRROR_SIZE})"
-        )
+        print(f"[GAZE] Mirror download truncated ({len(buffer)} != {GAZE_WEIGHTS_MIRROR_SIZE})")
         return None
     digest = hashlib.sha256(bytes(buffer)).hexdigest()
     if digest != GAZE_WEIGHTS_MIRROR_SHA256:
@@ -842,7 +888,9 @@ def _resolve_l2cs_weights_path(
 
     # Fast local fallback: discover nested gaze360 checkpoints under the same base directory.
     if not force_download:
-        local_candidates = list(weights_path.parent.rglob("*.pkl")) if weights_path.parent.exists() else []
+        local_candidates = (
+            list(weights_path.parent.rglob("*.pkl")) if weights_path.parent.exists() else []
+        )
         local_selected = _select_gaze360_weight_path(
             [str(p) for p in local_candidates], preferred_arch=preferred_arch
         )
@@ -877,7 +925,9 @@ def _resolve_l2cs_weights_path(
 
     if not candidate_paths:
         candidate_paths = list(weights_path.parent.rglob("*.pkl"))
-    selected = _select_gaze360_weight_path([str(p) for p in candidate_paths], preferred_arch=preferred_arch)
+    selected = _select_gaze360_weight_path(
+        [str(p) for p in candidate_paths], preferred_arch=preferred_arch
+    )
     if selected is not None and selected.exists():
         return selected.resolve()
 
@@ -935,7 +985,9 @@ def _align_face_from_landmarks(face_crop: np.ndarray, landmarks: np.ndarray | No
     try:
         mat = cv2.getRotationMatrix2D(center, angle, 1.0)
         border_mode = int(getattr(cv2, "BORDER_REPLICATE", 1))
-        return cv2.warpAffine(face_crop, mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=border_mode)
+        return cv2.warpAffine(
+            face_crop, mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=border_mode
+        )
     except Exception:
         return face_crop
 
@@ -1054,7 +1106,12 @@ def _load_gaze_runtime(
         inferred_arch = _infer_l2cs_arch_from_state_dict(state_dict)
 
         # If local/default weights don't match requested arch, try a forced arch-specific download once.
-        if inferred_arch is not None and inferred_arch != gaze_arch and gaze_auto_download and gdown_module is not None:
+        if (
+            inferred_arch is not None
+            and inferred_arch != gaze_arch
+            and gaze_auto_download
+            and gdown_module is not None
+        ):
             alt_path = _resolve_l2cs_weights_path(
                 weights_path=weights_path,
                 weights_source=gaze_weights_source,
@@ -1064,9 +1121,15 @@ def _load_gaze_runtime(
                 preferred_arch=gaze_arch,
                 force_download=True,
             )
-            if alt_path is not None and alt_path.exists() and alt_path.resolve() != resolved_path.resolve():
+            if (
+                alt_path is not None
+                and alt_path.exists()
+                and alt_path.resolve() != resolved_path.resolve()
+            ):
                 resolved_path = alt_path.resolve()
-                state_dict = _normalize_l2cs_state_dict(torch.load(str(resolved_path), map_location=device))
+                state_dict = _normalize_l2cs_state_dict(
+                    torch.load(str(resolved_path), map_location=device)
+                )
                 inferred_arch = _infer_l2cs_arch_from_state_dict(state_dict)
 
         if inferred_arch is not None and inferred_arch != gaze_arch:
@@ -1290,7 +1353,7 @@ class GazeScheduler:
 
 
 def _best_face(
-    faces: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None]]
+    faces: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None]],
 ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray | None] | None:
     return max(
         faces,
@@ -1661,8 +1724,7 @@ class _BehaviorTracker:
             "events_count": int(self.events_count),
             "attention_total_sec": round(float(sum(self.attention_sec.values())), 3),
             "interaction_counts": {
-                f"{person}|{obj}": int(count)
-                for (person, obj), count in self.interactions.items()
+                f"{person}|{obj}": int(count) for (person, obj), count in self.interactions.items()
             },
         }
 
@@ -1760,8 +1822,7 @@ def _build_situation_summary(minutes: int = 5, now_utc: datetime | None = None) 
             for (person, obj), sec in top_pairs[:10]
         ],
         "interaction_counts": {
-            f"{person}|{obj}": int(count)
-            for (person, obj), count in interaction_counts.items()
+            f"{person}|{obj}": int(count) for (person, obj), count in interaction_counts.items()
         },
         "snapshots_total": snapshots_total,
         "snapshots_manual": snapshots_manual,
@@ -1870,10 +1931,12 @@ def _query_groq(question: str, context: dict[str, Any]) -> str | None:
 
     try:
         client = Groq(api_key=api_key)
+        # Reasoning model: see the longer comment in server.py's grounded path.
         response = client.chat.completions.create(
             model=GROQ_MODEL_DEFAULT,
             temperature=0.2,
             max_tokens=350,
+            extra_body={"reasoning_effort": "low"},
             messages=[
                 {"role": "system", "content": GROQ_SYSTEM_PROMPT},
                 {
@@ -1923,7 +1986,9 @@ def _answer_current_presence() -> str:
         agg = event.get("aggregate") if isinstance(event.get("aggregate"), dict) else {}
         active = agg.get("active_subjects")
         if isinstance(active, list) and active:
-            names = [str(row.get("name", UNKNOWN_LABEL)) for row in active[:8] if isinstance(row, dict)]
+            names = [
+                str(row.get("name", UNKNOWN_LABEL)) for row in active[:8] if isinstance(row, dict)
+            ]
             if names:
                 return "Currently visible: " + ", ".join(names)
         return "No known people are currently visible in the latest session state."
@@ -1983,7 +2048,11 @@ def _handle_chat_query(
     db = FaceDB.load()
     known_people = {n.lower() for n in db.names}
 
-    if ("what happened" in q and "minute" in q) or "recent activity" in q or "situation summary" in q:
+    if (
+        ("what happened" in q and "minute" in q)
+        or "recent activity" in q
+        or "situation summary" in q
+    ):
         intent = "session_summary"
         summary_minutes = _parse_minutes_from_text(q, default=5)
         summary_payload = _build_situation_summary(summary_minutes)
@@ -1994,7 +2063,10 @@ def _handle_chat_query(
                 "source": "chat",
                 "minutes": summary_minutes,
                 "result_lines": answer.count("\n") + 1,
-                "hit": bool(summary_payload.get("top_attention_pairs") or summary_payload.get("snapshots_total")),
+                "hit": bool(
+                    summary_payload.get("top_attention_pairs")
+                    or summary_payload.get("snapshots_total")
+                ),
             },
         )
     elif "memory status" in q or "memory stats" in q:
@@ -2130,7 +2202,9 @@ def _handle_chat_query(
 
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
-def _bracket_box(frame: np.ndarray, bbox: np.ndarray, color: tuple[int, int, int], thickness: int = 2) -> None:
+def _bracket_box(
+    frame: np.ndarray, bbox: np.ndarray, color: tuple[int, int, int], thickness: int = 2
+) -> None:
     x1, y1, x2, y2 = (int(v) for v in bbox)
     arm = max(12, int((x2 - x1) * 0.18))
     for pts in [
@@ -2207,11 +2281,24 @@ SESSION_AGGREGATE_KEYS: tuple[str, ...] = (
     "moving_avg_fps",
     "min_fps",
     "max_fps",
+    # The configured ceiling, so `avg_fps` can be read as "held the cap" rather
+    # than "ran out of machine". 0 means uncapped, which the CLI loop is.
+    "fps_cap",
+    # Spread, not only a mean: a session averaging 0.82 fps contained a 178 fps
+    # instant, and a mean cannot tell work apart from stalls.
+    "frame_period_p50_ms",
+    "frame_period_p95_ms",
     "faces_per_sec",
     "avg_detection_latency_ms",
     "min_detection_latency_ms",
     "max_detection_latency_ms",
     "detection_calls",
+    # What `avg_detection_latency_ms` above actually measures is *face recognition*.
+    # Object detection was never timed at all, so it gets its own fields instead of
+    # being folded into a name that would then mean two things.
+    "object_detection_calls",
+    "avg_object_detection_latency_ms",
+    "max_object_detection_latency_ms",
     "avg_confidence",
     "recognition_rate",
     "unknown_rate",
@@ -2287,9 +2374,14 @@ class SessionAggregateInput:
     detection_latency_sum_ms: float = 0.0
     detection_latency_min_ms: float = float("inf")
     detection_latency_max_ms: float = 0.0
+    object_detection_calls: int = 0
+    object_detection_latency_sum_ms: float = 0.0
+    object_detection_latency_max_ms: float = 0.0
     fps_ema: float = 0.0
     fps_min: float = float("inf")
     fps_max: float = 0.0
+    fps_cap: int = 0
+    frame_periods_ms: list[float] = field(default_factory=list)
     object_detections_total: int = 0
     object_general_detections: int = 0
     object_custom_detections: int = 0
@@ -2348,6 +2440,20 @@ class SessionAggregateInput:
         def real_min(value: float) -> float:
             return 0.0 if value == float("inf") else _safe_float(value)
 
+        def percentile(values: list[float], fraction: float) -> float:
+            """Nearest-rank percentile of the per-frame periods.
+
+            An empty sample reports 0.0 rather than a plausible-looking guess, so a
+            session that recorded no periods cannot be read as a fast one.
+            """
+            if not values:
+                return 0.0
+            ordered = sorted(values)
+            index = round(fraction * (len(ordered) - 1))
+            return _safe_float(ordered[min(max(index, 0), len(ordered) - 1)])
+
+        periods = [_safe_float(period) for period in self.frame_periods_ms]
+
         return {
             "session_id": str(self.session_id),
             "frames_total": frames_total,
@@ -2364,20 +2470,31 @@ class SessionAggregateInput:
             "moving_avg_fps": round(_safe_float(self.fps_ema), 3),
             "min_fps": round(real_min(self.fps_min), 3),
             "max_fps": round(_safe_float(self.fps_max), 3),
+            "fps_cap": _safe_int(self.fps_cap),
+            "frame_period_p50_ms": round(percentile(periods, 0.5), 2),
+            "frame_period_p95_ms": round(percentile(periods, 0.95), 2),
             "faces_per_sec": round(ratio(detections_total, duration), 3),
             "avg_detection_latency_ms": round(
-                ratio(_safe_float(self.detection_latency_sum_ms), _safe_int(self.detection_calls)), 2
+                ratio(_safe_float(self.detection_latency_sum_ms), _safe_int(self.detection_calls)),
+                2,
             ),
             "min_detection_latency_ms": round(real_min(self.detection_latency_min_ms), 2),
             "max_detection_latency_ms": round(_safe_float(self.detection_latency_max_ms), 2),
             "detection_calls": _safe_int(self.detection_calls),
+            "object_detection_calls": _safe_int(self.object_detection_calls),
+            "avg_object_detection_latency_ms": round(
+                ratio(
+                    _safe_float(self.object_detection_latency_sum_ms),
+                    _safe_int(self.object_detection_calls),
+                ),
+                2,
+            ),
+            "max_object_detection_latency_ms": round(
+                _safe_float(self.object_detection_latency_max_ms), 2
+            ),
             "avg_confidence": round(ratio(_safe_float(self.confidence_sum), detections_total), 4),
-            "recognition_rate": round(
-                ratio(_safe_int(self.known_detections), detections_total), 6
-            ),
-            "unknown_rate": round(
-                ratio(_safe_int(self.unknown_detections), detections_total), 6
-            ),
+            "recognition_rate": round(ratio(_safe_int(self.known_detections), detections_total), 6),
+            "unknown_rate": round(ratio(_safe_int(self.unknown_detections), detections_total), 6),
             "unknown_alert_events": _safe_int(self.unknown_alert_count),
             "unknown_alert_density_per_min": round(
                 ratio(_safe_int(self.unknown_alert_count), minutes), 3
@@ -2417,7 +2534,10 @@ class SessionAggregateInput:
             "gaze_target_fps_drop": _safe_float(self.gaze_target_fps_drop, 0.0),
             "gaze_inference_calls": _safe_int(self.gaze_inference_calls),
             "gaze_inference_avg_ms": round(
-                ratio(_safe_float(self.gaze_inference_sum_ms), _safe_int(self.gaze_inference_calls)), 2
+                ratio(
+                    _safe_float(self.gaze_inference_sum_ms), _safe_int(self.gaze_inference_calls)
+                ),
+                2,
             ),
             "gaze_inference_min_ms": round(real_min(self.gaze_inference_min_ms), 2),
             "gaze_inference_max_ms": round(_safe_float(self.gaze_inference_max_ms), 2),
@@ -2505,7 +2625,10 @@ def cmd_enroll(name: str, model: str) -> None:
                     status, sc = f"Hold still... {wait_left:.2f}s", TEAL
 
             _progress_bar(frame, len(samples), ENROLL_SAMPLES)
-            _hud(frame, [(f"Enrolling: {name}", WHITE), (status, sc), ("Q  quit early", (160, 160, 160))])
+            _hud(
+                frame,
+                [(f"Enrolling: {name}", WHITE), (status, sc), ("Q  quit early", (160, 160, 160))],
+            )
             cv2.imshow(win, frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
@@ -2644,7 +2767,11 @@ def cmd_recognize(
         print("Custom YOLO model: not configured")
     if gaze_enabled:
         if gaze_model_loaded:
-            loaded_path = str(gaze_runtime.get("weights_path", gaze_weights)) if gaze_runtime else gaze_weights
+            loaded_path = (
+                str(gaze_runtime.get("weights_path", gaze_weights))
+                if gaze_runtime
+                else gaze_weights
+            )
             loaded_arch = str(gaze_runtime.get("arch", gaze_arch)) if gaze_runtime else gaze_arch
             print(
                 f"Gaze active: model=L2CS-Net {loaded_arch} weights={loaded_path} "
@@ -2653,7 +2780,11 @@ def cmd_recognize(
         else:
             print("Gaze requested but unavailable. Continuing with gaze OFF.")
 
-    t_prev = time.time()
+    # Elapsed time for pacing comes from a clock that cannot step. The wall clock
+    # can be corrected backwards mid-session (NTP), which turns one interval into
+    # microseconds and reports an absurd instantaneous rate - one recorded session
+    # reports 29,537 fps against a 0.68 fps average for exactly that reason.
+    t_prev = time.monotonic()
     fps_ema = 0.0
     fps_min = float("inf")
     fps_max = 0.0
@@ -2672,6 +2803,10 @@ def cmd_recognize(
     detection_latency_sum_ms = 0.0
     detection_latency_min_ms = float("inf")
     detection_latency_max_ms = 0.0
+    object_detection_calls = 0
+    object_detection_latency_sum_ms = 0.0
+    object_detection_latency_max_ms = 0.0
+    frame_periods_ms: list[float] = []
     detection_timeline: dict[str, int] = defaultdict(int)
 
     object_detections_total = 0
@@ -2740,12 +2875,14 @@ def cmd_recognize(
             frames_total += 1
             now_ts = time.time()
 
-            dt = max(now_ts - t_prev, 1e-6)
+            mono_ts = time.monotonic()
+            dt = max(mono_ts - t_prev, 1e-6)
             inst_fps = 1.0 / dt
-            t_prev = now_ts
+            t_prev = mono_ts
             fps_ema = inst_fps if fps_ema == 0.0 else (0.9 * fps_ema + 0.1 * inst_fps)
             fps_min = min(fps_min, inst_fps)
             fps_max = max(fps_max, inst_fps)
+            frame_periods_ms.append(dt * 1000.0)
 
             detect_t0 = time.perf_counter()
             face_rows = _detect(app, frame)
@@ -2755,6 +2892,12 @@ def cmd_recognize(
             detection_latency_min_ms = min(detection_latency_min_ms, latency_ms)
             detection_latency_max_ms = max(detection_latency_max_ms, latency_ms)
 
+            # Object detection is timed on its own. Lumping it in with the face
+            # recognition call above is why `avg_detection_latency_ms` reads as
+            # object detection while measuring face recognition, and why object
+            # detection appeared in no record at all (see OBJECT_DETECTION_PLAN.md
+            # section 2h: the frame budget could not be closed from the log).
+            object_t0 = time.perf_counter()
             try:
                 object_rows = detector.detect(frame)
             except Exception as exc:
@@ -2763,6 +2906,12 @@ def cmd_recognize(
                     detector_error_seen = True
                     add_event("object_detect_error", str(exc), severity="alert")
                     print(f"Object detection error: {exc}")
+            object_latency_ms = (time.perf_counter() - object_t0) * 1000.0
+            object_detection_calls += 1
+            object_detection_latency_sum_ms += object_latency_ms
+            object_detection_latency_max_ms = max(
+                object_detection_latency_max_ms, object_latency_ms
+            )
 
             face_count = len(face_rows)
             object_count = len(object_rows)
@@ -2845,7 +2994,7 @@ def cmd_recognize(
                     severity="alert",
                     extra={
                         "image_path": snapshot_path,
-                        "image_name": Path(snapshot_path).name,
+                        "image_name": Path(snapshot_path).name if snapshot_path else None,
                     },
                 )
 
@@ -2932,7 +3081,9 @@ def cmd_recognize(
                                 "name": label,
                                 "target_object": str(target_info.get("label")),
                                 "method": target_info.get("method"),
-                                "distance_px": round(_safe_float(target_info.get("distance_px"), 0.0), 3),
+                                "distance_px": round(
+                                    _safe_float(target_info.get("distance_px"), 0.0), 3
+                                ),
                             }
                         )
 
@@ -2942,7 +3093,9 @@ def cmd_recognize(
                         "confidence": round(float(score), 6),
                         "bbox": _bbox_to_list(bbox),
                         "gaze": gaze_payload,
-                        "target_object": str(target_info.get("label")) if isinstance(target_info, dict) else None,
+                        "target_object": str(target_info.get("label"))
+                        if isinstance(target_info, dict)
+                        else None,
                     }
                 )
 
@@ -3062,11 +3215,15 @@ def cmd_recognize(
             if key == ord("g"):
                 enabled = detector.toggle_general()
                 print(f"General YOLO: {'ON' if enabled else 'OFF'}")
-                add_event("toggle_general_yolo", f"General YOLO {'enabled' if enabled else 'disabled'}")
+                add_event(
+                    "toggle_general_yolo", f"General YOLO {'enabled' if enabled else 'disabled'}"
+                )
             elif key == ord("o"):
                 enabled = detector.toggle_custom()
                 print(f"Custom YOLO: {'ON' if enabled else 'OFF'}")
-                add_event("toggle_custom_yolo", f"Custom YOLO {'enabled' if enabled else 'disabled'}")
+                add_event(
+                    "toggle_custom_yolo", f"Custom YOLO {'enabled' if enabled else 'disabled'}"
+                )
             elif key == ord("c"):
                 query = input("Chat query: ").strip()
                 if query:
@@ -3094,7 +3251,9 @@ def cmd_recognize(
                             "used_llm": result.get("used_llm"),
                         },
                     )
-                    if result.get("action") == "snapshot" and isinstance(result.get("snapshot"), dict):
+                    if result.get("action") == "snapshot" and isinstance(
+                        result.get("snapshot"), dict
+                    ):
                         memory_manual_snapshots += 1
                         snap = result["snapshot"]
                         add_event(
@@ -3139,7 +3298,9 @@ def cmd_recognize(
                     memory_query_hits["recent"] += 1
                     print(f"Recent snapshots (last 5 min): {len(rows)}")
                     for row in rows[-8:]:
-                        print(f"  {row.get('timestamp_local')} | {row.get('objects')} | {row.get('snapshot')}")
+                        print(
+                            f"  {row.get('timestamp_local')} | {row.get('objects')} | {row.get('snapshot')}"
+                        )
                 else:
                     memory_query_misses["recent"] += 1
                     print("No recent snapshots in the last 5 minutes.")
@@ -3229,9 +3390,16 @@ def cmd_recognize(
         detection_latency_sum_ms=detection_latency_sum_ms,
         detection_latency_min_ms=detection_latency_min_ms,
         detection_latency_max_ms=detection_latency_max_ms,
+        object_detection_calls=object_detection_calls,
+        object_detection_latency_sum_ms=object_detection_latency_sum_ms,
+        object_detection_latency_max_ms=object_detection_latency_max_ms,
         fps_ema=fps_ema,
         fps_min=fps_min,
         fps_max=fps_max,
+        # This loop runs as fast as the machine allows, so it has no ceiling to
+        # report. 0 is "uncapped", not "capped at zero".
+        fps_cap=0,
+        frame_periods_ms=frame_periods_ms,
         object_detections_total=object_detections_total,
         object_general_detections=object_general_detections,
         object_custom_detections=object_custom_detections,
@@ -3421,10 +3589,7 @@ def cmd_memory_recent(minutes: int) -> None:
 
     print(f"Recent snapshots in the last {minutes} minutes: {len(rows)}")
     for row in rows:
-        print(
-            f"  {row.get('timestamp_local')} | {row.get('objects')} | "
-            f"{row.get('snapshot')}"
-        )
+        print(f"  {row.get('timestamp_local')} | {row.get('objects')} | {row.get('snapshot')}")
 
 
 def cmd_memory_find(object_name: str) -> None:
@@ -3498,8 +3663,7 @@ def cmd_memory_search(text: str) -> None:
             else ""
         )
         print(
-            f"  {row.get('timestamp_local')} | {row.get('objects')} | "
-            f"{row.get('snapshot')}{extra}"
+            f"  {row.get('timestamp_local')} | {row.get('objects')} | {row.get('snapshot')}{extra}"
         )
 
 
@@ -3595,14 +3759,23 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
     moving_avg_fps = _safe_float(raw_aggregate.get("moving_avg_fps"), avg_fps)
     min_fps = _safe_float(raw_aggregate.get("min_fps"), avg_fps)
     max_fps = _safe_float(raw_aggregate.get("max_fps"), avg_fps)
-    frames_empty = _safe_int(raw_aggregate.get("frames_empty"), max(frames_total - frames_with_faces, 0))
+    fps_cap = _safe_int(raw_aggregate.get("fps_cap"), 0)
+    frame_period_p50_ms = _safe_float(raw_aggregate.get("frame_period_p50_ms"), 0.0)
+    frame_period_p95_ms = _safe_float(raw_aggregate.get("frame_period_p95_ms"), 0.0)
+    frames_empty = _safe_int(
+        raw_aggregate.get("frames_empty"), max(frames_total - frames_with_faces, 0)
+    )
 
     aggregate = {
-        "session_id": raw_aggregate.get("session_id") or event.get("session_id") or f"legacy-recognize-{idx}",
+        "session_id": raw_aggregate.get("session_id")
+        or event.get("session_id")
+        or f"legacy-recognize-{idx}",
         "frames_total": frames_total,
         "frames_with_faces": frames_with_faces,
         "frames_empty": frames_empty,
-        "frames_dropped": _safe_int(raw_aggregate.get("frames_dropped", event.get("frames_dropped", 0)), 0),
+        "frames_dropped": _safe_int(
+            raw_aggregate.get("frames_dropped", event.get("frames_dropped", 0)), 0
+        ),
         "average_faces_per_frame": _safe_float(
             raw_aggregate.get("average_faces_per_frame"),
             (detections_total / frames_total) if frames_total > 0 else 0.0,
@@ -3618,20 +3791,38 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
         "moving_avg_fps": moving_avg_fps,
         "min_fps": min_fps,
         "max_fps": max_fps,
+        "fps_cap": fps_cap,
+        "frame_period_p50_ms": frame_period_p50_ms,
+        "frame_period_p95_ms": frame_period_p95_ms,
         "faces_per_sec": faces_per_sec,
         "avg_detection_latency_ms": _safe_float(
-            raw_aggregate.get("avg_detection_latency_ms", event.get("avg_detection_latency_ms", 0.0)),
+            raw_aggregate.get(
+                "avg_detection_latency_ms", event.get("avg_detection_latency_ms", 0.0)
+            ),
             0.0,
         ),
         "min_detection_latency_ms": _safe_float(
-            raw_aggregate.get("min_detection_latency_ms", event.get("min_detection_latency_ms", 0.0)),
+            raw_aggregate.get(
+                "min_detection_latency_ms", event.get("min_detection_latency_ms", 0.0)
+            ),
             0.0,
         ),
         "max_detection_latency_ms": _safe_float(
-            raw_aggregate.get("max_detection_latency_ms", event.get("max_detection_latency_ms", 0.0)),
+            raw_aggregate.get(
+                "max_detection_latency_ms", event.get("max_detection_latency_ms", 0.0)
+            ),
             0.0,
         ),
-        "detection_calls": _safe_int(raw_aggregate.get("detection_calls", event.get("detection_calls", 0)), 0),
+        "detection_calls": _safe_int(
+            raw_aggregate.get("detection_calls", event.get("detection_calls", 0)), 0
+        ),
+        "object_detection_calls": _safe_int(raw_aggregate.get("object_detection_calls"), 0),
+        "avg_object_detection_latency_ms": _safe_float(
+            raw_aggregate.get("avg_object_detection_latency_ms"), 0.0
+        ),
+        "max_object_detection_latency_ms": _safe_float(
+            raw_aggregate.get("max_object_detection_latency_ms"), 0.0
+        ),
         "avg_confidence": avg_conf,
         "recognition_rate": _safe_float(
             raw_aggregate.get("recognition_rate"),
@@ -3660,14 +3851,18 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
             0,
         ),
         "active_subjects": raw_aggregate.get("active_subjects", event.get("active_subjects", [])),
-        "detection_timeline": raw_aggregate.get("detection_timeline", event.get("detection_timeline", [])),
+        "detection_timeline": raw_aggregate.get(
+            "detection_timeline", event.get("detection_timeline", [])
+        ),
         "active_objects": raw_aggregate.get("active_objects", event.get("active_objects", [])),
         "object_detections_total": _safe_int(
             raw_aggregate.get("object_detections_total", event.get("object_detections_total", 0)),
             0,
         ),
         "object_general_detections": _safe_int(
-            raw_aggregate.get("object_general_detections", event.get("object_general_detections", 0)),
+            raw_aggregate.get(
+                "object_general_detections", event.get("object_general_detections", 0)
+            ),
             0,
         ),
         "object_custom_detections": _safe_int(
@@ -3695,11 +3890,15 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
             raw_aggregate.get("gaze_model_loaded", event.get("gaze_model_loaded", False))
         ),
         "gaze_base_interval_frames": _safe_int(
-            raw_aggregate.get("gaze_base_interval_frames", event.get("gaze_base_interval_frames", 0)),
+            raw_aggregate.get(
+                "gaze_base_interval_frames", event.get("gaze_base_interval_frames", 0)
+            ),
             0,
         ),
         "gaze_interval_frames_final": _safe_int(
-            raw_aggregate.get("gaze_interval_frames_final", event.get("gaze_interval_frames_final", 0)),
+            raw_aggregate.get(
+                "gaze_interval_frames_final", event.get("gaze_interval_frames_final", 0)
+            ),
             0,
         ),
         "gaze_target_fps_drop": _safe_float(
@@ -3734,8 +3933,12 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
         "object_detection_timeline": raw_aggregate.get(
             "object_detection_timeline", event.get("object_detection_timeline", [])
         ),
-        "yolo_state_final": raw_aggregate.get("yolo_state_final", event.get("yolo_state_final", {})),
-        "yolo_model_paths": raw_aggregate.get("yolo_model_paths", event.get("yolo_model_paths", {})),
+        "yolo_state_final": raw_aggregate.get(
+            "yolo_state_final", event.get("yolo_state_final", {})
+        ),
+        "yolo_model_paths": raw_aggregate.get(
+            "yolo_model_paths", event.get("yolo_model_paths", {})
+        ),
         "memory_snapshots_auto": _safe_int(
             raw_aggregate.get("memory_snapshots_auto", event.get("memory_snapshots_auto", 0)),
             0,
@@ -3751,17 +3954,29 @@ def _normalize_recognize_event(event: dict[str, Any], idx: int) -> dict[str, Any
             0,
         ),
         "memory_snapshot_total_store": _safe_int(
-            raw_aggregate.get("memory_snapshot_total_store", event.get("memory_snapshot_total_store", 0)),
+            raw_aggregate.get(
+                "memory_snapshot_total_store", event.get("memory_snapshot_total_store", 0)
+            ),
             0,
         ),
-        "memory_query_counts": raw_aggregate.get("memory_query_counts", event.get("memory_query_counts", {})),
-        "memory_query_hits": raw_aggregate.get("memory_query_hits", event.get("memory_query_hits", {})),
-        "memory_query_misses": raw_aggregate.get("memory_query_misses", event.get("memory_query_misses", {})),
+        "memory_query_counts": raw_aggregate.get(
+            "memory_query_counts", event.get("memory_query_counts", {})
+        ),
+        "memory_query_hits": raw_aggregate.get(
+            "memory_query_hits", event.get("memory_query_hits", {})
+        ),
+        "memory_query_misses": raw_aggregate.get(
+            "memory_query_misses", event.get("memory_query_misses", {})
+        ),
         "chat_queries_total": _safe_int(raw_aggregate.get("chat_queries_total"), 0),
         "chat_queries_hit": _safe_int(raw_aggregate.get("chat_queries_hit"), 0),
         "chat_queries_llm": _safe_int(raw_aggregate.get("chat_queries_llm"), 0),
-        "behavior_interactions_total": _safe_int(raw_aggregate.get("behavior_interactions_total"), 0),
-        "behavior_attention_total_sec": _safe_float(raw_aggregate.get("behavior_attention_total_sec"), 0.0),
+        "behavior_interactions_total": _safe_int(
+            raw_aggregate.get("behavior_interactions_total"), 0
+        ),
+        "behavior_attention_total_sec": _safe_float(
+            raw_aggregate.get("behavior_attention_total_sec"), 0.0
+        ),
         "behavior_top_objects": raw_aggregate.get("behavior_top_objects", []),
         "behavior_attention_map": raw_aggregate.get("behavior_attention_map", {}),
         "behavior_events_count": _safe_int(raw_aggregate.get("behavior_events_count"), 0),
@@ -3821,7 +4036,9 @@ def _normalize_enroll_event(event: dict[str, Any], idx: int) -> dict[str, Any] |
         "duration_sec": duration_sec,
         "samples_captured": _safe_int(event.get("samples_captured"), 0),
         "total_samples_for_name": _safe_int(event.get("total_samples_for_name"), 0),
-        "frame_metrics": event.get("frame_metrics") if isinstance(event.get("frame_metrics"), dict) else {},
+        "frame_metrics": event.get("frame_metrics")
+        if isinstance(event.get("frame_metrics"), dict)
+        else {},
         "raw_timestamp_utc": event.get("timestamp_utc"),
     }
 
@@ -4277,7 +4494,9 @@ def _build_ascii_dashboard(summary: dict[str, Any]) -> str:
 
     if events:
         for e in events[-10:]:
-            lines.append(f"{_local_hms(e.get('timestamp_utc')):<10} | {e.get('message', 'Unknown event')}")
+            lines.append(
+                f"{_local_hms(e.get('timestamp_utc')):<10} | {e.get('message', 'Unknown event')}"
+            )
     else:
         lines.append("--:--:--   | No recent events")
 
@@ -4382,7 +4601,10 @@ _DEGRADABLE_MODULES = {"insightface": "face recognition"}
 # Only lower bounds are enforced here -- falling below a pinned minimum is a proven
 # break, whereas exceeding an upper bound is a forward-looking risk.
 _MIN_MODULE_VERSIONS: dict[str, tuple[tuple[int, ...], str]] = {
-    "insightface": (INSIGHTFACE_MIN_VERSION, "FaceAnalysis(providers=...) requires 0.7+ (2.x supported)"),
+    "insightface": (
+        INSIGHTFACE_MIN_VERSION,
+        "FaceAnalysis(providers=...) requires 0.7+ (2.x supported)",
+    ),
     "numpy": ((1, 26), "pixi.toml pins numpy >=1.26,<3"),
     "torch": ((2, 5), "pixi.toml pins torch >=2.5,<3"),
     "ultralytics": ((8, 4), "pixi.toml pins ultralytics >=8.4,<9"),
@@ -4396,6 +4618,8 @@ def _parse_version(value: Any) -> tuple[int, ...]:
     if not match:
         return ()
     return tuple(int(part) for part in match.group(1).split("."))
+
+
 _OPTIONAL_MODULES = {
     "l2cs": "gaze estimation",
     "gdown": "gaze weight auto-download",
@@ -4438,9 +4662,7 @@ def collect_environment_report(check_camera: bool = False) -> list[tuple[str, st
         (
             "ok" if pinned else "warn",
             "Python",
-            f"{python_version} (pixi workspace pins 3.11)"
-            if not pinned
-            else python_version,
+            f"{python_version} (pixi workspace pins 3.11)" if not pinned else python_version,
         )
     )
 
@@ -4456,25 +4678,40 @@ def collect_environment_report(check_camera: bool = False) -> list[tuple[str, st
                 status = unavailable_status
                 want = ".".join(str(part) for part in minimum[0])
                 detail = f"{detail} is too old (need >= {want}: {minimum[1]})"
+        # Name the capability either way, but only claim it is disabled when it is.
+        # Appending "... disabled without it" unconditionally made a working install
+        # read as broken -- `module:insightface 2.0 - face recognition disabled
+        # without it` on a machine where face recognition was fine, which is exactly
+        # the wrong signal to send someone staring at a dashboard reporting zero faces.
         if degradable:
-            detail = f"{detail} - {_DEGRADABLE_MODULES[name]} disabled without it"
+            purpose = _DEGRADABLE_MODULES[name]
+            detail = (
+                f"{detail} - {purpose} disabled without it"
+                if status != "ok"
+                else f"{detail} (needed for {purpose})"
+            )
         rows.append((status, f"module:{name}", detail))
 
     for name, purpose in _OPTIONAL_MODULES.items():
         available, detail = _check_import(name)
-        rows.append(
-            ("ok" if available else "warn", f"module:{name}", f"{detail} - {purpose}")
-        )
+        rows.append(("ok" if available else "warn", f"module:{name}", f"{detail} - {purpose}"))
 
+    # Report the *configured* checkpoint. The old resolver substituted yolov8n.pt
+    # whenever the configured file was absent, so this row could read "yolov8n.pt
+    # present" while the session actually ran on whatever the env var named.
     general_path = _resolve_general_model_path(None)
-    rows.append(
-        (
-            "ok" if Path(general_path).exists() else "warn",
-            "general YOLO",
-            f"{general_path} "
-            + ("present" if Path(general_path).exists() else "missing (Ultralytics downloads it on first run)"),
+    if Path(general_path).exists():
+        rows.append(("ok", "general YOLO", f"{general_path} present"))
+    elif _is_downloadable_model_name(general_path):
+        rows.append(
+            (
+                "warn",
+                "general YOLO",
+                f"{general_path} not downloaded yet (Ultralytics fetches it on first run)",
+            )
         )
-    )
+    else:
+        rows.append(("warn", "general YOLO", f"{general_path} not found"))
 
     custom_path = _load_default_custom_model_path()
     rows.append(
@@ -4560,7 +4797,9 @@ def cmd_doctor(check_camera: bool = False) -> None:
     failures = [name for status, name, _ in rows if status == "fail"]
     warnings = [name for status, name, _ in rows if status == "warn"]
     print("-" * 72)
-    print(f"{len(rows) - len(failures) - len(warnings)} ok, {len(warnings)} warning(s), {len(failures)} failure(s)")
+    print(
+        f"{len(rows) - len(failures) - len(warnings)} ok, {len(warnings)} warning(s), {len(failures)} failure(s)"
+    )
 
     if failures:
         print("Blocking: " + ", ".join(failures))
@@ -4589,14 +4828,12 @@ def cmd_bootstrap(download_gaze: bool = True) -> None:
     if Path(general_path).exists():
         print(f"[ ok ] general YOLO already present: {general_path}")
     else:
-        try:
-            from ultralytics import YOLO
-
-            YOLO("yolov8n.pt")
+        problem = _ensure_general_model(general_path)
+        if problem:
+            problems.append(f"general YOLO weights unavailable ({general_path}: {problem})")
+            print(f"[warn] general YOLO could not be prepared: {general_path} ({problem})")
+        else:
             print(f"[ ok ] general YOLO ready: {general_path}")
-        except Exception as exc:
-            problems.append(f"general YOLO weights unavailable ({exc})")
-            print(f"[warn] general YOLO could not be prepared: {exc}")
 
     gaze_weights = Path(GAZE_WEIGHTS_DEFAULT)
     if gaze_weights.exists():
@@ -4638,6 +4875,278 @@ def cmd_bootstrap(download_gaze: bool = True) -> None:
 
     if problems:
         print("Unresolved: " + "; ".join(problems))
+
+
+def cmd_bench_detect(
+    frame_patterns: list[str],
+    model: str | None,
+    confs: list[float] | None,
+    sizes: list[int] | None,
+    min_brightness: float,
+    json_out: str | None,
+) -> None:
+    """Measure object detection offline, so tuning claims can be verified."""
+    model_path = _resolve_general_model_path(model)
+    params = detection_bench.default_param_grid(confs, sizes)
+    frames, rejected = detection_bench.load_frames(frame_patterns, min_brightness=min_brightness)
+    references = detection_bench.reference_assets()
+
+    print(f"Model      : {model_path}")
+    print(f"Frames     : {len(frames)} usable, {len(rejected)} excluded")
+    print(f"References : {len(references)}")
+    print()
+
+    results = detection_bench.run_benchmark(model_path, params, frames, references)
+    print(detection_bench.format_report(results, rejected))
+
+    if json_out:
+        Path(json_out).write_text(json.dumps(results, indent=2), encoding="utf-8")
+        print(f"\nWrote {json_out}")
+
+
+def cmd_validate_frames(
+    root: str,
+    targets: str | None,
+    vocab: str | None,
+    min_brightness: float,
+    json_out: str | None,
+) -> None:
+    """Check a labelled frame set against the capture spec before measuring on it.
+
+    This validates the *dataset*, not the detector: it exits non-zero only when the
+    frames or labels are malformed, never because of how a model performed. The
+    problems it catches are the silent ones — a missing label file, a class spelled
+    slightly wrong, frames the quality filter will quietly drop.
+    """
+    root_path = Path(root)
+    if not root_path.is_dir():
+        print(f"[FAIL] frame set not found: {root_path}")
+        print("       Expected a directory holding images/ and labels/ (spec §7).")
+        sys.exit(1)
+
+    targets_path = Path(targets) if targets else root_path / "targets.txt"
+    target_names: list[str] = []
+    if targets_path.is_file():
+        target_names = frame_set_validation.load_targets(targets_path)
+    else:
+        print(f"[warn] no target list at {targets_path}")
+        print("       Class-coverage and negative-frame checks will be skipped (spec §2a).")
+
+    classes = (
+        frame_set_validation.load_vocabulary(vocab) if vocab else frame_set_validation.vocabulary()
+    )
+
+    print(f"Frame set  : {root_path}")
+    print(
+        f"Targets    : {len(target_names)} declared"
+        + (f" ({targets_path.name})" if target_names else "")
+    )
+    print(f"Vocabulary : {len(classes)} classes" + (f" ({vocab})" if vocab else " (COCO-80)"))
+    print()
+
+    report = frame_set_validation.validate_frame_set(
+        root_path,
+        targets=target_names,
+        vocab=classes,
+        min_brightness=min_brightness,
+    )
+    print(frame_set_validation.format_validation_report(report))
+
+    if json_out:
+        Path(json_out).write_text(
+            json.dumps(
+                {
+                    "ok": report.ok,
+                    "stats": report.stats,
+                    "findings": [vars(row) for row in report.findings],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"\nWrote {json_out}")
+
+    if not report.ok:
+        sys.exit(1)
+
+
+def cmd_review_detections(
+    frames: list[str],
+    out_dir: str,
+    limit: int,
+    min_brightness: float,
+    verdicts: str | None = None,
+) -> None:
+    """Build a review page from the detections on frames that already exist.
+
+    This is the route to a precision figure that needs no new capture and no
+    labelling: the detector proposes boxes, and a person confirms or rejects that
+    finite list. Recall is out of reach this way and is not claimed.
+    """
+    loaded, rejected = detection_bench.load_frames(frames, min_brightness=min_brightness)
+    if not loaded:
+        print(f"[FAIL] no usable frames matched: {', '.join(frames)}")
+        print("       Frames are excluded when they are too dark, blurred or small to detect in.")
+        sys.exit(1)
+
+    reasons: dict[str, int] = {}
+    for row in rejected:
+        reasons[row.reason] = reasons.get(row.reason, 0) + 1
+
+    print(
+        f"Frames     : {len(loaded)} usable" + (f", {len(rejected)} excluded" if rejected else "")
+    )
+    if reasons:
+        rendered = ", ".join(f"{name}={count}" for name, count in sorted(reasons.items()))
+        print(f"             excluded by reason: {rendered}")
+
+    detector = DualYoloDetector()
+    params = detector.get_state()["params"]
+    print(
+        f"Detector   : {detector.general_model_path}  {detection_bench.DetectorConfig(**params).label}"
+    )
+
+    rows = detection_review.build_rows(loaded, detector, limit=limit)
+    if not rows:
+        print("[FAIL] the detector found nothing to review in those frames.")
+        sys.exit(1)
+
+    # A correction pass starts from the previous answers, but only if they belong to
+    # this exact list: preloading another build's verdicts would paint the wrong boxes.
+    existing: dict[int, bool] | None = None
+    if verdicts:
+        try:
+            previous = json.loads(Path(verdicts).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[warn] could not read {verdicts}: {exc}")
+            print("       Starting from a blank page.")
+        else:
+            list_id = detection_review.fingerprint([row.detection for row in rows])
+            mismatch = detection_review.fingerprint_mismatch(list_id, previous)
+            if mismatch:
+                print(f"[warn] {mismatch}")
+                print("       Starting from a blank page rather than preloading the wrong boxes.")
+            else:
+                existing = detection_review.load_existing(verdicts)
+                print(f"Preloaded  : {len(existing)} verdict(s) from {verdicts}")
+
+    detections_path, page_path = detection_review.write_review(
+        rows, out_dir=out_dir, source=", ".join(frames), existing=existing
+    )
+
+    print(
+        f"Boxes      : {len(rows)} to review"
+        + (f" (sampled evenly across confidence from {limit})" if limit else " (all of them)")
+    )
+    print()
+    print("Next:")
+    print(f"  1. open  {page_path}")
+    print("  2. mark each box Correct / Wrong (a couple of minutes for the whole list)")
+    print("  3. click 'Download verdicts.json' and save it as:")
+    print(f"       {detections_path.parent / detection_review.VERDICTS_FILENAME}")
+    print(f"  4. pixi run python main.py score-detections --review-dir {out_dir}")
+
+
+def cmd_score_detections(review_dir: str, verdicts: str | None) -> None:
+    """Turn a reviewed detection list into precision, per class and overall."""
+    directory = Path(review_dir)
+    detections_path = directory / detection_review.DETECTIONS_FILENAME
+    verdicts_path = Path(verdicts) if verdicts else directory / detection_review.VERDICTS_FILENAME
+
+    if not detections_path.exists():
+        print(f"[FAIL] no detection list at {detections_path}")
+        print("       Run `main.py review-detections` first.")
+        sys.exit(1)
+    if not verdicts_path.exists():
+        print(f"[FAIL] no verdicts at {verdicts_path}")
+        print("       Mark the boxes in review.html, download verdicts.json into that directory,")
+        print("       or pass --verdicts <path>.")
+        sys.exit(1)
+
+    try:
+        payload = json.loads(verdicts_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"[FAIL] verdicts file is not valid JSON: {exc}")
+        sys.exit(1)
+
+    try:
+        stored = json.loads(detections_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"[FAIL] detection list is not valid JSON: {exc}")
+        sys.exit(1)
+
+    # Box indices only mean anything against the list they were assigned to, and a
+    # rebuild renumbers them: scoring one build's verdicts against another build's
+    # list would report a confident, wrong precision figure and say nothing about it.
+    mismatch = detection_review.fingerprint_mismatch(
+        stored.get("fingerprint") if isinstance(stored, dict) else None, payload
+    )
+    if mismatch:
+        print(f"[FAIL] {mismatch}")
+        print("       Rebuild the page and review again, or point --verdicts at the file")
+        print("       that belongs to this detection list.")
+        sys.exit(1)
+
+    detections = detection_review.load_detections(detections_path)
+    verdicts = detection_review.parse_verdicts(payload)
+    report = detection_review.score(detections, verdicts)
+
+    print(
+        f"Verdicts   : {verdicts_path}  ({len(verdicts)} recorded, {len(detections)} detection(s) in the list)"
+    )
+    if isinstance(stored, dict) and stored.get("fingerprint"):
+        print(f"List id    : {stored['fingerprint']}  (verdicts must carry the same id)")
+    print()
+    print(detection_review.format_score(report))
+
+    if report.reviewed == 0:
+        sys.exit(1)
+
+
+def cmd_frame_budget(log: str | None, limit: int, json_out: str | None) -> None:
+    """Split each recorded session's frame period into measured stages and a residual.
+
+    `bench-detect` measures object detection alone, on saved frames. This reads the
+    other half of the evidence — the sessions the pipeline has already recorded — so
+    the two can be compared without opening a camera. It decides nothing and changes
+    nothing; it exists so that "what is a live frame made of" has a measured answer
+    instead of an assumed one.
+    """
+    log_path = Path(log) if log else METRICS_LOG_PATH
+    if not log_path.exists():
+        print(f"[FAIL] metrics log not found: {log_path}")
+        print("       Run a monitoring session first, or pass --log <path>.")
+        sys.exit(1)
+
+    rows = common.read_jsonl(log_path)
+    session_rows = sum(1 for row in rows if isinstance(row.get("aggregate"), dict))
+    budget_set = frame_budget.collect_budgets(rows, limit=limit)
+
+    print(f"Metrics log: {log_path}")
+    print(
+        f"Sessions   : {len(budget_set)} accounted for, from {session_rows} row(s) with an aggregate"
+    )
+    if limit > 0:
+        print(f"Limit      : newest {limit}")
+    print()
+    print(frame_budget.format_report(budget_set))
+
+    if json_out:
+        Path(json_out).write_text(
+            json.dumps(
+                {
+                    "summary": asdict(frame_budget.summarize(budget_set.budgets)),
+                    "sessions": [asdict(budget) for budget in budget_set.budgets],
+                    "skipped": list(budget_set.skipped),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"\nWrote {json_out}")
+
+    if not budget_set:
+        sys.exit(1)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -4745,7 +5254,9 @@ def main() -> None:
     p_ms = sub.add_parser("memory-search", help="Search similar scenes")
     p_ms.add_argument("--text", required=True, help="Natural language scene query")
     p_ss = sub.add_parser("session-summary", help="Generate narrative summary of recent activity")
-    p_ss.add_argument("--minutes", type=int, default=5, help="Lookback window in minutes (default: 5)")
+    p_ss.add_argument(
+        "--minutes", type=int, default=5, help="Lookback window in minutes (default: 5)"
+    )
     p_ss.add_argument("--json", action="store_true", help="Output raw summary JSON")
     p_chat = sub.add_parser("chat", help="Interactive chat over memory and logs")
     p_chat.add_argument("--question", default=None, help="Single-turn question (optional)")
@@ -4757,6 +5268,131 @@ def main() -> None:
         "--check-camera",
         action="store_true",
         help="Also probe the configured camera (opens and releases the device)",
+    )
+    p_bd = sub.add_parser(
+        "bench-detect",
+        help="Benchmark object detection offline on saved frames and reference images",
+    )
+    p_bd.add_argument(
+        "--frames",
+        nargs="+",
+        default=["memory/snapshots/*.jpg", "unknown_incidents/*.jpg"],
+        help="Glob patterns for the frames to benchmark (default: the project's saved frames)",
+    )
+    p_bd.add_argument(
+        "--model",
+        default=None,
+        help="Detector checkpoint, or a name for Ultralytics to download (default: configured general model)",
+    )
+    p_bd.add_argument(
+        "--conf", type=float, nargs="+", default=None, help="Confidence thresholds to compare"
+    )
+    p_bd.add_argument(
+        "--imgsz", type=int, nargs="+", default=None, help="Inference sizes to compare"
+    )
+    p_bd.add_argument(
+        "--min-brightness",
+        type=float,
+        default=detection_bench.DEFAULT_MIN_BRIGHTNESS,
+        help="Frames darker than this are excluded and reported instead of skewing recall",
+    )
+    p_bd.add_argument(
+        "--json", dest="json_out", default=None, help="Also write raw results to this JSON file"
+    )
+    p_vf = sub.add_parser(
+        "validate-frames",
+        help="Check a labelled frame set against the capture spec (see OBJECT_DETECTION_FRAME_SET_SPEC.md)",
+    )
+    p_vf.add_argument(
+        "--root",
+        default="frames",
+        help="Frame-set root, holding images/ and labels/ (default: frames)",
+    )
+    p_vf.add_argument(
+        "--targets",
+        default=None,
+        help="File listing the in-scope class names, one per line (default: <root>/targets.txt)",
+    )
+    p_vf.add_argument(
+        "--vocab",
+        default=None,
+        help="File overriding the class vocabulary, one name per line (default: COCO-80)",
+    )
+    p_vf.add_argument(
+        "--min-brightness",
+        type=float,
+        default=detection_bench.DEFAULT_MIN_BRIGHTNESS,
+        help="Frames darker than this are reported, since the benchmark would drop them",
+    )
+    p_vf.add_argument(
+        "--json", dest="json_out", default=None, help="Also write the results to this JSON file"
+    )
+    p_fb = sub.add_parser(
+        "frame-budget",
+        help="Split recorded sessions into a per-stage frame budget (see OBJECT_DETECTION_PLAN.md)",
+    )
+    p_fb.add_argument(
+        "--log",
+        default=None,
+        help=f"Metrics JSONL to read (default: {common.METRICS_FILENAME})",
+    )
+    p_fb.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Only the newest N sessions (default: all of them)",
+    )
+    p_fb.add_argument(
+        "--json",
+        dest="json_out",
+        default=None,
+        help="Also write the per-session accounting to this JSON file",
+    )
+    p_rv = sub.add_parser(
+        "review-detections",
+        help="Build a review page for the detections on existing frames (measures precision)",
+    )
+    p_rv.add_argument(
+        "--frames",
+        nargs="+",
+        default=["memory/snapshots/*.jpg", "unknown_incidents/*.jpg"],
+        help="Glob patterns for the frames to review (default: the project's saved frames)",
+    )
+    p_rv.add_argument(
+        "--out-dir",
+        default=detection_review.DEFAULT_REVIEW_DIR,
+        help=f"Where to write the page and detection list (default: {detection_review.DEFAULT_REVIEW_DIR})",
+    )
+    p_rv.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Review only N boxes, spread across the confidence range (default: all of them)",
+    )
+    p_rv.add_argument(
+        "--min-brightness",
+        type=float,
+        default=detection_bench.DEFAULT_MIN_BRIGHTNESS,
+        help="Frames darker than this cannot be detected in and are excluded",
+    )
+    p_rv.add_argument(
+        "--verdicts",
+        default=None,
+        help="Preload earlier verdicts so a re-review is only the corrections",
+    )
+    p_sc = sub.add_parser(
+        "score-detections",
+        help="Score reviewed detections into precision, per class and overall",
+    )
+    p_sc.add_argument(
+        "--review-dir",
+        default=detection_review.DEFAULT_REVIEW_DIR,
+        help=f"Directory holding detections.json and verdicts.json (default: {detection_review.DEFAULT_REVIEW_DIR})",
+    )
+    p_sc.add_argument(
+        "--verdicts",
+        default=None,
+        help="Verdicts JSON to score (default: <review-dir>/verdicts.json)",
     )
     p_boot = sub.add_parser("bootstrap", help="Create runtime directories and fetch model assets")
     p_boot.add_argument(
@@ -4803,6 +5439,30 @@ def main() -> None:
         "list": cmd_list,
         "report": cmd_report,
         "doctor": lambda: cmd_doctor(args.check_camera),
+        "bench-detect": lambda: cmd_bench_detect(
+            args.frames,
+            args.model,
+            args.conf,
+            args.imgsz,
+            args.min_brightness,
+            args.json_out,
+        ),
+        "validate-frames": lambda: cmd_validate_frames(
+            args.root,
+            args.targets,
+            args.vocab,
+            args.min_brightness,
+            args.json_out,
+        ),
+        "review-detections": lambda: cmd_review_detections(
+            args.frames,
+            args.out_dir,
+            args.limit,
+            args.min_brightness,
+            args.verdicts,
+        ),
+        "score-detections": lambda: cmd_score_detections(args.review_dir, args.verdicts),
+        "frame-budget": lambda: cmd_frame_budget(args.log, args.limit, args.json_out),
         "bootstrap": lambda: cmd_bootstrap(download_gaze=not args.no_gaze_download),
     }.get(args.cmd, parser.print_help)()
 

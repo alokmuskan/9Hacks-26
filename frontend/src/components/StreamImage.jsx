@@ -117,7 +117,11 @@ function StreamImage({
         style={{
           width: "100%",
           height: "100%",
-          objectFit: "cover",
+          // `contain`, not `cover`: the viewport is deliberately shorter than the
+          // camera's aspect ratio, so cover would crop the top and bottom of the
+          // frame — exactly where annotated faces sit. Letterboxing instead keeps
+          // every detection visible.
+          objectFit: "contain",
           opacity: errored ? 0.4 : 1
         }}
       />

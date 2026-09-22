@@ -39,7 +39,7 @@ def _run_children(script: Path, args_per_child: list[list[str]], timeout: float 
             )
 
 
-METRICS_CHILD = '''
+METRICS_CHILD = """
 import pathlib
 import sys
 
@@ -51,9 +51,9 @@ count = int(sys.argv[2])
 tag = sys.argv[3]
 for index in range(count):
     common.append_jsonl(log, {"worker": tag, "n": index})
-'''
+"""
 
-METADATA_CHILD = '''
+METADATA_CHILD = """
 import pathlib
 import sys
 import time
@@ -72,11 +72,11 @@ frame = np.zeros((16, 16, 3), dtype=np.uint8)
 for index in range(count):
     manager.save_snapshot(frame, [], current_time=1000.0 + index)
     time.sleep(0.005)
-'''
+"""
 
 # Emulates the pre-fix behaviour: read the index, append, write it back, with no
 # cross-process coordination at all.
-UNSYNCHRONISED_CHILD = '''
+UNSYNCHRONISED_CHILD = """
 import pathlib
 import sys
 import time
@@ -99,7 +99,7 @@ for index in range(count):
         # os.replace). Losing the write is the point; aborting the child is not.
         pass
     time.sleep(0.005)
-'''
+"""
 
 
 class LockPrimitiveTests(unittest.TestCase):
@@ -264,7 +264,8 @@ class CrossProcessMetadataTests(unittest.TestCase):
             workers = 4
             per_worker = 12
             _run_children(
-                script, [[str(index), str(per_worker), f"w{i}", str(PROJECT_ROOT)] for i in range(workers)]
+                script,
+                [[str(index), str(per_worker), f"w{i}", str(PROJECT_ROOT)] for i in range(workers)],
             )
 
             rows = _read_metadata_file(index)

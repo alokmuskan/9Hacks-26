@@ -6,13 +6,25 @@ on:
   pull_request:
   workflow_dispatch:
 
-# The backend suite deliberately stubs cv2 and insightface, so CI does not need the
-# full computer-vision stack (insightface, ultralytics, onnxruntime, faiss). numpy,
-# pillow, fastapi and httpx are the only real imports; torch is used by one L2CS
-# decoding test, which skips itself when torch is absent.
+# The backend suite deliberately stubs cv2 and insightface, so this job does not
+# need the full computer-vision stack (insightface, ultralytics, onnxruntime,
+# faiss). numpy, pillow, fastapi and httpx are the only real imports; torch is used
+# by one L2CS decoding test, which skips itself when torch is absent.
+#
+# That stubbing is also why `backend` cannot catch a broken detector wiring: the
+# four tests in `test_detection_bench.py` that exercise real inference skip
+# themselves without ultralytics, OpenCV and the weights. The `detection-smoke`
+# job below installs them and fails if those tests skip, so the guard is enforced
+# rather than merely present.
 env:
   PYTHON_VERSION: "3.11"
   NODE_VERSION: "22"
+  # These wheels are a matched CPU-only pair from the PyTorch index.  Do not
+  # install torch from this index and let a later PyPI dependency resolution
+  # choose torchvision: that can install a binary built for a different torch
+  # release and make the torchvision::nms operator unavailable at import time.
+  TORCH_VERSION: "2.7.1"
+  TORCHVISION_VERSION: "0.22.1"
 
 jobs:
   backend:
@@ -29,18 +41,70 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "numpy>=1.26,<3" "pillow>=11,<12" fastapi httpx
+          # server.py imports cv2 while the test modules are discovered.  Use
+          # the headless wheel: CI encodes placeholder frames but never needs a
+          # desktop display or camera window.
+          pip install "numpy>=1.26,<3" "pillow>=11,<12" opencv-python-headless fastapi httpx "python-dotenv>=1,<2"
 
       # CPU-only wheel, so the full suite runs rather than skipping the L2CS test.
-      # Drop this step to make the job lighter; that test will report as skipped.
+      # Pin it even though this job does not import torchvision: keeping the same
+      # tested torch version as the real-CV job prevents a new torch release from
+      # changing the L2CS checkpoint-loading contract unexpectedly.
       - name: Install torch (CPU)
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+        run: >-
+          pip install
+          --index-url https://download.pytorch.org/whl/cpu
+          "torch==${{ env.TORCH_VERSION }}"
 
       - name: Run backend tests
         run: python -m unittest discover -s tests -q
 
       - name: Byte-compile every module
         run: python -m compileall -q main.py server.py common.py scene_memory.py object_detection.py tests/ ai-surveillance/
+
+  detection-smoke:
+    name: Detection smoke (real CV stack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      # Separate from `backend` on purpose: this is the only job that pays for the
+      # real stack, so the main suite stays fast. Install the matched CPU-only
+      # torch/torchvision wheels before Ultralytics; otherwise pip may combine a
+      # CPU torch wheel with an incompatible PyPI torchvision wheel.
+      - name: Install the detector and a real OpenCV
+        run: |
+          python -m pip install --upgrade pip
+          pip install "numpy>=1.26,<3" "pillow>=11,<12" opencv-python-headless
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch==${{ env.TORCH_VERSION }}" "torchvision==${{ env.TORCHVISION_VERSION }}"
+          pip install ultralytics
+
+      # Fail at installation time with a precise error if the paired wheels ever
+      # stop registering torchvision::nms, instead of surfacing a deep Ultralytics
+      # traceback during the inference test.
+      - name: Verify PyTorch CPU wheel compatibility
+        run: |
+          python -c "import torch, torchvision; from torchvision.ops import nms; print(f'torch={torch.__version__} torchvision={torchvision.__version__} nms={nms.__name__}')"
+
+      # The tests skip when the weights are absent, which would leave this job
+      # green while testing nothing. Fetch them into the directory the tests look
+      # in and let a failure here be a failure.
+      - name: Fetch yolov8n.pt
+        run: python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+
+      # `unittest` exits 0 when tests skip, so this job sets the flag that turns
+      # "the real stack is missing" into a failure instead of a skip. Without it the
+      # job could pass while exercising nothing, which is the exact failure these
+      # tests exist to catch.
+      - name: Run the inference wiring guard
+        env:
+          AI_STUDIO_REQUIRE_REAL_INFERENCE: "1"
+        run: python -m unittest discover -s tests -q -p "test_detection_bench.py"
 
   lint:
     name: Lint and types
@@ -60,6 +124,11 @@ jobs:
 
       - name: Ruff
         run: ruff check .
+
+      # The codebase was reformatted in one commit so this could be turned on; a
+      # future edit that is not formatted now fails here instead of drifting.
+      - name: Ruff format
+        run: ruff format --check .
 
       # Configuration lives in mypy.ini. main.py is currently opted out there, with
       # the reason and the remaining finding count documented in that file.

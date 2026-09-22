@@ -1,5 +1,5 @@
 import { useContext, useMemo, useState } from "react";
-import { Camera, Pause, Play, RefreshCcw, ToggleLeft, ToggleRight } from "lucide-react";
+import { Camera, Pause, Play, ToggleLeft, ToggleRight } from "lucide-react";
 import StreamImage from "../components/StreamImage";
 import { SurveillanceContext } from "../context/SurveillanceContext";
 import "./live.css";
@@ -32,6 +32,14 @@ function LiveMonitorPage() {
     const objects = detections?.objects?.length || 0;
     return { faces, objects };
   }, [detections]);
+  // `wsState.reconnecting` is only true while a retry is pending, so an idle page
+  // always showed "no". Report the actual socket state instead.
+  const connectionState = wsState.connected
+    ? { label: "Live", tone: "ok" }
+    : wsState.reconnecting
+      ? { label: "Retrying", tone: "warn" }
+      : { label: "Offline", tone: "bad" };
+
   const liveSequence = Number(detections?.sequence || status?.frame?.sequence || 0);
   const warmingUp = Boolean(isRunning && liveSequence <= 0);
   const startupPhase = String(status?.startup_phase || "idle");
@@ -126,32 +134,50 @@ function LiveMonitorPage() {
 
         <section className="glass-panel">
           <h3>Runtime Controls</h3>
-          <p className="tiny">Toggles are queued to the global worker loop.</p>
+          <p className="tiny">
+            Applied to the running pipeline within one frame. Switching a detector off frees CPU for the ones you
+            keep.
+          </p>
           <div className="toggle-list">
-            <button
-              className="btn-secondary toggle-btn"
-              disabled={!isRunning || busy}
-              onClick={() => submit(() => setToggles({ general_yolo: !toggles.general }))}
-            >
-              {toggles.general ? <ToggleRight size={16} /> : <ToggleLeft size={16} />}
-              General YOLO
-            </button>
-            <button
-              className="btn-secondary toggle-btn"
-              disabled={!isRunning || busy}
-              onClick={() => submit(() => setToggles({ custom_yolo: !toggles.custom }))}
-            >
-              {toggles.custom ? <ToggleRight size={16} /> : <ToggleLeft size={16} />}
-              Custom YOLO
-            </button>
-            <button
-              className="btn-secondary toggle-btn"
-              disabled={!isRunning || busy}
-              onClick={() => submit(() => setToggles({ gaze: !toggles.gaze }))}
-            >
-              {toggles.gaze ? <ToggleRight size={16} /> : <ToggleLeft size={16} />}
-              Gaze
-            </button>
+            <div className="toggle-row">
+              <button
+                className="btn-secondary toggle-btn"
+                disabled={!isRunning || busy}
+                aria-pressed={toggles.general}
+                onClick={() => submit(() => setToggles({ general_yolo: !toggles.general }))}
+              >
+                {toggles.general ? <ToggleRight size={16} /> : <ToggleLeft size={16} />}
+                General YOLO
+                <span className="toggle-chip">{toggles.general ? "On" : "Off"}</span>
+              </button>
+              <span className="toggle-hint">Everyday classes — person, laptop, chair, phone, bottle.</span>
+            </div>
+            <div className="toggle-row">
+              <button
+                className="btn-secondary toggle-btn"
+                disabled={!isRunning || busy}
+                aria-pressed={toggles.custom}
+                onClick={() => submit(() => setToggles({ custom_yolo: !toggles.custom }))}
+              >
+                {toggles.custom ? <ToggleRight size={16} /> : <ToggleLeft size={16} />}
+                Custom YOLO
+                <span className="toggle-chip">{toggles.custom ? "On" : "Off"}</span>
+              </button>
+              <span className="toggle-hint">Your own trained classes. Off until a custom model is configured.</span>
+            </div>
+            <div className="toggle-row">
+              <button
+                className="btn-secondary toggle-btn"
+                disabled={!isRunning || busy}
+                aria-pressed={toggles.gaze}
+                onClick={() => submit(() => setToggles({ gaze: !toggles.gaze }))}
+              >
+                {toggles.gaze ? <ToggleRight size={16} /> : <ToggleLeft size={16} />}
+                Gaze
+                <span className="toggle-chip">{toggles.gaze ? "On" : "Off"}</span>
+              </button>
+              <span className="toggle-hint">Where each person looks. The heaviest per-frame step.</span>
+            </div>
           </div>
 
           <div style={{ marginTop: 20 }}>
@@ -174,8 +200,8 @@ function LiveMonitorPage() {
                 <strong>{status?.snapshot_interval ? `${status.snapshot_interval}s` : "8s"}</strong>
               </div>
               <div className="count-box">
-                <span>Reconnect</span>
-                <strong>{wsState.reconnecting ? <RefreshCcw size={15} /> : "no"}</strong>
+                <span>Connection</span>
+                <strong className={`conn-${connectionState.tone}`}>{connectionState.label}</strong>
               </div>
             </div>
           </div>

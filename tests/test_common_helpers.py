@@ -35,8 +35,9 @@ class SharedHelperTests(unittest.TestCase):
     def test_both_entry_points_read_the_same_metrics_log(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "metrics.jsonl"
-            with mock.patch.object(self.main, "METRICS_LOG_PATH", path), mock.patch.object(
-                self.server, "METRICS_PATH", path
+            with (
+                mock.patch.object(self.main, "METRICS_LOG_PATH", path),
+                mock.patch.object(self.server, "METRICS_PATH", path),
             ):
                 self.main._append_metric("chat_query", {"question": "hello", "hit": True})
 
@@ -63,7 +64,9 @@ class SharedHelperTests(unittest.TestCase):
 
             def write_via_main():
                 for index in range(rows_per_thread):
-                    self.main._append_metric("chat_query", {"writer": "main", "index": index, "pad": "x" * 400})
+                    self.main._append_metric(
+                        "chat_query", {"writer": "main", "index": index, "pad": "x" * 400}
+                    )
 
             def write_via_common():
                 for index in range(rows_per_thread):
@@ -88,7 +91,9 @@ class SharedHelperTests(unittest.TestCase):
                 for thread in threads:
                     thread.join()
 
-                lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                lines = [
+                    line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+                ]
                 self.assertEqual(len(lines), 4 * rows_per_thread)
                 for line in lines:
                     json.loads(line)  # raises if two writers interleaved
@@ -100,8 +105,9 @@ class SharedHelperTests(unittest.TestCase):
             path.write_text(f"{good}\n" + '{"broken": \n', encoding="utf-8")
 
             before = common.metrics_parse_errors()
-            with mock.patch.object(self.main, "METRICS_LOG_PATH", path), mock.patch.object(
-                self.server, "METRICS_PATH", path
+            with (
+                mock.patch.object(self.main, "METRICS_LOG_PATH", path),
+                mock.patch.object(self.server, "METRICS_PATH", path),
             ):
                 self.assertEqual(len(self.main._load_metric_events()), 1)
                 self.assertEqual(len(self.server._load_metric_events()), 1)
@@ -126,7 +132,14 @@ class SharedHelperTests(unittest.TestCase):
         )
         self.assertEqual([row["timestamp_utc"] for row in windowed], ["2026-03-14T11:00:00+00:00"])
 
-        self.assertEqual(len(common.filter_events(rows, event_type="chat_query", limit=1, from_ts=None, to_ts=None)), 1)
+        self.assertEqual(
+            len(
+                common.filter_events(
+                    rows, event_type="chat_query", limit=1, from_ts=None, to_ts=None
+                )
+            ),
+            1,
+        )
 
     def test_value_helpers_handle_bad_input(self):
         self.assertEqual(common.safe_int("7"), 7)
