@@ -418,14 +418,22 @@ class PipelineManager:
     ) -> None:
         event = self._event(event_type, payload, session_id=session_id)
         self._recent_events.append(event)
-        if self._loop is None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
             return
+        publish = self.event_hub.publish(event)
         try:
-            fut = asyncio.run_coroutine_threadsafe(self.event_hub.publish(event), self._loop)
-            fut.result(timeout=0.25)
+            fut = asyncio.run_coroutine_threadsafe(publish, loop)
         except Exception:
-            # Non-fatal: websocket fan-out should never crash pipeline.
-            pass
+            # `run_coroutine_threadsafe` may reject a loop that closed in the
+            # small interval after `is_closed()` above.  It does not consume the
+            # coroutine in that case, so close it explicitly to avoid an
+            # unawaited-coroutine warning during server/test shutdown.
+            publish.close()
+            return
+        # Non-fatal: websocket fan-out should never crash pipeline.
+        with suppress(Exception):
+            fut.result(timeout=0.25)
 
     def _set_pipeline_state(
         self,

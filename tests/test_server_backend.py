@@ -49,6 +49,18 @@ class ServerBackendTests(unittest.TestCase):
         self.assertEqual(row["session_id"], "s1")
         self.assertEqual(row["payload"], payload)
 
+    def test_publish_event_does_not_create_a_coroutine_for_a_closed_loop(self):
+        manager = self.server.PipelineManager()
+        loop = mock.Mock()
+        loop.is_closed.return_value = True
+        manager.set_event_loop(loop)
+        publish = mock.AsyncMock()
+        manager.event_hub.publish = publish
+
+        manager._publish_event("pipeline_state", {"running": False})
+
+        publish.assert_not_awaited()
+
     def test_fps_throttle_sleep_duration(self):
         dur = self.server.PipelineManager._compute_sleep_duration(0.05, 0.01)
         self.assertAlmostEqual(dur, 0.04, places=6)
