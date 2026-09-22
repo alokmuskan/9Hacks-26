@@ -562,5 +562,39 @@ class GroqReasoningModelWiringTests(unittest.TestCase):
         self.assertEqual(captured["extra_body"].get("reasoning_effort"), "low")
 
 
+class ServerDotEnvLoadingTests(unittest.TestCase):
+    """server.py must load .env at import, like the CLI entry point does.
+
+    Regression: only main.py called load_dotenv, so `python server.py` never
+    had GROQ_API_KEY in its process environment and chat always answered
+    "Groq response unavailable" despite a valid key in .env.
+    """
+
+    def test_importing_server_loads_env_file(self):
+        import subprocess
+
+        repo_root = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text('PROBE_MARKER_9F27A = "env-file-loaded"\n', encoding="utf-8")
+            # Run with CWD = the temp dir so load_dotenv() can only find the
+            # probe key through server.py's own import-time load. Any real env
+            # var must not leak in, so the probe name is unique.
+            code = (
+                "import sys; sys.path.insert(0, r" + repr(str(repo_root)) + "); "
+                "import server; import os; "
+                "print('PROBE:' + str(os.getenv('PROBE_MARKER_9F27A')))"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("PROBE:env-file-loaded", proc.stdout, proc.stderr[-800:])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,24 @@ from pydantic import BaseModel, Field
 
 import common
 
+
+def _load_env_file() -> None:
+    """Load .env from the working directory once, mirroring main.py.
+
+    Only the CLI entry point loaded .env, so features that read the
+    environment lazily at request time — e.g. GROQ_API_KEY for chat — ran
+    unconfigured when the backend was started via ``python server.py``.
+    ``override=False`` keeps real process env vars authoritative.
+    """
+    try:
+        from dotenv import load_dotenv
+    except Exception:
+        return
+    load_dotenv(override=False)
+
+
+_load_env_file()
+
 LOGGER = logging.getLogger("monitoring-backend")
 logging.basicConfig(level=logging.INFO)
 
